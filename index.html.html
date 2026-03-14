@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Life Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0b10; --bg2: #0f1018; --bg3: #14161f; --bg4: #1a1d27;
+  --border: #2a2d3a; --text: #e0e0e8; --text2: #8a8d9e; --text3: #4a4d5e;
+  --green: #22c55e; --red: #ef4444; --orange: #f97316;
+  --yellow: #eab308; --blue: #3b82f6; --purple: #a855f7; --pink: #ec4899;
+  --gray: #6b7280;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Outfit', system-ui, sans-serif;
+  background: linear-gradient(145deg, var(--bg), var(--bg2), var(--bg3));
+  color: var(--text); min-height: 100vh; max-width: 480px;
+  margin: 0 auto; -webkit-font-smoothing: antialiased;
+}
+button, input, select, textarea { font-family: inherit; }
+input, select, textarea {
+  padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--text); font-size: 13px; outline: none;
+}
+input:focus, select:focus { border-color: var(--green); }
+.btn {
+  padding: 10px 16px; border-radius: 8px; border: none;
+  font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s;
+}
+.btn-primary { background: var(--green); color: #000; }
+.btn-primary:hover { background: #16a34a; }
+.btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--text2); }
+.btn-ghost:hover { border-color: var(--text2); }
+.pill {
+  padding: 6px 14px; border-radius: 20px; border: 1px solid var(--border);
+  background: transparent; color: var(--text3); font-size: 11px;
+  font-weight: 500; cursor: pointer; white-space: nowrap; transition: all 0.2s;
+}
+.pill.active { border-color: var(--green); background: rgba(34,197,94,0.07); color: var(--green); }
+
+@keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
+
+.fade-up { animation: fadeUp 0.25s ease both; }
+.spinner { width: 28px; height: 28px; border: 3px solid var(--border); border-top-color: var(--green); border-radius: 50%; animation: spin 0.7s linear infinite; margin: 0 auto 12px; }
+
+#login-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; padding: 40px 20px; text-align: center; }
+#login-screen h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; letter-spacing: -0.03em; }
+#login-screen p { color: var(--text3); font-size: 13px; margin-bottom: 32px; }
+#login-screen .btn { font-size: 15px; padding: 14px 32px; border-radius: 12px; }
+
+#app { display: none; }
+.header { padding: 24px 20px 16px; border-bottom: 1px solid var(--bg4); }
+.header h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; }
+.header .date { font-size: 11px; color: var(--text3); font-family: 'JetBrains Mono', monospace; margin-top: 2px; }
+.header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+
+.tabs { display: flex; gap: 4px; background: var(--bg3); border-radius: 10px; padding: 3px; }
+.tab {
+  flex: 1; padding: 9px 12px; border-radius: 8px; border: none;
+  background: transparent; color: var(--text3); font-size: 12px;
+  font-weight: 400; cursor: pointer; transition: all 0.2s;
+}
+.tab.active { background: #1e2030; color: var(--text); font-weight: 600; }
+
+.content { padding: 16px 20px; padding-bottom: 100px; }
+.pills { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 12px; margin-bottom: 12px; }
+.pills::-webkit-scrollbar { display: none; }
+
+.task-item {
+  display: flex; align-items: flex-start; gap: 12px; padding: 14px 0;
+  border-bottom: 1px solid var(--bg3); transition: opacity 0.3s;
+}
+.task-check {
+  width: 24px; height: 24px; border-radius: 7px; border: 2px solid;
+  background: transparent; cursor: pointer; flex-shrink: 0; margin-top: 1px;
+  transition: all 0.2s; display: flex; align-items: center; justify-content: center;
+}
+.task-check:hover { transform: scale(1.1); }
+.task-check.done { background: var(--green); border-color: var(--green); }
+.task-title { font-size: 13px; font-weight: 500; color: #e8e8f0; line-height: 1.4; word-break: break-word; }
+.task-title.done { color: var(--text3); text-decoration: line-through; }
+.task-meta { display: flex; align-items: center; gap: 6px; margin-top: 5px; flex-wrap: wrap; }
+.tag { font-size: 10px; padding: 2px 8px; border-radius: 5px; font-weight: 500; }
+.task-notes { font-size: 11px; color: var(--text3); margin-top: 5px; line-height: 1.4; word-break: break-word; }
+
+.add-form {
+  background: var(--bg3); border-radius: 12px; padding: 16px;
+  margin-bottom: 16px; border: 1px solid var(--border); animation: fadeUp 0.2s ease;
+}
+.add-form .row { display: flex; gap: 8px; margin-bottom: 10px; }
+
+.completed-section { margin-top: 20px; }
+.completed-header {
+  padding: 10px 14px; border-radius: 8px; background: #0d1017;
+  border: 1px solid #1e293b; color: var(--text3); font-size: 13px;
+  cursor: pointer; display: flex; justify-content: space-between; align-items: center;
+  width: 100%;
+}
+.completed-list {
+  margin-top: 4px; border-radius: 8px; background: #0a0c12;
+  border: 1px solid #1e293b; padding: 0 12px;
+}
+
+.shop-item {
+  display: flex; align-items: center; gap: 10px; padding: 10px 0;
+  border-bottom: 1px solid var(--bg4);
+}
+.shop-check {
+  width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--border);
+  background: transparent; cursor: pointer; flex-shrink: 0; transition: all 0.2s;
+  display: flex; align-items: center; justify-content: center; font-size: 11px; color: #000;
+}
+.shop-check.done { border-color: var(--green); background: var(--green); }
+
+.footer {
+  position: fixed; bottom: 0; left: 0; right: 0;
+  background: linear-gradient(transparent, var(--bg) 30%);
+  padding: 28px 16px 14px; text-align: center;
+}
+.footer p { font-size: 10px; color: #1e2030; font-family: 'JetBrains Mono', monospace; }
+
+.empty { text-align: center; padding: 48px 20px; color: var(--text3); }
+.empty .icon { font-size: 36px; margin-bottom: 8px; }
+.empty .msg { font-size: 13px; }
+
+.error-banner {
+  margin: 12px 20px 0; padding: 10px 14px; border-radius: 8px;
+  background: #2d1215; border: 1px solid #5c2126; color: #f87171;
+  font-size: 12px; display: flex; justify-content: space-between; align-items: center;
+}
+</style>
+</head>
+<body>
+
+<!-- LOGIN SCREEN -->
+<div id="login-screen">
+  <h1>Life Dashboard</h1>
+  <p>Sign in with Google to sync with your calendar</p>
+  <button class="btn btn-primary" onclick="handleAuth()" id="login-btn">🔐 Sign in with Google</button>
+</div>
+
+<!-- APP -->
+<div id="app">
+  <div class="header">
+    <div class="header-row">
+      <div>
+        <h1>Life Dashboard</h1>
+        <p class="date" id="date-display"></p>
+      </div>
+      <button class="btn btn-ghost" onclick="syncTasks()" id="sync-btn">↻ Sync</button>
+    </div>
+    <div class="tabs">
+      <button class="tab active" onclick="switchView('tasks', this)">✅ Tasks <span id="task-count"></span></button>
+      <button class="tab" onclick="switchView('shopping', this)">🛒 Shop <span id="shop-count"></span></button>
+    </div>
+  </div>
+
+  <div id="error-container"></div>
+
+  <div class="content" id="tasks-view">
+    <div class="pills" id="category-pills"></div>
+    <button class="btn btn-ghost" style="width:100%;margin-bottom:16px;border-style:dashed" onclick="toggleAddForm()" id="add-btn">+ Add Task</button>
+    <div id="add-form-container"></div>
+    <div id="tasks-list"></div>
+    <div id="completed-section"></div>
+  </div>
+
+  <div class="content" id="shopping-view" style="display:none">
+    <div style="display:flex;gap:6px;margin-bottom:16px">
+      <input id="shop-input" placeholder="Add item..." style="flex:1" onkeydown="if(event.key==='Enter')addShopItem()">
+      <input id="shop-qty" placeholder="#" style="width:42px;text-align:center" value="1">
+      <button class="btn btn-primary" onclick="addShopItem()">+</button>
+    </div>
+    <div id="shop-list"></div>
+  </div>
+
+  <div class="footer">
+    <p id="footer-text">google calendar synced</p>
+  </div>
+</div>
+
+<script>
+// ── CONFIG ──
+const CLIENT_ID = '724457331852-5jpikras7qjphvgbqg2blfs17m1bu21e.apps.googleusercontent.com';
+const SCOPES = 'https://www.googleapis.com/auth/calendar';
+const TASK_PREFIX = '📋';
+const CALENDAR_ID = 'yon.level@gmail.com';
+
+let tokenClient;
+let accessToken = null;
+let tasks = [];
+let activeCategory = 'all';
+let showAddForm = false;
+let showCompleted = false;
+let shopItems = JSON.parse(localStorage.getItem('dash-shop') || '[]');
+
+// ── CATEGORIES & PRIORITIES ──
+const CATS = {
+  'Parents Care': { icon: '💜', color: '#ec4899' },
+  'School': { icon: '🏫', color: '#3b82f6' },
+  'Personal': { icon: '🔧', color: '#a855f7' },
+  'Finance': { icon: '💰', color: '#eab308' },
+  'Tasks': { icon: '✅', color: '#22c55e' },
+  'Habits': { icon: '🏃', color: '#f97316' },
+};
+const PRIS = {
+  'Urgent': { color: '#ef4444', order: 0 },
+  'High': { color: '#f97316', order: 1 },
+  'Medium': { color: '#eab308', order: 2 },
+  'Low': { color: '#6b7280', order: 3 },
+};
+
+// ── GOOGLE AUTH ──
+function initGsi() {
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: CLIENT_ID,
+    scope: SCOPES,
+    callback: (response) => {
+      if (response.error) { showError('Auth failed: ' + response.error); return; }
+      accessToken = response.access_token;
+      localStorage.setItem('dash-token', accessToken);
+      document.getElementById('login-screen').style.display = 'none';
+      document.getElementById('app').style.display = 'block';
+      updateDate();
+      syncTasks();
+    },
+  });
+
+  // Try stored token
+  const stored = localStorage.getItem('dash-token');
+  if (stored) {
+    accessToken = stored;
+    // Test if token is still valid
+    fetch('https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=1', {
+      headers: { Authorization: 'Bearer ' + accessToken }
+    }).then(r => {
+      if (r.ok) {
+        document.getElementById('login-screen').style.display = 'none';
+        document.getElementById('app').style.display = 'block';
+        updateDate();
+        syncTasks();
+      } else {
+        accessToken = null;
+        localStorage.removeItem('dash-token');
+      }
+    }).catch(() => {});
+  }
+}
+
+function handleAuth() {
+  tokenClient.requestAccessToken({ prompt: 'consent' });
+}
+
+// ── API HELPERS ──
+async function calFetch(url, opts = {}) {
+  const r = await fetch('https://www.googleapis.com/calendar/v3' + url, {
+    ...opts,
+    headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json', ...opts.headers },
+  });
+  if (r.status === 401) {
+    accessToken = null; localStorage.removeItem('dash-token');
+    document.getElementById('login-screen').style.display = '';
+    document.getElementById('app').style.display = 'none';
+    throw new Error('Session expired. Please sign in again.');
+  }
+  if (!r.ok) throw new Error('API error: ' + r.status);
+  if (r.status === 204) return null;
+  return r.json();
+}
+
+// ── PARSE TASK ──
+function parseTask(event) {
+  const title = (event.summary || '').replace(TASK_PREFIX, '').trim();
+  const desc = event.description || '';
+  const lines = desc.split('\n');
+  const meta = lines[0] || '';
+  const notes = lines.slice(1).join('\n').trim();
+  let category = 'Tasks', priority = 'Medium';
+  for (const cat of Object.keys(CATS)) {
+    if (meta.toLowerCase().includes(cat.toLowerCase())) { category = cat; break; }
+  }
+  for (const p of Object.keys(PRIS)) {
+    if (meta.toLowerCase().includes(p.toLowerCase())) { priority = p; break; }
+  }
+  return { id: event.id, title, category, priority, notes, done: false };
+}
+
+// ── SYNC TASKS ──
+async function syncTasks() {
+  const btn = document.getElementById('sync-btn');
+  btn.textContent = '⟳ ...';
+  btn.disabled = true;
+  try {
+    const now = new Date(); 
+    const min = new Date(now.getFullYear(), 0, 1).toISOString();
+    const max = new Date(now.getFullYear() + 2, 0, 1).toISOString();
+    const data = await calFetch(
+      `/calendars/${encodeURIComponent(CALENDAR_ID)}/events?timeMin=${min}&timeMax=${max}&maxResults=250&singleEvents=true&q=${encodeURIComponent(TASK_PREFIX)}`
+    );
+    tasks = (data.items || [])
+      .filter(e => (e.summary || '').includes(TASK_PREFIX))
+      .map(parseTask);
+    tasks.sort((a, b) => (PRIS[a.priority]?.order ?? 2) - (PRIS[b.priority]?.order ?? 2));
+    renderAll();
+  } catch (e) {
+    showError(e.message);
+  }
+  btn.textContent = '↻ Sync';
+  btn.disabled = false;
+}
+
+// ── COMPLETE TASK ──
+async function completeTask(id) {
+  const el = document.querySelector(`[data-task="${id}"]`);
+  if (el) el.style.opacity = '0.3';
+  try {
+    await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${id}`, { method: 'DELETE' });
+    tasks = tasks.filter(t => t.id !== id);
+    renderAll();
+  } catch (e) {
+    showError('Failed to complete: ' + e.message);
+    if (el) el.style.opacity = '1';
+  }
+}
+
+// ── ADD TASK ──
+async function addTask() {
+  const title = document.getElementById('add-title').value.trim();
+  const cat = document.getElementById('add-cat').value;
+  const pri = document.getElementById('add-pri').value;
+  if (!title) return;
+
+  const addBtn = document.querySelector('#add-form-container .btn-primary');
+  if (addBtn) { addBtn.textContent = 'Adding...'; addBtn.disabled = true; }
+
+  try {
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const dateStr = tomorrow.toISOString().split('T')[0];
+
+    await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events`, {
+      method: 'POST',
+      body: JSON.stringify({
+        summary: TASK_PREFIX + ' ' + title,
+        description: cat + ' | ' + pri + ' priority',
+        start: { date: dateStr },
+        end: { date: dateStr },
+      }),
+    });
+    toggleAddForm();
+    await syncTasks();
+  } catch (e) {
+    showError('Failed to add: ' + e.message);
+    if (addBtn) { addBtn.textContent = 'Add Task'; addBtn.disabled = false; }
+  }
+}
+
+// ── RENDER ──
+function renderAll() {
+  renderPills();
+  renderTasks();
+  renderShop();
+  updateCounts();
+}
+
+function renderPills() {
+  const container = document.getElementById('category-pills');
+  const active = tasks.filter(t => !t.done);
+  let html = `<button class="pill ${activeCategory==='all'?'active':''}" onclick="setCategory('all')">All (${active.length})</button>`;
+  for (const [name, info] of Object.entries(CATS)) {
+    const count = active.filter(t => t.category === name).length;
+    if (count === 0) continue;
+    const isActive = activeCategory === name;
+    html += `<button class="pill" style="${isActive?`border-color:${info.color};background:${info.color}12;color:${info.color}`:''}" onclick="setCategory('${name}')">${info.icon} ${name} (${count})</button>`;
+  }
+  container.innerHTML = html;
+}
+
+function renderTasks() {
+  const container = document.getElementById('tasks-list');
+  const compContainer = document.getElementById('completed-section');
+  const active = tasks.filter(t => !t.done);
+  const filtered = activeCategory === 'all' ? active : active.filter(t => t.category === activeCategory);
+
+  if (filtered.length === 0) {
+    container.innerHTML = `<div class="empty"><div class="icon">📝</div><div class="msg">${tasks.length===0?'No tasks — hit Sync or add one':'No tasks in this category'}</div></div>`;
+  } else {
+    container.innerHTML = filtered.map((t, i) => {
+      const cat = CATS[t.category] || CATS.Tasks;
+      const pri = PRIS[t.priority] || PRIS.Medium;
+      return `
+        <div class="task-item fade-up" data-task="${t.id}" style="animation-delay:${i*0.03}s">
+          <button class="task-check" style="border-color:${pri.color}40" onclick="completeTask('${t.id}')" title="Complete"></button>
+          <div style="flex:1;min-width:0">
+            <div class="task-title">${esc(t.title)}</div>
+            <div class="task-meta">
+              <span class="tag" style="background:${cat.color}15;color:${cat.color}">${cat.icon} ${t.category}</span>
+              <span class="tag" style="background:${pri.color}15;color:${pri.color}">${t.priority}</span>
+            </div>
+            ${t.notes ? `<div class="task-notes">${esc(t.notes)}</div>` : ''}
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  compContainer.innerHTML = '';
+}
+
+function updateCounts() {
+  const active = tasks.filter(t => !t.done);
+  document.getElementById('task-count').textContent = active.length ? `(${active.length})` : '';
+  const shopActive = shopItems.filter(i => !i.checked).length;
+  document.getElementById('shop-count').textContent = shopActive ? `(${shopActive})` : '';
+  document.getElementById('footer-text').textContent = `google calendar synced • ${active.length} tasks`;
+}
+
+function updateDate() {
+  document.getElementById('date-display').textContent = new Date().toLocaleDateString('en-GB', {
+    weekday: 'long', day: 'numeric', month: 'short', year: 'numeric'
+  });
+}
+
+// ── ADD FORM ──
+function toggleAddForm() {
+  showAddForm = !showAddForm;
+  const container = document.getElementById('add-form-container');
+  const btn = document.getElementById('add-btn');
+  if (showAddForm) {
+    btn.style.display = 'none';
+    container.innerHTML = `
+      <div class="add-form">
+        <input id="add-title" placeholder="What needs to be done?" style="width:100%;margin-bottom:10px" onkeydown="if(event.key==='Enter')addTask()">
+        <div class="row">
+          <select id="add-cat" style="flex:1">${Object.keys(CATS).map(c=>`<option value="${c}">${c}</option>`).join('')}</select>
+          <select id="add-pri" style="flex:1">${Object.keys(PRIS).map(p=>`<option value="${p}"${p==='Medium'?' selected':''}>${p}</option>`).join('')}</select>
+        </div>
+        <div class="row">
+          <button class="btn btn-primary" style="flex:1" onclick="addTask()">Add Task</button>
+          <button class="btn btn-ghost" onclick="toggleAddForm()">Cancel</button>
+        </div>
+      </div>`;
+    setTimeout(() => document.getElementById('add-title')?.focus(), 50);
+  } else {
+    btn.style.display = '';
+    container.innerHTML = '';
+  }
+}
+
+// ── SHOPPING ──
+function renderShop() {
+  const container = document.getElementById('shop-list');
+  const unc = shopItems.filter(i => !i.checked);
+  const chk = shopItems.filter(i => i.checked);
+  let html = '';
+
+  if (unc.length === 0 && chk.length === 0) {
+    html = '<div class="empty"><div class="icon">🛒</div><div class="msg">No items yet</div></div>';
+  }
+
+  html += unc.map(i => `
+    <div class="shop-item">
+      <button class="shop-check" onclick="toggleShop('${i.id}')"></button>
+      <span style="flex:1;font-size:13px">${esc(i.name)}</span>
+      <span style="font-size:11px;color:var(--text3);font-family:monospace">×${i.qty}</span>
+      <button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:12px" onclick="deleteShop('${i.id}')">🗑</button>
+    </div>`).join('');
+
+  if (chk.length > 0) {
+    html += `<div style="margin-top:16px">
+      <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+        <span style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em">Done (${chk.length})</span>
+        <button style="font-size:11px;color:var(--text3);background:none;border:none;cursor:pointer;text-decoration:underline" onclick="clearShop()">Clear all</button>
+      </div>`;
+    html += chk.map(i => `
+      <div class="shop-item" style="opacity:0.4">
+        <button class="shop-check done" onclick="toggleShop('${i.id}')">✓</button>
+        <span style="flex:1;font-size:13px;color:var(--text3);text-decoration:line-through">${esc(i.name)}</span>
+      </div>`).join('');
+    html += '</div>';
+  }
+  container.innerHTML = html;
+  updateCounts();
+}
+
+function addShopItem() {
+  const input = document.getElementById('shop-input');
+  const qtyInput = document.getElementById('shop-qty');
+  if (!input.value.trim()) return;
+  shopItems.push({ id: Date.now().toString(36), name: input.value.trim(), qty: qtyInput.value || '1', checked: false });
+  input.value = ''; qtyInput.value = '1';
+  saveShop(); renderShop();
+}
+function toggleShop(id) { shopItems = shopItems.map(i => i.id===id?{...i,checked:!i.checked}:i); saveShop(); renderShop(); }
+function deleteShop(id) { shopItems = shopItems.filter(i => i.id!==id); saveShop(); renderShop(); }
+function clearShop() { shopItems = shopItems.filter(i => !i.checked); saveShop(); renderShop(); }
+function saveShop() { localStorage.setItem('dash-shop', JSON.stringify(shopItems)); }
+
+// ── UI HELPERS ──
+function switchView(v, btn) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('tasks-view').style.display = v === 'tasks' ? '' : 'none';
+  document.getElementById('shopping-view').style.display = v === 'shopping' ? '' : 'none';
+}
+
+function setCategory(cat) { activeCategory = cat; renderPills(); renderTasks(); }
+
+function showError(msg) {
+  const c = document.getElementById('error-container');
+  c.innerHTML = `<div class="error-banner"><span>${esc(msg)}</span><button style="background:none;border:none;color:#f87171;cursor:pointer;font-size:16px" onclick="this.parentElement.remove()">×</button></div>`;
+  setTimeout(() => c.innerHTML = '', 5000);
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+</script>
+
+<!-- Google Identity Services -->
+<script src="https://accounts.google.com/gsi/client" onload="initGsi()"></script>
+
+</body>
+</html>
