@@ -191,6 +191,7 @@ input:focus, select:focus { border-color: var(--green); }
 const CLIENT_ID = '724457331852-5jpikras7qjphvgbqg2blfs17m1bu21e.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/calendar';
 const TASK_PREFIX = '📋';
+const SHOP_PREFIX = '🛒';
 const CALENDAR_ID = 'yon.level@gmail.com';
 
 let tokenClient;
@@ -199,7 +200,7 @@ let tasks = [];
 let activeCategory = 'all';
 let showAddForm = false;
 let showCompleted = false;
-let shopItems = JSON.parse(localStorage.getItem('dash-shop') || '[]');
+let shopItems = [];
 
 // ── CATEGORIES & PRIORITIES ──
 const CATS = {
@@ -298,22 +299,40 @@ async function syncTasks() {
   btn.textContent = '⟳ ...';
   btn.disabled = true;
   try {
-    const now = new Date(); 
+    const now = new Date();
     const min = new Date(now.getFullYear(), 0, 1).toISOString();
     const max = new Date(now.getFullYear() + 2, 0, 1).toISOString();
-    const data = await calFetch(
-      `/calendars/${encodeURIComponent(CALENDAR_ID)}/events?timeMin=${min}&timeMax=${max}&maxResults=250&singleEvents=true&q=${encodeURIComponent(TASK_PREFIX)}`
-    );
-    tasks = (data.items || [])
+    const [taskData, shopData] = await Promise.all([
+      calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events?timeMin=${min}&timeMax=${max}&maxResults=250&singleEvents=true&q=${encodeURIComponent(TASK_PREFIX)}`),
+      calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events?timeMin=${min}&timeMax=${max}&maxResults=250&singleEvents=true&q=${encodeURIComponent(SHOP_PREFIX)}`)
+    ]);
+    tasks = (taskData.items || [])
       .filter(e => (e.summary || '').includes(TASK_PREFIX))
       .map(parseTask);
     tasks.sort((a, b) => (PRIS[a.priority]?.order ?? 2) - (PRIS[b.priority]?.order ?? 2));
+
+    shopItems = (shopData.items || [])
+      .filter(e => (e.summary || '').includes(SHOP_PREFIX) && !(e.summary || '').includes(TASK_PREFIX))
+      .map(parseShopEvent);
     renderAll();
   } catch (e) {
     showError(e.message);
   }
   btn.textContent = '↻ Sync';
   btn.disabled = false;
+}
+
+function parseShopEvent(event) {
+  const name = (event.summary || '').replace(SHOP_PREFIX, '').trim();
+  const desc = event.description || '';
+  const qtyMatch = desc.match(/qty:\s*(\d+)/i);
+  const checkedMatch = desc.match(/checked:\s*(true|false)/i);
+  return {
+    id: event.id,
+    name,
+    qty: qtyMatch ? qtyMatch[1] : '1',
+    checked: checkedMatch ? checkedMatch[1] === 'true' : false,
+  };
 }
 
 // ── COMPLETE TASK ──
@@ -489,18 +508,78 @@ function renderShop() {
   updateCounts();
 }
 
-function addShopItem() {
+async function addShopItem() {
   const input = document.getElementById('shop-input');
   const qtyInput = document.getElementById('shop-qty');
-  if (!input.value.trim()) return;
-  shopItems.push({ id: Date.now().toString(36), name: input.value.trim(), qty: qtyInput.value || '1', checked: false });
+  const name = input.value.trim();
+  if (!name) return;
+  const qty = qtyInput.value || '1';
   input.value = ''; qtyInput.value = '1';
-  saveShop(); renderShop();
+  try {
+    const dateStr = new Date().toISOString().split('T')[0];
+    await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events`, {
+      method: 'POST',
+      body: JSON.stringify({
+        summary: SHOP_PREFIX + ' ' + name,
+        description: `qty: ${qty}\nchecked: false`,
+        start: { date: dateStr },
+        end: { date: dateStr },
+      }),
+    });
+    await syncTasks();
+  } catch (e) {
+    showError('Failed to add item: ' + e.message);
+  }
 }
-function toggleShop(id) { shopItems = shopItems.map(i => i.id===id?{...i,checked:!i.checked}:i); saveShop(); renderShop(); }
-function deleteShop(id) { shopItems = shopItems.filter(i => i.id!==id); saveShop(); renderShop(); }
-function clearShop() { shopItems = shopItems.filter(i => !i.checked); saveShop(); renderShop(); }
-function saveShop() { localStorage.setItem('dash-shop', JSON.stringify(shopItems)); }
+
+async function toggleShop(id) {
+  const item = shopItems.find(i => i.id === id);
+  if (!item) return;
+  const newChecked = !item.checked;
+  item.checked = newChecked;
+  renderShop();
+  try {
+    await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        description: `qty: ${item.qty}\nchecked: ${newChecked}`,
+      }),
+    });
+  } catch (e) {
+    item.checked = !newChecked;
+    renderShop();
+    showError('Failed to update item: ' + e.message);
+  }
+}
+
+async function deleteShop(id) {
+  const idx = shopItems.findIndex(i => i.id === id);
+  if (idx === -1) return;
+  const removed = shopItems.splice(idx, 1);
+  renderShop();
+  try {
+    await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${id}`, { method: 'DELETE' });
+  } catch (e) {
+    shopItems.splice(idx, 0, removed[0]);
+    renderShop();
+    showError('Failed to delete item: ' + e.message);
+  }
+}
+
+async function clearShop() {
+  const checked = shopItems.filter(i => i.checked);
+  if (checked.length === 0) return;
+  shopItems = shopItems.filter(i => !i.checked);
+  renderShop();
+  try {
+    await Promise.all(checked.map(i =>
+      calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${i.id}`, { method: 'DELETE' })
+    ));
+  } catch (e) {
+    showError('Failed to clear some items: ' + e.message);
+    await syncTasks();
+  }
+}
 
 // ── UI HELPERS ──
 function switchView(v, btn) {
