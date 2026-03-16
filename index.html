@@ -3,8 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0a0b10">
+<link rel="manifest" href="manifest.json">
 <title>Life Dashboard</title>
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
@@ -13,29 +15,33 @@
   --border: #2a2d3a; --text: #e0e0e8; --text2: #8a8d9e; --text3: #4a4d5e;
   --green: #22c55e; --red: #ef4444; --orange: #f97316;
   --yellow: #eab308; --blue: #3b82f6; --purple: #a855f7; --pink: #ec4899;
-  --gray: #6b7280;
+  --gray: #6b7280; --cyan: #06b6d4;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
   font-family: 'Outfit', system-ui, sans-serif;
   background: linear-gradient(145deg, var(--bg), var(--bg2), var(--bg3));
-  color: var(--text); min-height: 100vh; max-width: 480px;
-  margin: 0 auto; -webkit-font-smoothing: antialiased;
+  color: var(--text); min-height: 100vh; min-height: 100dvh;
+  max-width: 520px; margin: 0 auto; -webkit-font-smoothing: antialiased;
+  padding-bottom: 72px;
 }
 button, input, select, textarea { font-family: inherit; }
 input, select, textarea {
   padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border);
-  background: var(--bg); color: var(--text); font-size: 13px; outline: none;
+  background: var(--bg); color: var(--text); font-size: 14px; outline: none; width: 100%;
 }
-input:focus, select:focus { border-color: var(--green); }
+input:focus, select:focus, textarea:focus { border-color: var(--green); }
+textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 .btn {
   padding: 10px 16px; border-radius: 8px; border: none;
   font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s;
 }
 .btn-primary { background: var(--green); color: #000; }
 .btn-primary:hover { background: #16a34a; }
+.btn-sm { padding: 6px 12px; font-size: 12px; border-radius: 6px; }
 .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--text2); }
 .btn-ghost:hover { border-color: var(--text2); }
+.btn-danger { background: var(--red); color: #fff; }
 .pill {
   padding: 6px 14px; border-radius: 20px; border: 1px solid var(--border);
   background: transparent; color: var(--text3); font-size: 11px;
@@ -45,34 +51,58 @@ input:focus, select:focus { border-color: var(--green); }
 
 @keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes spin { to { transform: rotate(360deg); } }
-@keyframes pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
-
 .fade-up { animation: fadeUp 0.25s ease both; }
 .spinner { width: 28px; height: 28px; border: 3px solid var(--border); border-top-color: var(--green); border-radius: 50%; animation: spin 0.7s linear infinite; margin: 0 auto 12px; }
 
+/* ── LOGIN ── */
 #login-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; padding: 40px 20px; text-align: center; }
 #login-screen h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; letter-spacing: -0.03em; }
 #login-screen p { color: var(--text3); font-size: 13px; margin-bottom: 32px; }
 #login-screen .btn { font-size: 15px; padding: 14px 32px; border-radius: 12px; }
 
+/* ── HEADER ── */
 #app { display: none; }
-.header { padding: 24px 20px 16px; border-bottom: 1px solid var(--bg4); }
-.header h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.02em; }
+.header { padding: 20px 20px 12px; border-bottom: 1px solid var(--bg4); position: sticky; top: 0; background: var(--bg); z-index: 10; }
+.header h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }
 .header .date { font-size: 11px; color: var(--text3); font-family: 'JetBrains Mono', monospace; margin-top: 2px; }
-.header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+.header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 
-.tabs { display: flex; gap: 4px; background: var(--bg3); border-radius: 10px; padding: 3px; }
-.tab {
-  flex: 1; padding: 9px 12px; border-radius: 8px; border: none;
-  background: transparent; color: var(--text3); font-size: 12px;
-  font-weight: 400; cursor: pointer; transition: all 0.2s;
+/* ── BOTTOM NAV ── */
+.bottom-nav {
+  position: fixed; bottom: 0; left: 0; right: 0;
+  background: var(--bg); border-top: 1px solid var(--bg4);
+  display: flex; justify-content: center; max-width: 520px; margin: 0 auto;
+  z-index: 100; padding: 4px 0 env(safe-area-inset-bottom, 4px);
 }
-.tab.active { background: #1e2030; color: var(--text); font-weight: 600; }
+.nav-btn {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 8px 4px; background: none; border: none; color: var(--text3);
+  font-size: 10px; font-weight: 500; cursor: pointer; transition: color 0.2s;
+  max-width: 72px;
+}
+.nav-btn .nav-icon { font-size: 20px; line-height: 1; }
+.nav-btn.active { color: var(--green); }
+.nav-badge {
+  position: absolute; top: 4px; right: calc(50% - 16px);
+  background: var(--red); color: #fff; font-size: 9px; font-weight: 700;
+  padding: 1px 5px; border-radius: 8px; min-width: 16px; text-align: center;
+}
 
-.content { padding: 16px 20px; padding-bottom: 100px; }
+/* ── CONTENT ── */
+.content { padding: 16px 20px; display: none; }
+.content.active { display: block; }
 .pills { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 12px; margin-bottom: 12px; }
 .pills::-webkit-scrollbar { display: none; }
+.section-title { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; font-weight: 600; }
 
+/* ── CARDS ── */
+.card {
+  background: var(--bg3); border: 1px solid var(--border); border-radius: 12px;
+  padding: 14px; margin-bottom: 10px; transition: all 0.2s;
+}
+.card:active { transform: scale(0.98); }
+
+/* ── TASK ITEMS ── */
 .task-item {
   display: flex; align-items: flex-start; gap: 12px; padding: 14px 0;
   border-bottom: 1px solid var(--bg3); transition: opacity 0.3s;
@@ -90,24 +120,7 @@ input:focus, select:focus { border-color: var(--green); }
 .tag { font-size: 10px; padding: 2px 8px; border-radius: 5px; font-weight: 500; }
 .task-notes { font-size: 11px; color: var(--text3); margin-top: 5px; line-height: 1.4; word-break: break-word; }
 
-.add-form {
-  background: var(--bg3); border-radius: 12px; padding: 16px;
-  margin-bottom: 16px; border: 1px solid var(--border); animation: fadeUp 0.2s ease;
-}
-.add-form .row { display: flex; gap: 8px; margin-bottom: 10px; }
-
-.completed-section { margin-top: 20px; }
-.completed-header {
-  padding: 10px 14px; border-radius: 8px; background: #0d1017;
-  border: 1px solid #1e293b; color: var(--text3); font-size: 13px;
-  cursor: pointer; display: flex; justify-content: space-between; align-items: center;
-  width: 100%;
-}
-.completed-list {
-  margin-top: 4px; border-radius: 8px; background: #0a0c12;
-  border: 1px solid #1e293b; padding: 0 12px;
-}
-
+/* ── SHOP ITEMS ── */
 .shop-item {
   display: flex; align-items: center; gap: 10px; padding: 10px 0;
   border-bottom: 1px solid var(--bg4);
@@ -119,21 +132,87 @@ input:focus, select:focus { border-color: var(--green); }
 }
 .shop-check.done { border-color: var(--green); background: var(--green); }
 
-.footer {
-  position: fixed; bottom: 0; left: 0; right: 0;
-  background: linear-gradient(transparent, var(--bg) 30%);
-  padding: 28px 16px 14px; text-align: center;
+/* ── ADD FORM ── */
+.add-form {
+  background: var(--bg3); border-radius: 12px; padding: 16px;
+  margin-bottom: 16px; border: 1px solid var(--border); animation: fadeUp 0.2s ease;
 }
-.footer p { font-size: 10px; color: #1e2030; font-family: 'JetBrains Mono', monospace; }
+.add-form .row { display: flex; gap: 8px; margin-bottom: 10px; }
 
+/* ── INBOX ── */
+.inbox-input-wrap {
+  position: relative; margin-bottom: 20px;
+}
+.inbox-input {
+  width: 100%; padding: 16px; padding-right: 52px; border-radius: 14px;
+  border: 1px solid var(--border); background: var(--bg3);
+  color: var(--text); font-size: 15px; outline: none;
+}
+.inbox-input:focus { border-color: var(--green); }
+.inbox-input::placeholder { color: var(--text3); }
+.inbox-send {
+  position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+  width: 36px; height: 36px; border-radius: 10px; border: none;
+  background: var(--green); color: #000; font-size: 18px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+
+/* ── IDEAS ── */
+.idea-card { cursor: pointer; }
+.idea-card .idea-text { font-size: 14px; line-height: 1.5; margin-bottom: 8px; word-break: break-word; }
+.idea-card .idea-meta { font-size: 10px; color: var(--text3); display: flex; gap: 8px; align-items: center; }
+.idea-actions { display: flex; gap: 6px; margin-top: 10px; }
+
+/* ── PROJECTS ── */
+.project-card { cursor: pointer; }
+.project-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.project-name { font-size: 15px; font-weight: 600; }
+.project-progress { height: 4px; background: var(--bg); border-radius: 2px; margin-bottom: 8px; overflow: hidden; }
+.project-progress-fill { height: 100%; background: var(--green); border-radius: 2px; transition: width 0.3s; }
+.project-stat { font-size: 11px; color: var(--text3); }
+
+/* ── LISTS ── */
+.list-card { cursor: pointer; }
+.list-icon { font-size: 24px; margin-bottom: 6px; }
+.list-name { font-size: 14px; font-weight: 600; margin-bottom: 2px; }
+.list-count { font-size: 11px; color: var(--text3); }
+
+/* ── DETAIL VIEWS (overlay) ── */
+.detail-view {
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: var(--bg); z-index: 200; overflow-y: auto;
+  max-width: 520px; margin: 0 auto;
+  animation: fadeUp 0.2s ease;
+}
+.detail-header {
+  padding: 16px 20px; border-bottom: 1px solid var(--bg4);
+  display: flex; align-items: center; gap: 12px; position: sticky; top: 0;
+  background: var(--bg); z-index: 1;
+}
+.detail-back {
+  background: none; border: none; color: var(--text2); font-size: 20px; cursor: pointer; padding: 4px;
+}
+.detail-title { font-size: 17px; font-weight: 600; flex: 1; }
+.detail-body { padding: 16px 20px; padding-bottom: 100px; }
+
+/* ── EMPTY STATES ── */
 .empty { text-align: center; padding: 48px 20px; color: var(--text3); }
 .empty .icon { font-size: 36px; margin-bottom: 8px; }
 .empty .msg { font-size: 13px; }
 
+/* ── ERROR ── */
 .error-banner {
   margin: 12px 20px 0; padding: 10px 14px; border-radius: 8px;
   background: #2d1215; border: 1px solid #5c2126; color: #f87171;
   font-size: 12px; display: flex; justify-content: space-between; align-items: center;
+}
+
+/* ── COMPLETED SECTION ── */
+.completed-header {
+  padding: 10px 14px; border-radius: 8px; background: #0d1017;
+  border: 1px solid #1e293b; color: var(--text3); font-size: 13px;
+  cursor: pointer; display: flex; justify-content: space-between; align-items: center;
+  width: 100%; margin-top: 20px;
 }
 </style>
 </head>
@@ -142,8 +221,8 @@ input:focus, select:focus { border-color: var(--green); }
 <!-- LOGIN SCREEN -->
 <div id="login-screen">
   <h1>Life Dashboard</h1>
-  <p>Sign in with Google to sync with your calendar</p>
-  <button class="btn btn-primary" onclick="handleAuth()" id="login-btn">🔐 Sign in with Google</button>
+  <p>Capture ideas, manage tasks, get things done</p>
+  <button class="btn btn-primary" onclick="handleAuth()" id="login-btn">Sign in with Google</button>
 </div>
 
 <!-- APP -->
@@ -151,19 +230,26 @@ input:focus, select:focus { border-color: var(--green); }
   <div class="header">
     <div class="header-row">
       <div>
-        <h1>Life Dashboard</h1>
+        <h1 id="view-title">Inbox</h1>
         <p class="date" id="date-display"></p>
       </div>
-      <button class="btn btn-ghost" onclick="syncTasks()" id="sync-btn">↻ Sync</button>
-    </div>
-    <div class="tabs">
-      <button class="tab active" onclick="switchView('tasks', this)">✅ Tasks <span id="task-count"></span></button>
-      <button class="tab" onclick="switchView('shopping', this)">🛒 Shop <span id="shop-count"></span></button>
+      <button class="btn btn-ghost btn-sm" onclick="syncAll()" id="sync-btn">Sync</button>
     </div>
   </div>
 
   <div id="error-container"></div>
 
+  <!-- ═══ INBOX VIEW ═══ -->
+  <div class="content active" id="inbox-view">
+    <div class="inbox-input-wrap">
+      <input class="inbox-input" id="inbox-input" placeholder="What's on your mind?"
+             onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();captureInbox()}">
+      <button class="inbox-send" onclick="captureInbox()">+</button>
+    </div>
+    <div id="inbox-list"></div>
+  </div>
+
+  <!-- ═══ TASKS VIEW ═══ -->
   <div class="content" id="tasks-view">
     <div class="pills" id="category-pills"></div>
     <button class="btn btn-ghost" style="width:100%;margin-bottom:16px;border-style:dashed" onclick="toggleAddForm()" id="add-btn">+ Add Task</button>
@@ -172,37 +258,99 @@ input:focus, select:focus { border-color: var(--green); }
     <div id="completed-section"></div>
   </div>
 
-  <div class="content" id="shopping-view" style="display:none">
+  <!-- ═══ SHOPPING VIEW ═══ -->
+  <div class="content" id="shopping-view">
     <div style="display:flex;gap:6px;margin-bottom:16px">
       <input id="shop-input" placeholder="Add item..." style="flex:1" onkeydown="if(event.key==='Enter')addShopItem()">
-      <input id="shop-qty" placeholder="#" style="width:42px;text-align:center" value="1">
+      <input id="shop-qty" placeholder="#" style="width:48px;text-align:center" value="1">
       <button class="btn btn-primary" onclick="addShopItem()">+</button>
     </div>
     <div id="shop-list"></div>
   </div>
 
-  <div class="footer">
-    <p id="footer-text">google calendar synced</p>
+  <!-- ═══ IDEAS VIEW ═══ -->
+  <div class="content" id="ideas-view">
+    <div id="ideas-list"></div>
+    <div class="empty" id="ideas-empty" style="display:none">
+      <div class="icon">💡</div>
+      <div class="msg">Capture thoughts in the Inbox — promote them here to develop further</div>
+    </div>
   </div>
+
+  <!-- ═══ PROJECTS VIEW ═══ -->
+  <div class="content" id="projects-view">
+    <button class="btn btn-ghost" style="width:100%;margin-bottom:16px;border-style:dashed" onclick="showAddProject()">+ New Project</button>
+    <div id="projects-list"></div>
+    <div class="empty" id="projects-empty" style="display:none">
+      <div class="icon">🎯</div>
+      <div class="msg">Create a project to break big ideas into actionable steps</div>
+    </div>
+  </div>
+
+  <!-- ═══ LISTS VIEW ═══ -->
+  <div class="content" id="lists-view">
+    <button class="btn btn-ghost" style="width:100%;margin-bottom:16px;border-style:dashed" onclick="showAddList()">+ New List</button>
+    <div id="lists-grid"></div>
+    <div class="empty" id="lists-empty" style="display:none">
+      <div class="icon">📋</div>
+      <div class="msg">Create custom lists for anything — packing, goals, recipes, whatever you need</div>
+    </div>
+  </div>
+
+  <!-- BOTTOM NAV -->
+  <nav class="bottom-nav">
+    <button class="nav-btn active" onclick="switchTab('inbox', this)" data-tab="inbox">
+      <span class="nav-icon">📥</span>Inbox
+    </button>
+    <button class="nav-btn" onclick="switchTab('tasks', this)" data-tab="tasks">
+      <span class="nav-icon">✅</span>Tasks
+    </button>
+    <button class="nav-btn" onclick="switchTab('shopping', this)" data-tab="shopping">
+      <span class="nav-icon">🛒</span>Shop
+    </button>
+    <button class="nav-btn" onclick="switchTab('ideas', this)" data-tab="ideas">
+      <span class="nav-icon">💡</span>Ideas
+    </button>
+    <button class="nav-btn" onclick="switchTab('projects', this)" data-tab="projects">
+      <span class="nav-icon">🎯</span>Projects
+    </button>
+    <button class="nav-btn" onclick="switchTab('lists', this)" data-tab="lists">
+      <span class="nav-icon">📋</span>Lists
+    </button>
+  </nav>
 </div>
 
+<!-- DETAIL VIEW CONTAINER -->
+<div id="detail-container"></div>
+
 <script>
-// ── CONFIG ──
+// ══════════════════════════════════════════════════
+// CONFIG
+// ══════════════════════════════════════════════════
 const CLIENT_ID = '724457331852-5jpikras7qjphvgbqg2blfs17m1bu21e.apps.googleusercontent.com';
-const SCOPES = 'https://www.googleapis.com/auth/calendar';
-const TASK_PREFIX = '📋';
-const SHOP_PREFIX = '🛒';
+const SCOPES = 'https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/drive.file';
 const CALENDAR_ID = 'yon.level@gmail.com';
 
-let tokenClient;
-let accessToken = null;
-let tasks = [];
+// Prefixes for Calendar events — each data type gets a unique emoji prefix
+const P = {
+  TASK: '📋',
+  SHOP: '🛒',
+  INBOX: '📥',
+  IDEA: '💡',
+  PROJECT: '🎯',
+  LIST: '📋L',
+  LIST_ITEM: '📋I',
+};
+
+let tokenClient, accessToken = null;
+let tasks = [], shopItems = [], inboxItems = [], ideas = [], projects = [], customLists = [];
 let activeCategory = 'all';
 let showAddForm = false;
-let showCompleted = false;
-let shopItems = [];
+let currentTab = 'inbox';
 
-// ── CATEGORIES & PRIORITIES ──
+// ══════════════════════════════════════════════════
+// CATEGORIES & PRIORITIES
+// ══════════════════════════════════════════════════
 const CATS = {
   'Parents Care': { icon: '💜', color: '#ec4899' },
   'School': { icon: '🏫', color: '#3b82f6' },
@@ -210,6 +358,7 @@ const CATS = {
   'Finance': { icon: '💰', color: '#eab308' },
   'Tasks': { icon: '✅', color: '#22c55e' },
   'Habits': { icon: '🏃', color: '#f97316' },
+  'Work': { icon: '💼', color: '#06b6d4' },
 };
 const PRIS = {
   'Urgent': { color: '#ef4444', order: 0 },
@@ -218,7 +367,9 @@ const PRIS = {
   'Low': { color: '#6b7280', order: 3 },
 };
 
-// ── GOOGLE AUTH ──
+// ══════════════════════════════════════════════════
+// GOOGLE AUTH
+// ══════════════════════════════════════════════════
 function initGsi() {
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: CLIENT_ID,
@@ -227,39 +378,34 @@ function initGsi() {
       if (response.error) { showError('Auth failed: ' + response.error); return; }
       accessToken = response.access_token;
       localStorage.setItem('dash-token', accessToken);
-      document.getElementById('login-screen').style.display = 'none';
-      document.getElementById('app').style.display = 'block';
-      updateDate();
-      syncTasks();
+      showApp();
     },
   });
 
-  // Try stored token
   const stored = localStorage.getItem('dash-token');
   if (stored) {
     accessToken = stored;
-    // Test if token is still valid
     fetch('https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=1', {
       headers: { Authorization: 'Bearer ' + accessToken }
     }).then(r => {
-      if (r.ok) {
-        document.getElementById('login-screen').style.display = 'none';
-        document.getElementById('app').style.display = 'block';
-        updateDate();
-        syncTasks();
-      } else {
-        accessToken = null;
-        localStorage.removeItem('dash-token');
-      }
+      if (r.ok) { showApp(); }
+      else { accessToken = null; localStorage.removeItem('dash-token'); }
     }).catch(() => {});
   }
 }
 
-function handleAuth() {
-  tokenClient.requestAccessToken({ prompt: 'consent' });
+function handleAuth() { tokenClient.requestAccessToken({ prompt: 'consent' }); }
+
+function showApp() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  updateDate();
+  syncAll();
 }
 
-// ── API HELPERS ──
+// ══════════════════════════════════════════════════
+// API HELPERS
+// ══════════════════════════════════════════════════
 async function calFetch(url, opts = {}) {
   const r = await fetch('https://www.googleapis.com/calendar/v3' + url, {
     ...opts,
@@ -276,9 +422,90 @@ async function calFetch(url, opts = {}) {
   return r.json();
 }
 
-// ── PARSE TASK ──
+async function createEvent(prefix, title, description) {
+  const dateStr = new Date().toISOString().split('T')[0];
+  return calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events`, {
+    method: 'POST',
+    body: JSON.stringify({
+      summary: prefix + ' ' + title,
+      description: description || '',
+      start: { date: dateStr },
+      end: { date: dateStr },
+    }),
+  });
+}
+
+async function updateEvent(id, data) {
+  return calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  });
+}
+
+async function deleteEvent(id) {
+  return calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${id}`, { method: 'DELETE' });
+}
+
+async function fetchEvents(prefix) {
+  const now = new Date();
+  const min = new Date(now.getFullYear() - 1, 0, 1).toISOString();
+  const max = new Date(now.getFullYear() + 2, 0, 1).toISOString();
+  const data = await calFetch(
+    `/calendars/${encodeURIComponent(CALENDAR_ID)}/events?timeMin=${min}&timeMax=${max}&maxResults=500&singleEvents=true&q=${encodeURIComponent(prefix)}`
+  );
+  return (data.items || []).filter(e => (e.summary || '').includes(prefix));
+}
+
+// ══════════════════════════════════════════════════
+// SYNC ALL
+// ══════════════════════════════════════════════════
+async function syncAll() {
+  const btn = document.getElementById('sync-btn');
+  btn.textContent = '...';
+  btn.disabled = true;
+  try {
+    const [taskEvts, shopEvts, inboxEvts, ideaEvts, projEvts, listEvts, listItemEvts] = await Promise.all([
+      fetchEvents(P.TASK),
+      fetchEvents(P.SHOP),
+      fetchEvents(P.INBOX),
+      fetchEvents(P.IDEA),
+      fetchEvents(P.PROJECT),
+      fetchEvents(P.LIST),
+      fetchEvents(P.LIST_ITEM),
+    ]);
+
+    tasks = taskEvts.map(parseTask);
+    tasks.sort((a, b) => (PRIS[a.priority]?.order ?? 2) - (PRIS[b.priority]?.order ?? 2));
+
+    shopItems = shopEvts.filter(e => !(e.summary || '').includes(P.TASK)).map(parseShopEvent);
+
+    inboxItems = inboxEvts.filter(e => {
+      const s = e.summary || '';
+      return !s.includes(P.TASK) && !s.includes(P.IDEA) && !s.includes(P.SHOP);
+    }).map(parseInboxEvent);
+    inboxItems.sort((a, b) => new Date(b.created) - new Date(a.created));
+
+    ideas = ideaEvts.map(parseIdeaEvent);
+    ideas.sort((a, b) => new Date(b.created) - new Date(a.created));
+
+    projects = projEvts.map(parseProjectEvent);
+
+    // Parse custom lists and their items
+    customLists = listEvts.map(e => parseListEvent(e, listItemEvts));
+
+    renderAll();
+  } catch (e) {
+    showError(e.message);
+  }
+  btn.textContent = 'Sync';
+  btn.disabled = false;
+}
+
+// ══════════════════════════════════════════════════
+// PARSERS
+// ══════════════════════════════════════════════════
 function parseTask(event) {
-  const title = (event.summary || '').replace(TASK_PREFIX, '').trim();
+  const title = (event.summary || '').replace(P.TASK, '').trim();
   const desc = event.description || '';
   const lines = desc.split('\n');
   const meta = lines[0] || '';
@@ -290,105 +517,174 @@ function parseTask(event) {
   for (const p of Object.keys(PRIS)) {
     if (meta.toLowerCase().includes(p.toLowerCase())) { priority = p; break; }
   }
-  return { id: event.id, title, category, priority, notes, done: false };
-}
-
-// ── SYNC TASKS ──
-async function syncTasks() {
-  const btn = document.getElementById('sync-btn');
-  btn.textContent = '⟳ ...';
-  btn.disabled = true;
-  try {
-    const now = new Date();
-    const min = new Date(now.getFullYear(), 0, 1).toISOString();
-    const max = new Date(now.getFullYear() + 2, 0, 1).toISOString();
-    const [taskData, shopData] = await Promise.all([
-      calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events?timeMin=${min}&timeMax=${max}&maxResults=250&singleEvents=true&q=${encodeURIComponent(TASK_PREFIX)}`),
-      calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events?timeMin=${min}&timeMax=${max}&maxResults=250&singleEvents=true&q=${encodeURIComponent(SHOP_PREFIX)}`)
-    ]);
-    tasks = (taskData.items || [])
-      .filter(e => (e.summary || '').includes(TASK_PREFIX))
-      .map(parseTask);
-    tasks.sort((a, b) => (PRIS[a.priority]?.order ?? 2) - (PRIS[b.priority]?.order ?? 2));
-
-    shopItems = (shopData.items || [])
-      .filter(e => (e.summary || '').includes(SHOP_PREFIX) && !(e.summary || '').includes(TASK_PREFIX))
-      .map(parseShopEvent);
-    renderAll();
-  } catch (e) {
-    showError(e.message);
-  }
-  btn.textContent = '↻ Sync';
-  btn.disabled = false;
+  const projectMatch = meta.match(/project:\s*(.+?)(?:\||$)/i);
+  return {
+    id: event.id, title, category, priority, notes,
+    done: meta.includes('[DONE]'),
+    project: projectMatch ? projectMatch[1].trim() : null,
+    created: event.created,
+  };
 }
 
 function parseShopEvent(event) {
-  const name = (event.summary || '').replace(SHOP_PREFIX, '').trim();
+  const name = (event.summary || '').replace(P.SHOP, '').trim();
   const desc = event.description || '';
   const qtyMatch = desc.match(/qty:\s*(\d+)/i);
   const checkedMatch = desc.match(/checked:\s*(true|false)/i);
   return {
-    id: event.id,
-    name,
+    id: event.id, name,
     qty: qtyMatch ? qtyMatch[1] : '1',
     checked: checkedMatch ? checkedMatch[1] === 'true' : false,
   };
 }
 
-// ── COMPLETE TASK ──
-async function completeTask(id) {
-  const el = document.querySelector(`[data-task="${id}"]`);
-  if (el) el.style.opacity = '0.3';
-  try {
-    await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${id}`, { method: 'DELETE' });
-    tasks = tasks.filter(t => t.id !== id);
-    renderAll();
-  } catch (e) {
-    showError('Failed to complete: ' + e.message);
-    if (el) el.style.opacity = '1';
-  }
+function parseInboxEvent(event) {
+  const text = (event.summary || '').replace(P.INBOX, '').trim();
+  const desc = event.description || '';
+  return { id: event.id, text, notes: desc, created: event.created };
 }
 
-// ── ADD TASK ──
-async function addTask() {
-  const title = document.getElementById('add-title').value.trim();
-  const cat = document.getElementById('add-cat').value;
-  const pri = document.getElementById('add-pri').value;
-  if (!title) return;
+function parseIdeaEvent(event) {
+  const text = (event.summary || '').replace(P.IDEA, '').trim();
+  const desc = event.description || '';
+  const statusMatch = desc.match(/status:\s*(.+)/i);
+  const notesLines = desc.split('\n').filter(l => !l.match(/^status:/i));
+  return {
+    id: event.id, text,
+    notes: notesLines.join('\n').trim(),
+    status: statusMatch ? statusMatch[1].trim() : 'raw',
+    created: event.created,
+  };
+}
 
-  const addBtn = document.querySelector('#add-form-container .btn-primary');
-  if (addBtn) { addBtn.textContent = 'Adding...'; addBtn.disabled = true; }
+function parseProjectEvent(event) {
+  const name = (event.summary || '').replace(P.PROJECT, '').trim();
+  const desc = event.description || '';
+  const statusMatch = desc.match(/status:\s*(.+)/i);
+  const goalMatch = desc.match(/goal:\s*(.+)/i);
+  return {
+    id: event.id, name,
+    goal: goalMatch ? goalMatch[1].trim() : '',
+    status: statusMatch ? statusMatch[1].trim() : 'active',
+    created: event.created,
+  };
+}
 
-  try {
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    const dateStr = tomorrow.toISOString().split('T')[0];
-
-    await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events`, {
-      method: 'POST',
-      body: JSON.stringify({
-        summary: TASK_PREFIX + ' ' + title,
-        description: cat + ' | ' + pri + ' priority',
-        start: { date: dateStr },
-        end: { date: dateStr },
-      }),
+function parseListEvent(event, listItemEvts) {
+  const name = (event.summary || '').replace(P.LIST, '').trim();
+  const desc = event.description || '';
+  const iconMatch = desc.match(/icon:\s*(.+)/i);
+  const listId = event.id;
+  const items = listItemEvts
+    .filter(e => (e.description || '').includes('list:' + listId))
+    .map(e => {
+      const text = (e.summary || '').replace(P.LIST_ITEM, '').trim();
+      const d = e.description || '';
+      const checkedMatch = d.match(/checked:\s*(true|false)/i);
+      return {
+        id: e.id, text,
+        checked: checkedMatch ? checkedMatch[1] === 'true' : false,
+      };
     });
-    toggleAddForm();
-    await syncTasks();
-  } catch (e) {
-    showError('Failed to add: ' + e.message);
-    if (addBtn) { addBtn.textContent = 'Add Task'; addBtn.disabled = false; }
-  }
+  return {
+    id: listId, name,
+    icon: iconMatch ? iconMatch[1].trim() : '📝',
+    items,
+  };
 }
 
-// ── RENDER ──
+// ══════════════════════════════════════════════════
+// RENDER ALL
+// ══════════════════════════════════════════════════
 function renderAll() {
+  renderInbox();
   renderPills();
   renderTasks();
   renderShop();
+  renderIdeas();
+  renderProjects();
+  renderLists();
   updateCounts();
 }
 
+// ══════════════════════════════════════════════════
+// INBOX
+// ══════════════════════════════════════════════════
+async function captureInbox() {
+  const input = document.getElementById('inbox-input');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  try {
+    await createEvent(P.INBOX, text, '');
+    await syncAll();
+  } catch (e) {
+    showError('Failed to capture: ' + e.message);
+  }
+}
+
+function renderInbox() {
+  const container = document.getElementById('inbox-list');
+  if (inboxItems.length === 0) {
+    container.innerHTML = '<div class="empty"><div class="icon">📥</div><div class="msg">Your inbox is empty — capture a thought above</div></div>';
+    return;
+  }
+  container.innerHTML = inboxItems.map((item, i) => `
+    <div class="card fade-up" style="animation-delay:${i * 0.03}s">
+      <div style="font-size:14px;line-height:1.5;margin-bottom:10px;word-break:break-word">${esc(item.text)}</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn btn-sm btn-ghost" onclick="promoteToTask('${item.id}')">Make Task</button>
+        <button class="btn btn-sm btn-ghost" onclick="promoteToIdea('${item.id}')">Save as Idea</button>
+        <button class="btn btn-sm btn-ghost" onclick="promoteToShop('${item.id}')">Add to Shop</button>
+        <button class="btn btn-sm btn-ghost" style="margin-left:auto;color:var(--red);border-color:var(--red)" onclick="deleteInbox('${item.id}')">Dismiss</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function promoteToTask(inboxId) {
+  const item = inboxItems.find(i => i.id === inboxId);
+  if (!item) return;
+  try {
+    await createEvent(P.TASK, item.text, 'Tasks | Medium priority');
+    await deleteEvent(inboxId);
+    await syncAll();
+  } catch (e) { showError(e.message); }
+}
+
+async function promoteToIdea(inboxId) {
+  const item = inboxItems.find(i => i.id === inboxId);
+  if (!item) return;
+  try {
+    await createEvent(P.IDEA, item.text, 'status: raw');
+    await deleteEvent(inboxId);
+    await syncAll();
+  } catch (e) { showError(e.message); }
+}
+
+async function promoteToShop(inboxId) {
+  const item = inboxItems.find(i => i.id === inboxId);
+  if (!item) return;
+  try {
+    await createEvent(P.SHOP, item.text, 'qty: 1\nchecked: false');
+    await deleteEvent(inboxId);
+    await syncAll();
+  } catch (e) { showError(e.message); }
+}
+
+async function deleteInbox(id) {
+  const el = document.querySelector(`[data-inbox="${id}"]`);
+  try {
+    await deleteEvent(id);
+    inboxItems = inboxItems.filter(i => i.id !== id);
+    renderInbox();
+    updateCounts();
+  } catch (e) { showError(e.message); }
+}
+
+// ══════════════════════════════════════════════════
+// TASKS
+// ══════════════════════════════════════════════════
 function renderPills() {
   const container = document.getElementById('category-pills');
   const active = tasks.filter(t => !t.done);
@@ -397,56 +693,73 @@ function renderPills() {
     const count = active.filter(t => t.category === name).length;
     if (count === 0) continue;
     const isActive = activeCategory === name;
-    html += `<button class="pill" style="${isActive?`border-color:${info.color};background:${info.color}12;color:${info.color}`:''}" onclick="setCategory('${name}')">${info.icon} ${name} (${count})</button>`;
+    html += `<button class="pill" style="${isActive ? `border-color:${info.color};background:${info.color}12;color:${info.color}` : ''}" onclick="setCategory('${name}')">${info.icon} ${name} (${count})</button>`;
   }
   container.innerHTML = html;
 }
 
 function renderTasks() {
   const container = document.getElementById('tasks-list');
-  const compContainer = document.getElementById('completed-section');
   const active = tasks.filter(t => !t.done);
   const filtered = activeCategory === 'all' ? active : active.filter(t => t.category === activeCategory);
 
   if (filtered.length === 0) {
-    container.innerHTML = `<div class="empty"><div class="icon">📝</div><div class="msg">${tasks.length===0?'No tasks — hit Sync or add one':'No tasks in this category'}</div></div>`;
+    container.innerHTML = `<div class="empty"><div class="icon">📝</div><div class="msg">${tasks.length === 0 ? 'No tasks yet' : 'No tasks in this category'}</div></div>`;
   } else {
     container.innerHTML = filtered.map((t, i) => {
       const cat = CATS[t.category] || CATS.Tasks;
       const pri = PRIS[t.priority] || PRIS.Medium;
       return `
-        <div class="task-item fade-up" data-task="${t.id}" style="animation-delay:${i*0.03}s">
+        <div class="task-item fade-up" data-task="${t.id}" style="animation-delay:${i * 0.03}s">
           <button class="task-check" style="border-color:${pri.color}40" onclick="completeTask('${t.id}')" title="Complete"></button>
           <div style="flex:1;min-width:0">
             <div class="task-title">${esc(t.title)}</div>
             <div class="task-meta">
               <span class="tag" style="background:${cat.color}15;color:${cat.color}">${cat.icon} ${t.category}</span>
               <span class="tag" style="background:${pri.color}15;color:${pri.color}">${t.priority}</span>
+              ${t.project ? `<span class="tag" style="background:var(--cyan)15;color:var(--cyan)">🎯 ${esc(t.project)}</span>` : ''}
             </div>
             ${t.notes ? `<div class="task-notes">${esc(t.notes)}</div>` : ''}
           </div>
         </div>`;
     }).join('');
   }
-
-  compContainer.innerHTML = '';
 }
 
-function updateCounts() {
-  const active = tasks.filter(t => !t.done);
-  document.getElementById('task-count').textContent = active.length ? `(${active.length})` : '';
-  const shopActive = shopItems.filter(i => !i.checked).length;
-  document.getElementById('shop-count').textContent = shopActive ? `(${shopActive})` : '';
-  document.getElementById('footer-text').textContent = `google calendar synced • ${active.length} tasks`;
+async function completeTask(id) {
+  const el = document.querySelector(`[data-task="${id}"]`);
+  if (el) el.style.opacity = '0.3';
+  try {
+    await deleteEvent(id);
+    tasks = tasks.filter(t => t.id !== id);
+    renderAll();
+  } catch (e) {
+    showError('Failed to complete: ' + e.message);
+    if (el) el.style.opacity = '1';
+  }
 }
 
-function updateDate() {
-  document.getElementById('date-display').textContent = new Date().toLocaleDateString('en-GB', {
-    weekday: 'long', day: 'numeric', month: 'short', year: 'numeric'
-  });
+async function addTask() {
+  const title = document.getElementById('add-title').value.trim();
+  const cat = document.getElementById('add-cat').value;
+  const pri = document.getElementById('add-pri').value;
+  const notes = document.getElementById('add-notes')?.value.trim() || '';
+  if (!title) return;
+
+  const addBtn = document.querySelector('#add-form-container .btn-primary');
+  if (addBtn) { addBtn.textContent = 'Adding...'; addBtn.disabled = true; }
+
+  try {
+    const desc = cat + ' | ' + pri + ' priority' + (notes ? '\n' + notes : '');
+    await createEvent(P.TASK, title, desc);
+    toggleAddForm();
+    await syncAll();
+  } catch (e) {
+    showError('Failed to add: ' + e.message);
+    if (addBtn) { addBtn.textContent = 'Add Task'; addBtn.disabled = false; }
+  }
 }
 
-// ── ADD FORM ──
 function toggleAddForm() {
   showAddForm = !showAddForm;
   const container = document.getElementById('add-form-container');
@@ -455,11 +768,12 @@ function toggleAddForm() {
     btn.style.display = 'none';
     container.innerHTML = `
       <div class="add-form">
-        <input id="add-title" placeholder="What needs to be done?" style="width:100%;margin-bottom:10px" onkeydown="if(event.key==='Enter')addTask()">
+        <input id="add-title" placeholder="What needs to be done?" style="margin-bottom:10px" onkeydown="if(event.key==='Enter')addTask()">
         <div class="row">
-          <select id="add-cat" style="flex:1">${Object.keys(CATS).map(c=>`<option value="${c}">${c}</option>`).join('')}</select>
-          <select id="add-pri" style="flex:1">${Object.keys(PRIS).map(p=>`<option value="${p}"${p==='Medium'?' selected':''}>${p}</option>`).join('')}</select>
+          <select id="add-cat" style="flex:1">${Object.keys(CATS).map(c => `<option value="${c}">${c}</option>`).join('')}</select>
+          <select id="add-pri" style="flex:1">${Object.keys(PRIS).map(p => `<option value="${p}"${p === 'Medium' ? ' selected' : ''}>${p}</option>`).join('')}</select>
         </div>
+        <textarea id="add-notes" placeholder="Notes (optional)" style="margin-bottom:10px" rows="2"></textarea>
         <div class="row">
           <button class="btn btn-primary" style="flex:1" onclick="addTask()">Add Task</button>
           <button class="btn btn-ghost" onclick="toggleAddForm()">Cancel</button>
@@ -472,7 +786,11 @@ function toggleAddForm() {
   }
 }
 
-// ── SHOPPING ──
+function setCategory(cat) { activeCategory = cat; renderPills(); renderTasks(); }
+
+// ══════════════════════════════════════════════════
+// SHOPPING
+// ══════════════════════════════════════════════════
 function renderShop() {
   const container = document.getElementById('shop-list');
   const unc = shopItems.filter(i => !i.checked);
@@ -487,8 +805,8 @@ function renderShop() {
     <div class="shop-item">
       <button class="shop-check" onclick="toggleShop('${i.id}')"></button>
       <span style="flex:1;font-size:13px">${esc(i.name)}</span>
-      <span style="font-size:11px;color:var(--text3);font-family:monospace">×${i.qty}</span>
-      <button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:12px" onclick="deleteShop('${i.id}')">🗑</button>
+      <span style="font-size:11px;color:var(--text3);font-family:monospace">${i.qty !== '1' ? 'x' + i.qty : ''}</span>
+      <button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:4px" onclick="deleteShop('${i.id}')">x</button>
     </div>`).join('');
 
   if (chk.length > 0) {
@@ -505,7 +823,6 @@ function renderShop() {
     html += '</div>';
   }
   container.innerHTML = html;
-  updateCounts();
 }
 
 async function addShopItem() {
@@ -516,54 +833,29 @@ async function addShopItem() {
   const qty = qtyInput.value || '1';
   input.value = ''; qtyInput.value = '1';
   try {
-    const dateStr = new Date().toISOString().split('T')[0];
-    await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events`, {
-      method: 'POST',
-      body: JSON.stringify({
-        summary: SHOP_PREFIX + ' ' + name,
-        description: `qty: ${qty}\nchecked: false`,
-        start: { date: dateStr },
-        end: { date: dateStr },
-      }),
-    });
-    await syncTasks();
-  } catch (e) {
-    showError('Failed to add item: ' + e.message);
-  }
+    await createEvent(P.SHOP, name, `qty: ${qty}\nchecked: false`);
+    await syncAll();
+  } catch (e) { showError('Failed to add item: ' + e.message); }
 }
 
 async function toggleShop(id) {
   const item = shopItems.find(i => i.id === id);
   if (!item) return;
-  const newChecked = !item.checked;
-  item.checked = newChecked;
+  item.checked = !item.checked;
   renderShop();
   try {
-    await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${id}`, {
-      method: 'PATCH',
-      body: JSON.stringify({
-        description: `qty: ${item.qty}\nchecked: ${newChecked}`,
-      }),
-    });
+    await updateEvent(id, { description: `qty: ${item.qty}\nchecked: ${item.checked}` });
   } catch (e) {
-    item.checked = !newChecked;
+    item.checked = !item.checked;
     renderShop();
-    showError('Failed to update item: ' + e.message);
+    showError(e.message);
   }
 }
 
 async function deleteShop(id) {
-  const idx = shopItems.findIndex(i => i.id === id);
-  if (idx === -1) return;
-  const removed = shopItems.splice(idx, 1);
+  shopItems = shopItems.filter(i => i.id !== id);
   renderShop();
-  try {
-    await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${id}`, { method: 'DELETE' });
-  } catch (e) {
-    shopItems.splice(idx, 0, removed[0]);
-    renderShop();
-    showError('Failed to delete item: ' + e.message);
-  }
+  try { await deleteEvent(id); } catch (e) { showError(e.message); await syncAll(); }
 }
 
 async function clearShop() {
@@ -572,32 +864,474 @@ async function clearShop() {
   shopItems = shopItems.filter(i => !i.checked);
   renderShop();
   try {
-    await Promise.all(checked.map(i =>
-      calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${i.id}`, { method: 'DELETE' })
-    ));
+    await Promise.all(checked.map(i => deleteEvent(i.id)));
+  } catch (e) { showError(e.message); await syncAll(); }
+}
+
+// ══════════════════════════════════════════════════
+// IDEAS
+// ══════════════════════════════════════════════════
+function renderIdeas() {
+  const container = document.getElementById('ideas-list');
+  const empty = document.getElementById('ideas-empty');
+
+  if (ideas.length === 0) {
+    container.innerHTML = '';
+    empty.style.display = '';
+    return;
+  }
+  empty.style.display = 'none';
+
+  const statusOrder = { raw: 0, developing: 1, ready: 2 };
+  const sorted = [...ideas].sort((a, b) => (statusOrder[a.status] || 0) - (statusOrder[b.status] || 0));
+
+  container.innerHTML = sorted.map((idea, i) => {
+    const statusColors = { raw: 'var(--text3)', developing: 'var(--yellow)', ready: 'var(--green)' };
+    const statusColor = statusColors[idea.status] || 'var(--text3)';
+    return `
+      <div class="card idea-card fade-up" style="animation-delay:${i * 0.03}s">
+        <div class="idea-text">${esc(idea.text)}</div>
+        ${idea.notes ? `<div style="font-size:12px;color:var(--text2);margin-bottom:8px;line-height:1.4">${esc(idea.notes)}</div>` : ''}
+        <div class="idea-meta">
+          <span class="tag" style="background:${statusColor}15;color:${statusColor}">${idea.status}</span>
+          <span>${timeAgo(idea.created)}</span>
+        </div>
+        <div class="idea-actions">
+          <button class="btn btn-sm btn-ghost" onclick="promoteIdeaToTask('${idea.id}')">Make Task</button>
+          <button class="btn btn-sm btn-ghost" onclick="promoteIdeaToProject('${idea.id}')">Make Project</button>
+          <button class="btn btn-sm btn-ghost" onclick="editIdea('${idea.id}')">Edit</button>
+          <button class="btn btn-sm btn-ghost" style="color:var(--red);border-color:var(--red);margin-left:auto" onclick="deleteIdea('${idea.id}')">Delete</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+async function promoteIdeaToTask(ideaId) {
+  const idea = ideas.find(i => i.id === ideaId);
+  if (!idea) return;
+  try {
+    await createEvent(P.TASK, idea.text, 'Tasks | Medium priority\n' + (idea.notes || ''));
+    await deleteEvent(ideaId);
+    await syncAll();
+  } catch (e) { showError(e.message); }
+}
+
+async function promoteIdeaToProject(ideaId) {
+  const idea = ideas.find(i => i.id === ideaId);
+  if (!idea) return;
+  try {
+    await createEvent(P.PROJECT, idea.text, 'status: active\ngoal: ' + (idea.notes || idea.text));
+    await deleteEvent(ideaId);
+    await syncAll();
+    switchTab('projects', document.querySelector('[data-tab="projects"]'));
+  } catch (e) { showError(e.message); }
+}
+
+function editIdea(ideaId) {
+  const idea = ideas.find(i => i.id === ideaId);
+  if (!idea) return;
+
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">Edit Idea</span>
+      <button class="btn btn-sm btn-primary" id="save-idea-btn" onclick="saveIdea('${ideaId}')">Save</button>
+    </div>
+    <div class="detail-body">
+      <div style="margin-bottom:12px">
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">IDEA</label>
+        <textarea id="edit-idea-text" style="min-height:80px">${esc(idea.text)}</textarea>
+      </div>
+      <div style="margin-bottom:12px">
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">NOTES</label>
+        <textarea id="edit-idea-notes" style="min-height:120px">${esc(idea.notes || '')}</textarea>
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">STATUS</label>
+        <select id="edit-idea-status">
+          <option value="raw" ${idea.status === 'raw' ? 'selected' : ''}>Raw</option>
+          <option value="developing" ${idea.status === 'developing' ? 'selected' : ''}>Developing</option>
+          <option value="ready" ${idea.status === 'ready' ? 'selected' : ''}>Ready</option>
+        </select>
+      </div>
+    </div>
+  `);
+}
+
+async function saveIdea(ideaId) {
+  const text = document.getElementById('edit-idea-text').value.trim();
+  const notes = document.getElementById('edit-idea-notes').value.trim();
+  const status = document.getElementById('edit-idea-status').value;
+  if (!text) return;
+  const btn = document.getElementById('save-idea-btn');
+  btn.textContent = '...'; btn.disabled = true;
+  try {
+    await updateEvent(ideaId, {
+      summary: P.IDEA + ' ' + text,
+      description: 'status: ' + status + (notes ? '\n' + notes : ''),
+    });
+    closeDetail();
+    await syncAll();
   } catch (e) {
-    showError('Failed to clear some items: ' + e.message);
-    await syncTasks();
+    showError(e.message);
+    btn.textContent = 'Save'; btn.disabled = false;
   }
 }
 
-// ── UI HELPERS ──
-function switchView(v, btn) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  btn.classList.add('active');
-  document.getElementById('tasks-view').style.display = v === 'tasks' ? '' : 'none';
-  document.getElementById('shopping-view').style.display = v === 'shopping' ? '' : 'none';
+async function deleteIdea(id) {
+  try { await deleteEvent(id); ideas = ideas.filter(i => i.id !== id); renderIdeas(); updateCounts(); } catch (e) { showError(e.message); }
 }
 
-function setCategory(cat) { activeCategory = cat; renderPills(); renderTasks(); }
+// ══════════════════════════════════════════════════
+// PROJECTS
+// ══════════════════════════════════════════════════
+function renderProjects() {
+  const container = document.getElementById('projects-list');
+  const empty = document.getElementById('projects-empty');
 
+  if (projects.length === 0) {
+    container.innerHTML = '';
+    empty.style.display = '';
+    return;
+  }
+  empty.style.display = 'none';
+
+  container.innerHTML = projects.map((proj, i) => {
+    const projTasks = tasks.filter(t => t.project === proj.name);
+    const total = projTasks.length;
+    const done = projTasks.filter(t => t.done).length;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+
+    return `
+      <div class="card project-card fade-up" style="animation-delay:${i * 0.03}s" onclick="openProject('${proj.id}')">
+        <div class="project-header">
+          <span class="project-name">${esc(proj.name)}</span>
+          <span class="tag" style="background:var(--green)15;color:var(--green)">${proj.status}</span>
+        </div>
+        ${proj.goal ? `<div style="font-size:12px;color:var(--text2);margin-bottom:8px">${esc(proj.goal)}</div>` : ''}
+        <div class="project-progress"><div class="project-progress-fill" style="width:${pct}%"></div></div>
+        <div class="project-stat">${done}/${total} tasks done${total > 0 ? ` (${pct}%)` : ''}</div>
+      </div>`;
+  }).join('');
+}
+
+function showAddProject() {
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">New Project</span>
+      <button class="btn btn-sm btn-primary" id="save-proj-btn" onclick="saveNewProject()">Create</button>
+    </div>
+    <div class="detail-body">
+      <div style="margin-bottom:12px">
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">PROJECT NAME</label>
+        <input id="new-proj-name" placeholder="e.g. Learn Spanish, Renovate kitchen">
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">GOAL / DESCRIPTION</label>
+        <textarea id="new-proj-goal" placeholder="What does success look like?" rows="3"></textarea>
+      </div>
+    </div>
+  `);
+  setTimeout(() => document.getElementById('new-proj-name')?.focus(), 100);
+}
+
+async function saveNewProject() {
+  const name = document.getElementById('new-proj-name').value.trim();
+  const goal = document.getElementById('new-proj-goal').value.trim();
+  if (!name) return;
+  const btn = document.getElementById('save-proj-btn');
+  btn.textContent = '...'; btn.disabled = true;
+  try {
+    await createEvent(P.PROJECT, name, 'status: active\ngoal: ' + goal);
+    closeDetail();
+    await syncAll();
+  } catch (e) {
+    showError(e.message);
+    btn.textContent = 'Create'; btn.disabled = false;
+  }
+}
+
+function openProject(projId) {
+  const proj = projects.find(p => p.id === projId);
+  if (!proj) return;
+  const projTasks = tasks.filter(t => t.project === proj.name);
+  const activeTasks = projTasks.filter(t => !t.done);
+
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">${esc(proj.name)}</span>
+      <button class="btn btn-sm btn-danger" onclick="deleteProject('${proj.id}')">Delete</button>
+    </div>
+    <div class="detail-body">
+      ${proj.goal ? `<div style="font-size:13px;color:var(--text2);margin-bottom:16px">${esc(proj.goal)}</div>` : ''}
+      <div style="display:flex;gap:6px;margin-bottom:16px">
+        <input id="proj-task-input" placeholder="Add a task to this project..." style="flex:1" onkeydown="if(event.key==='Enter')addProjectTask('${proj.id}','${esc(proj.name)}')">
+        <button class="btn btn-primary btn-sm" onclick="addProjectTask('${proj.id}','${esc(proj.name)}')">+</button>
+      </div>
+      <div id="proj-tasks">
+        ${activeTasks.length === 0 ? '<div class="empty"><div class="msg" style="font-size:12px">No tasks yet — add one above</div></div>' :
+          activeTasks.map(t => `
+            <div class="task-item" data-task="${t.id}">
+              <button class="task-check" style="border-color:var(--green)40" onclick="completeTask('${t.id}');openProject('${proj.id}')"></button>
+              <div style="flex:1;min-width:0">
+                <div class="task-title">${esc(t.title)}</div>
+              </div>
+            </div>
+          `).join('')
+        }
+      </div>
+    </div>
+  `);
+}
+
+async function addProjectTask(projId, projName) {
+  const input = document.getElementById('proj-task-input');
+  const title = input.value.trim();
+  if (!title) return;
+  input.value = '';
+  try {
+    await createEvent(P.TASK, title, `Tasks | Medium priority | project: ${projName}`);
+    await syncAll();
+    openProject(projId);
+  } catch (e) { showError(e.message); }
+}
+
+async function deleteProject(projId) {
+  try {
+    await deleteEvent(projId);
+    closeDetail();
+    await syncAll();
+  } catch (e) { showError(e.message); }
+}
+
+// ══════════════════════════════════════════════════
+// CUSTOM LISTS
+// ══════════════════════════════════════════════════
+function renderLists() {
+  const container = document.getElementById('lists-grid');
+  const empty = document.getElementById('lists-empty');
+
+  if (customLists.length === 0) {
+    container.innerHTML = '';
+    empty.style.display = '';
+    return;
+  }
+  empty.style.display = 'none';
+
+  container.innerHTML = customLists.map((list, i) => {
+    const unchecked = list.items.filter(i => !i.checked).length;
+    return `
+      <div class="card list-card fade-up" style="animation-delay:${i * 0.03}s" onclick="openList('${list.id}')">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-size:24px">${list.icon}</span>
+          <div>
+            <div class="list-name">${esc(list.name)}</div>
+            <div class="list-count">${list.items.length} items${unchecked > 0 ? ` (${unchecked} remaining)` : ''}</div>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function showAddList() {
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">New List</span>
+      <button class="btn btn-sm btn-primary" id="save-list-btn" onclick="saveNewList()">Create</button>
+    </div>
+    <div class="detail-body">
+      <div style="margin-bottom:12px">
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">LIST NAME</label>
+        <input id="new-list-name" placeholder="e.g. Packing list, Goal ideas">
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">ICON (emoji)</label>
+        <input id="new-list-icon" placeholder="📝" value="📝" style="width:60px;text-align:center;font-size:20px">
+      </div>
+    </div>
+  `);
+  setTimeout(() => document.getElementById('new-list-name')?.focus(), 100);
+}
+
+async function saveNewList() {
+  const name = document.getElementById('new-list-name').value.trim();
+  const icon = document.getElementById('new-list-icon').value.trim() || '📝';
+  if (!name) return;
+  const btn = document.getElementById('save-list-btn');
+  btn.textContent = '...'; btn.disabled = true;
+  try {
+    await createEvent(P.LIST, name, 'icon: ' + icon);
+    closeDetail();
+    await syncAll();
+  } catch (e) {
+    showError(e.message);
+    btn.textContent = 'Create'; btn.disabled = false;
+  }
+}
+
+function openList(listId) {
+  const list = customLists.find(l => l.id === listId);
+  if (!list) return;
+  const unchecked = list.items.filter(i => !i.checked);
+  const checked = list.items.filter(i => i.checked);
+
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">${list.icon} ${esc(list.name)}</span>
+      <button class="btn btn-sm btn-danger" onclick="deleteList('${list.id}')">Delete</button>
+    </div>
+    <div class="detail-body">
+      <div style="display:flex;gap:6px;margin-bottom:16px">
+        <input id="list-item-input" placeholder="Add item..." style="flex:1" onkeydown="if(event.key==='Enter')addListItem('${list.id}')">
+        <button class="btn btn-primary btn-sm" onclick="addListItem('${list.id}')">+</button>
+      </div>
+      <div id="list-items">
+        ${unchecked.map(item => `
+          <div class="shop-item">
+            <button class="shop-check" onclick="toggleListItem('${item.id}','${list.id}')"></button>
+            <span style="flex:1;font-size:13px">${esc(item.text)}</span>
+            <button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:4px" onclick="deleteListItem('${item.id}','${list.id}')">x</button>
+          </div>
+        `).join('')}
+        ${checked.length > 0 ? `
+          <div style="margin-top:16px">
+            <span class="section-title">Done (${checked.length})</span>
+            ${checked.map(item => `
+              <div class="shop-item" style="opacity:0.4">
+                <button class="shop-check done" onclick="toggleListItem('${item.id}','${list.id}')">✓</button>
+                <span style="flex:1;font-size:13px;color:var(--text3);text-decoration:line-through">${esc(item.text)}</span>
+              </div>
+            `).join('')}
+          </div>
+        ` : ''}
+        ${list.items.length === 0 ? '<div class="empty"><div class="msg" style="font-size:12px">Empty list — add items above</div></div>' : ''}
+      </div>
+    </div>
+  `);
+}
+
+async function addListItem(listId) {
+  const input = document.getElementById('list-item-input');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  try {
+    await createEvent(P.LIST_ITEM, text, `list:${listId}\nchecked: false`);
+    await syncAll();
+    openList(listId);
+  } catch (e) { showError(e.message); }
+}
+
+async function toggleListItem(itemId, listId) {
+  const list = customLists.find(l => l.id === listId);
+  if (!list) return;
+  const item = list.items.find(i => i.id === itemId);
+  if (!item) return;
+  item.checked = !item.checked;
+  openList(listId); // Re-render
+  try {
+    const event = await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${itemId}`);
+    const desc = (event.description || '').replace(/checked:\s*(true|false)/i, 'checked: ' + item.checked);
+    await updateEvent(itemId, { description: desc });
+  } catch (e) {
+    item.checked = !item.checked;
+    openList(listId);
+    showError(e.message);
+  }
+}
+
+async function deleteListItem(itemId, listId) {
+  try {
+    await deleteEvent(itemId);
+    await syncAll();
+    openList(listId);
+  } catch (e) { showError(e.message); }
+}
+
+async function deleteList(listId) {
+  const list = customLists.find(l => l.id === listId);
+  if (!list) return;
+  try {
+    // Delete list and all its items
+    await Promise.all([
+      deleteEvent(listId),
+      ...list.items.map(i => deleteEvent(i.id))
+    ]);
+    closeDetail();
+    await syncAll();
+  } catch (e) { showError(e.message); }
+}
+
+// ══════════════════════════════════════════════════
+// NAVIGATION & UI
+// ══════════════════════════════════════════════════
+const VIEW_TITLES = {
+  inbox: 'Inbox', tasks: 'Tasks', shopping: 'Shopping',
+  ideas: 'Ideas', projects: 'Projects', lists: 'Lists',
+};
+
+function switchTab(tab, btn) {
+  currentTab = tab;
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('.content').forEach(c => c.classList.remove('active'));
+  document.getElementById(tab + '-view').classList.add('active');
+  document.getElementById('view-title').textContent = VIEW_TITLES[tab] || tab;
+}
+
+function updateCounts() {
+  // Could add badge counts to nav buttons here
+  const active = tasks.filter(t => !t.done);
+  document.getElementById('date-display').textContent =
+    new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+function updateDate() {
+  document.getElementById('date-display').textContent =
+    new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+// ── Detail view helpers ──
+function showDetail(html) {
+  const container = document.getElementById('detail-container');
+  container.innerHTML = `<div class="detail-view">${html}</div>`;
+}
+
+function closeDetail() {
+  document.getElementById('detail-container').innerHTML = '';
+}
+
+// ── Error ──
 function showError(msg) {
   const c = document.getElementById('error-container');
-  c.innerHTML = `<div class="error-banner"><span>${esc(msg)}</span><button style="background:none;border:none;color:#f87171;cursor:pointer;font-size:16px" onclick="this.parentElement.remove()">×</button></div>`;
+  c.innerHTML = `<div class="error-banner"><span>${esc(msg)}</span><button style="background:none;border:none;color:#f87171;cursor:pointer;font-size:16px" onclick="this.parentElement.remove()">x</button></div>`;
   setTimeout(() => c.innerHTML = '', 5000);
 }
 
+// ── Utilities ──
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function timeAgo(dateStr) {
+  if (!dateStr) return '';
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return mins + 'm ago';
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs + 'h ago';
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return days + 'd ago';
+  return Math.floor(days / 7) + 'w ago';
+}
+
+// ── PWA / Service Worker ──
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
 </script>
 
 <!-- Google Identity Services -->

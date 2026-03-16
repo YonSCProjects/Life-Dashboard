@@ -1,0 +1,19 @@
+{
+  "name": "Life Dashboard",
+  "short_name": "Dashboard",
+  "description": "Your personal life management tool — tasks, ideas, projects, lists",
+  "start_url": "/Life-Dashboard/",
+  "scope": "/Life-Dashboard/",
+  "display": "standalone",
+  "background_color": "#0a0b10",
+  "theme_color": "#0a0b10",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "icons/icon-192.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
