@@ -246,6 +246,91 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
   cursor: pointer; display: flex; justify-content: space-between; align-items: center;
   width: 100%; margin-top: 20px;
 }
+
+/* ── AI CHAT ── */
+.ai-fab {
+  position: fixed; bottom: 80px; right: 16px; width: 52px; height: 52px;
+  border-radius: 50%; background: linear-gradient(135deg, #a855f7, #6366f1);
+  border: none; color: #fff; font-size: 24px; cursor: pointer;
+  box-shadow: 0 4px 20px rgba(139,92,246,0.4); z-index: 90;
+  display: flex; align-items: center; justify-content: center;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+.ai-fab:hover { transform: scale(1.08); box-shadow: 0 6px 24px rgba(139,92,246,0.6); }
+.ai-fab:active { transform: scale(0.95); }
+
+.ai-panel {
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: var(--bg); z-index: 300; max-width: 520px; margin: 0 auto;
+  display: flex; flex-direction: column; animation: fadeUp 0.2s ease;
+}
+.ai-header {
+  padding: 16px 20px; border-bottom: 1px solid var(--bg4);
+  display: flex; align-items: center; gap: 12px;
+}
+.ai-header-title { flex: 1; font-size: 17px; font-weight: 600; }
+.ai-header-subtitle { font-size: 11px; color: var(--text3); }
+.ai-close {
+  background: none; border: none; color: var(--text2); font-size: 22px;
+  cursor: pointer; padding: 4px;
+}
+.ai-messages {
+  flex: 1; overflow-y: auto; padding: 16px 20px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.ai-msg {
+  max-width: 88%; padding: 10px 14px; border-radius: 12px;
+  font-size: 13px; line-height: 1.6; word-break: break-word;
+  white-space: pre-wrap;
+}
+.ai-msg.user {
+  align-self: flex-end; background: var(--purple); color: #fff;
+  border-bottom-right-radius: 4px;
+}
+.ai-msg.assistant {
+  align-self: flex-start; background: var(--bg3); border: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+.ai-msg.assistant a { color: var(--blue); }
+.ai-msg.thinking {
+  align-self: flex-start; background: var(--bg3); border: 1px solid var(--border);
+  color: var(--text3); font-style: italic;
+}
+.ai-input-row {
+  padding: 12px 16px; border-top: 1px solid var(--bg4);
+  display: flex; gap: 8px; background: var(--bg);
+  padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+}
+.ai-input {
+  flex: 1; padding: 10px 14px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--bg3);
+  color: var(--text); font-size: 14px; outline: none;
+}
+.ai-input:focus { border-color: var(--purple); }
+.ai-input::placeholder { color: var(--text3); }
+.ai-send-btn {
+  width: 40px; height: 40px; border-radius: 10px; border: none;
+  background: linear-gradient(135deg, #a855f7, #6366f1);
+  color: #fff; font-size: 16px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.ai-send-btn:disabled { opacity: 0.4; cursor: default; }
+.ai-suggestions {
+  display: flex; flex-wrap: wrap; gap: 6px; padding: 0 20px 12px;
+}
+.ai-suggestion {
+  padding: 6px 12px; border-radius: 16px; border: 1px solid var(--border);
+  background: var(--bg3); color: var(--text2); font-size: 11px;
+  cursor: pointer; transition: all 0.2s;
+}
+.ai-suggestion:hover { border-color: var(--purple); color: var(--purple); }
+.ai-settings-row {
+  padding: 8px 20px; display: flex; align-items: center; gap: 8px;
+  font-size: 11px; color: var(--text3);
+}
+.ai-settings-row input {
+  flex: 1; padding: 6px 10px; font-size: 11px;
+}
 </style>
 </head>
 <body>
@@ -377,6 +462,12 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 
 <!-- DETAIL VIEW CONTAINER -->
 <div id="detail-container"></div>
+
+<!-- AI CHAT FAB -->
+<button class="ai-fab" id="ai-fab" onclick="openAI()" title="Ask Claude" style="display:none">✨</button>
+
+<!-- AI CHAT PANEL -->
+<div id="ai-panel" style="display:none"></div>
 
 <script>
 // ══════════════════════════════════════════════════
@@ -1701,6 +1792,223 @@ function timeAgo(dateStr) {
   if (days < 7) return days + 'd ago';
   return Math.floor(days / 7) + 'w ago';
 }
+
+// ══════════════════════════════════════════════════
+// AI CHAT (Claude)
+// ══════════════════════════════════════════════════
+const AI_WORKER_KEY = 'dash-ai-worker-url';
+let aiMessages = [];
+let aiStreaming = false;
+
+function getWorkerUrl() { return localStorage.getItem(AI_WORKER_KEY) || ''; }
+function setWorkerUrl(url) { localStorage.setItem(AI_WORKER_KEY, url); updateFabVisibility(); }
+function updateFabVisibility() {
+  const fab = document.getElementById('ai-fab');
+  if (fab) fab.style.display = accessToken ? '' : 'none';
+}
+
+function buildSystemPrompt() {
+  const today = new Date().toLocaleDateString('en-GB', { weekday:'long', day:'numeric', month:'long', year:'numeric' });
+  const activeTasks = tasks.filter(t => !t.done);
+  const doneTasks = tasks.filter(t => t.done);
+  const overdue = activeTasks.filter(t => t.due && getDueClass(t.due) === 'overdue');
+  const dueToday = activeTasks.filter(t => t.due && getDueClass(t.due) === 'today');
+
+  const taskList = activeTasks.map(t => {
+    let s = `- ${t.title} [${t.category}, ${t.priority}]`;
+    if (t.due) s += ` due: ${formatDue(t.due)}`;
+    if (t.project) s += ` (project: ${t.project})`;
+    if (t.notes) s += ` — ${t.notes.substring(0, 100)}`;
+    return s;
+  }).join('\n') || '(none)';
+
+  const inboxList = inboxItems.map(i => `- ${i.text} (${timeAgo(i.created)})`).join('\n') || '(none)';
+
+  const ideaList = ideas.map(i => {
+    let s = `- ${i.text} [${i.status}]`;
+    if (i.notes) s += ` — ${i.notes.substring(0, 100)}`;
+    return s;
+  }).join('\n') || '(none)';
+
+  const projList = projects.map(p => {
+    const pt = tasks.filter(t => t.project === p.name);
+    const done = pt.filter(t => t.done).length;
+    return `- ${p.name}: ${done}/${pt.length} tasks done${p.goal ? ' — Goal: ' + p.goal : ''}`;
+  }).join('\n') || '(none)';
+
+  const shopList = shopItems.filter(i => !i.checked).map(i => {
+    let s = `- ${i.name}`;
+    if (i.qty !== '1') s += ` x${i.qty}`;
+    if (i.category) s += ` [${i.category}]`;
+    return s;
+  }).join('\n') || '(none)';
+
+  const listsSummary = customLists.map(l => {
+    const unc = l.items.filter(i => !i.checked).length;
+    return `- ${l.icon} ${l.name}: ${l.items.length} items (${unc} remaining)`;
+  }).join('\n') || '(none)';
+
+  return `You are an AI assistant embedded in a personal Life Dashboard app. Today is ${today}.
+
+You help the user manage their life: find tasks, analyze projects, brainstorm ideas, plan their day, and triage their inbox.
+
+Be concise, actionable, and friendly. Use short responses. When suggesting actions, be specific to their actual data.
+
+== CURRENT DATA ==
+
+INBOX (${inboxItems.length} unprocessed):
+${inboxList}
+
+ACTIVE TASKS (${activeTasks.length}):
+${taskList}
+${overdue.length > 0 ? `\n⚠️ OVERDUE (${overdue.length}): ${overdue.map(t => t.title).join(', ')}` : ''}
+${dueToday.length > 0 ? `\n📅 DUE TODAY (${dueToday.length}): ${dueToday.map(t => t.title).join(', ')}` : ''}
+
+COMPLETED TASKS (${doneTasks.length}): ${doneTasks.map(t => t.title).join(', ') || '(none)'}
+
+IDEAS (${ideas.length}):
+${ideaList}
+
+PROJECTS (${projects.length}):
+${projList}
+
+SHOPPING LIST (${shopItems.filter(i => !i.checked).length} unchecked):
+${shopList}
+
+CUSTOM LISTS (${customLists.length}):
+${listsSummary}`;
+}
+
+function openAI() {
+  const panel = document.getElementById('ai-panel');
+  const workerUrl = getWorkerUrl();
+
+  panel.style.display = '';
+  panel.innerHTML = `
+    <div class="ai-panel">
+      <div class="ai-header">
+        <button class="ai-close" onclick="closeAI()">&larr;</button>
+        <div>
+          <div class="ai-header-title">✨ Claude</div>
+          <div class="ai-header-subtitle">Your life assistant</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="aiMessages=[];openAI()">Clear</button>
+      </div>
+      ${!workerUrl ? `
+        <div class="ai-settings-row" style="flex-direction:column;align-items:stretch;padding:20px">
+          <div style="margin-bottom:12px;font-size:13px;color:var(--text)">Enter your Cloudflare Worker URL to enable AI</div>
+          <input id="ai-worker-input" placeholder="https://life-dashboard-ai.YOUR-NAME.workers.dev" style="font-size:13px;padding:10px 12px">
+          <button class="btn btn-primary" style="margin-top:8px" onclick="setWorkerUrl(document.getElementById('ai-worker-input').value.trim());openAI()">Connect</button>
+          <div style="margin-top:16px;font-size:11px;color:var(--text3);line-height:1.6">
+            <b>Setup (one-time):</b><br>
+            1. Install wrangler: <code>npm i -g wrangler</code><br>
+            2. cd into worker/ and run: <code>npx wrangler deploy</code><br>
+            3. Set your API key: <code>npx wrangler secret put ANTHROPIC_API_KEY</code><br>
+            4. Paste the worker URL above
+          </div>
+        </div>
+      ` : `
+        <div class="ai-messages" id="ai-messages">
+          ${aiMessages.length === 0 ? `
+            <div style="text-align:center;padding:24px 0;color:var(--text3)">
+              <div style="font-size:28px;margin-bottom:8px">✨</div>
+              <div style="font-size:13px">I can see all your tasks, ideas, and projects.<br>Ask me anything!</div>
+            </div>
+          ` : aiMessages.map(m => `<div class="ai-msg ${m.role}">${esc(m.content)}</div>`).join('')}
+        </div>
+        ${aiMessages.length === 0 ? `
+          <div class="ai-suggestions">
+            <button class="ai-suggestion" onclick="aiAsk('What should I focus on today?')">What should I focus on today?</button>
+            <button class="ai-suggestion" onclick="aiAsk('Help me process my inbox')">Process my inbox</button>
+            <button class="ai-suggestion" onclick="aiAsk('Which project needs attention?')">Project health check</button>
+            <button class="ai-suggestion" onclick="aiAsk('Turn my ideas into action plans')">Ideas → actions</button>
+            <button class="ai-suggestion" onclick="aiAsk('Give me a weekly review summary')">Weekly review</button>
+          </div>
+        ` : ''}
+        <div class="ai-input-row">
+          <input class="ai-input" id="ai-input" placeholder="Ask Claude..."
+                 onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();aiSend()}">
+          <button class="ai-send-btn" id="ai-send-btn" onclick="aiSend()">→</button>
+        </div>
+        <div class="ai-settings-row">
+          <span>Worker:</span>
+          <input value="${esc(workerUrl)}" style="font-size:10px;padding:4px 8px" onchange="setWorkerUrl(this.value.trim())">
+        </div>
+      `}
+    </div>
+  `;
+
+  if (workerUrl) {
+    const msgs = document.getElementById('ai-messages');
+    if (msgs) msgs.scrollTop = msgs.scrollHeight;
+    setTimeout(() => document.getElementById('ai-input')?.focus(), 100);
+  }
+}
+
+function closeAI() {
+  document.getElementById('ai-panel').style.display = 'none';
+}
+
+function aiAsk(text) {
+  const input = document.getElementById('ai-input');
+  if (input) input.value = text;
+  aiSend();
+}
+
+async function aiSend() {
+  const input = document.getElementById('ai-input');
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text || aiStreaming) return;
+  input.value = '';
+
+  aiMessages.push({ role: 'user', content: text });
+  openAI(); // Re-render
+
+  const sendBtn = document.getElementById('ai-send-btn');
+  if (sendBtn) sendBtn.disabled = true;
+  aiStreaming = true;
+
+  // Add thinking indicator
+  const msgs = document.getElementById('ai-messages');
+  if (msgs) {
+    msgs.innerHTML += '<div class="ai-msg thinking" id="ai-thinking">Thinking...</div>';
+    msgs.scrollTop = msgs.scrollHeight;
+  }
+
+  try {
+    const workerUrl = getWorkerUrl();
+    const response = await fetch(workerUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1024,
+        system: buildSystemPrompt(),
+        messages: aiMessages.filter(m => m.role === 'user' || m.role === 'assistant'),
+      }),
+    });
+
+    const data = await response.json();
+
+    if (data.error) throw new Error(typeof data.error === 'string' ? data.error : data.error.message || 'API error');
+
+    const reply = data.content?.[0]?.text || 'No response';
+    aiMessages.push({ role: 'assistant', content: reply });
+  } catch (e) {
+    aiMessages.push({ role: 'assistant', content: '⚠️ Error: ' + e.message });
+  }
+
+  aiStreaming = false;
+  openAI(); // Re-render with response
+}
+
+// Show FAB after app loads
+const origShowApp = showApp;
+showApp = function() {
+  origShowApp();
+  updateFabVisibility();
+};
 
 // ── PWA / Service Worker ──
 if ('serviceWorker' in navigator) {
