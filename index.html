@@ -540,12 +540,17 @@ function initGsi() {
       headers: { Authorization: 'Bearer ' + accessToken }
     }).then(r => {
       if (r.ok) { showApp(); }
-      else { accessToken = null; localStorage.removeItem('dash-token'); }
-    }).catch(() => {});
+      else {
+        accessToken = null; localStorage.removeItem('dash-token');
+        tokenClient.requestAccessToken({ prompt: '' });
+      }
+    }).catch(() => {
+      tokenClient.requestAccessToken({ prompt: '' });
+    });
   }
 }
 
-function handleAuth() { tokenClient.requestAccessToken({ prompt: 'consent' }); }
+function handleAuth() { tokenClient.requestAccessToken({ prompt: '' }); }
 
 function showApp() {
   document.getElementById('login-screen').style.display = 'none';
