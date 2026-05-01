@@ -709,14 +709,14 @@ async function signOut() {
 }
 
 function showAuthLoading() {
-  document.getElementById('auth-loading').style.display = '';
+  document.getElementById('auth-loading').style.display = 'flex';
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app').style.display = 'none';
 }
 
 function showLogin() {
   document.getElementById('auth-loading').style.display = 'none';
-  document.getElementById('login-screen').style.display = '';
+  document.getElementById('login-screen').style.display = 'flex';
   document.getElementById('app').style.display = 'none';
   renderLoginScreen();
 }
