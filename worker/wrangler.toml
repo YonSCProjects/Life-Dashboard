@@ -2,5 +2,14 @@ name = "life-dashboard-ai"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
-# After deploying, set your API key:
-#   npx wrangler secret put ANTHROPIC_API_KEY
+# Secrets (set via `npx wrangler secret put NAME`):
+#   ANTHROPIC_API_KEY     — Claude API key
+#   GOOGLE_CLIENT_ID      — same Web-application OAuth client ID used by the frontend
+#   GOOGLE_CLIENT_SECRET  — its corresponding client secret (Google Cloud Console → Credentials)
+
+# KV namespace for refresh tokens.
+# Create with: npx wrangler kv:namespace create AUTH_TOKENS
+# Then paste the returned id below (replace REPLACE_WITH_KV_ID).
+[[kv_namespaces]]
+binding = "AUTH_TOKENS"
+id = "a702e3b5256c4617954427ccfe59ef57"

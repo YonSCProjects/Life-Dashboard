@@ -349,6 +349,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
   <h1>Life Dashboard</h1>
   <p>Capture ideas, manage tasks, get things done</p>
   <button class="btn btn-primary" onclick="handleAuth()" id="login-btn">Sign in with Google</button>
+  <div id="login-setup"></div>
 </div>
 
 <!-- APP -->
@@ -497,10 +498,11 @@ const P = {
   LIST_ITEM: '📋I',
 };
 
-let tokenClient, accessToken = null;
+let accessToken = null;
 let tokenExpiresAt = 0;
+let sessionId = null;
 let refreshTimer = null;
-let silentAuthInFlight = false;
+let refreshInFlight = null; // de-dupe concurrent refreshes
 let tasks = [], shopItems = [], inboxItems = [], ideas = [], projects = [], customLists = [];
 let activeCategory = 'all';
 let showAddFormVisible = false;
@@ -531,38 +533,179 @@ const SHOP_CATS_ORDER = ['Produce','Dairy','Meat','Bakery','Frozen','Drinks','Sn
 const SHOP_CATS_ICONS = { Produce:'🥬', Dairy:'🥛', Meat:'🥩', Bakery:'🍞', Frozen:'🧊', Drinks:'🥤', Snacks:'🍿', Household:'🏠', Other:'📦' };
 
 // ══════════════════════════════════════════════════
-// GOOGLE AUTH
+// GOOGLE AUTH — Authorization Code flow with PKCE.
+// Refresh tokens live on the Cloudflare Worker (KV); the browser only ever
+// holds a session id + short-lived access token. No third-party cookies needed.
 // ══════════════════════════════════════════════════
+const TOKEN_KEY     = 'dash-token';
+const TOKEN_EXP_KEY = 'dash-token-exp';
+const SESSION_KEY   = 'dash-session';
+const PKCE_KEY      = 'dash-pkce-verifier';
+const STATE_KEY     = 'dash-oauth-state';
+
+function getRedirectUri() {
+  // OAuth requires exact match — strip query/hash.
+  return window.location.origin + window.location.pathname;
+}
+
+function workerEndpoint(path) {
+  const base = (getWorkerUrl() || '').replace(/\/$/, '');
+  return base + path;
+}
+
 function tokenIsValid() {
   return !!accessToken && Date.now() < tokenExpiresAt - 60_000;
 }
 
-function persistToken(token, expiresInSec) {
+function persistAccessToken(token, expiresInSec) {
   accessToken = token;
   tokenExpiresAt = Date.now() + (expiresInSec * 1000);
-  localStorage.setItem('dash-token', token);
-  localStorage.setItem('dash-token-exp', String(tokenExpiresAt));
+  localStorage.setItem(TOKEN_KEY, token);
+  localStorage.setItem(TOKEN_EXP_KEY, String(tokenExpiresAt));
   scheduleSilentRefresh();
 }
 
-function clearStoredToken() {
+function clearLocalAuth() {
   accessToken = null;
   tokenExpiresAt = 0;
-  localStorage.removeItem('dash-token');
-  localStorage.removeItem('dash-token-exp');
+  sessionId = null;
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(TOKEN_EXP_KEY);
+  localStorage.removeItem(SESSION_KEY);
   if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
 }
 
 function scheduleSilentRefresh() {
   if (refreshTimer) clearTimeout(refreshTimer);
-  // Refresh ~5 minutes before expiry, but never sooner than 30s from now.
   const ms = Math.max(30_000, tokenExpiresAt - Date.now() - 5 * 60_000);
-  refreshTimer = setTimeout(() => {
-    if (tokenClient) {
-      silentAuthInFlight = true;
-      tokenClient.requestAccessToken({ prompt: '' });
+  refreshTimer = setTimeout(() => { doRefresh(); }, ms);
+}
+
+// ── PKCE helpers ──
+function randHex(byteLen) {
+  const buf = new Uint8Array(byteLen);
+  crypto.getRandomValues(buf);
+  return [...buf].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function base64url(arrayBuf) {
+  let s = '';
+  const bytes = new Uint8Array(arrayBuf);
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+async function pkceChallenge(verifier) {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  return base64url(hash);
+}
+
+// ── Sign-in: redirect to Google's OAuth consent screen ──
+async function startSignIn() {
+  if (!getWorkerUrl()) { showError('Set the Worker URL first'); return; }
+
+  const verifier = randHex(48);
+  const challenge = await pkceChallenge(verifier);
+  const state = randHex(16);
+  localStorage.setItem(PKCE_KEY, verifier);
+  localStorage.setItem(STATE_KEY, state);
+
+  const params = new URLSearchParams({
+    client_id: CLIENT_ID,
+    redirect_uri: getRedirectUri(),
+    response_type: 'code',
+    scope: SCOPES,
+    access_type: 'offline',
+    prompt: 'consent',          // ensures Google issues a refresh_token
+    include_granted_scopes: 'true',
+    state,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+  });
+  window.location.href = 'https://accounts.google.com/o/oauth2/v2/auth?' + params.toString();
+}
+
+// ── Callback: trade ?code=... for a session ──
+async function handleOAuthCallback() {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get('code');
+  if (!code) return false;
+
+  const state = params.get('state');
+  const expectedState = localStorage.getItem(STATE_KEY);
+  const verifier = localStorage.getItem(PKCE_KEY);
+  localStorage.removeItem(STATE_KEY);
+  localStorage.removeItem(PKCE_KEY);
+
+  // Strip the code from the URL before any await — don't leave it in history.
+  history.replaceState({}, '', getRedirectUri());
+
+  if (!expectedState || state !== expectedState || !verifier) {
+    showError('Sign-in failed: state mismatch');
+    showLogin();
+    return true;
+  }
+
+  showAuthLoading();
+  try {
+    const r = await fetch(workerEndpoint('/oauth/exchange'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, redirect_uri: getRedirectUri(), code_verifier: verifier }),
+    });
+    const data = await r.json();
+    if (!r.ok || !data.session_id) throw new Error(data.error || 'exchange failed');
+    sessionId = data.session_id;
+    localStorage.setItem(SESSION_KEY, sessionId);
+    persistAccessToken(data.access_token, parseInt(data.expires_in, 10) || 3599);
+    showApp();
+  } catch (e) {
+    showError('Sign-in failed: ' + e.message);
+    showLogin();
+  }
+  return true;
+}
+
+// ── Silent refresh via worker ──
+function doRefresh() {
+  if (refreshInFlight) return refreshInFlight;
+  if (!sessionId) sessionId = localStorage.getItem(SESSION_KEY);
+  if (!sessionId) return Promise.resolve(false);
+
+  refreshInFlight = (async () => {
+    try {
+      const r = await fetch(workerEndpoint('/oauth/refresh'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (r.status === 401 || !data.access_token) {
+        clearLocalAuth();
+        return false;
+      }
+      persistAccessToken(data.access_token, parseInt(data.expires_in, 10) || 3599);
+      return true;
+    } catch (e) {
+      return false;
+    } finally {
+      refreshInFlight = null;
     }
-  }, ms);
+  })();
+  return refreshInFlight;
+}
+
+async function signOut() {
+  const sid = sessionId || localStorage.getItem(SESSION_KEY);
+  if (sid && getWorkerUrl()) {
+    fetch(workerEndpoint('/oauth/revoke'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sid }),
+    }).catch(() => {});
+  }
+  clearLocalAuth();
+  showLogin();
 }
 
 function showAuthLoading() {
@@ -575,47 +718,68 @@ function showLogin() {
   document.getElementById('auth-loading').style.display = 'none';
   document.getElementById('login-screen').style.display = '';
   document.getElementById('app').style.display = 'none';
+  renderLoginScreen();
 }
 
-function initGsi() {
-  // Restore any prior token + expiry from localStorage
-  const t = localStorage.getItem('dash-token');
-  const e = parseInt(localStorage.getItem('dash-token-exp') || '0', 10);
-  if (t && e) { accessToken = t; tokenExpiresAt = e; }
+async function initAuth() {
+  // Restore prior auth state from localStorage.
+  accessToken = localStorage.getItem(TOKEN_KEY);
+  tokenExpiresAt = parseInt(localStorage.getItem(TOKEN_EXP_KEY) || '0', 10);
+  sessionId = localStorage.getItem(SESSION_KEY);
 
-  tokenClient = google.accounts.oauth2.initTokenClient({
-    client_id: CLIENT_ID,
-    scope: SCOPES,
-    callback: (response) => {
-      const wasSilent = silentAuthInFlight;
-      silentAuthInFlight = false;
-      if (response.error || !response.access_token) {
-        // Silent attempt failed → user must sign in interactively.
-        // Interactive failure → also surface login screen.
-        if (!wasSilent) showError('Auth failed: ' + (response.error || 'unknown'));
-        showLogin();
-        return;
-      }
-      persistToken(response.access_token, parseInt(response.expires_in, 10) || 3599);
-      showApp();
-    },
-  });
+  // 1. OAuth callback?
+  if (await handleOAuthCallback()) return;
 
+  // 2. Still-valid access token? Just go.
   if (tokenIsValid()) {
     showApp();
     scheduleSilentRefresh();
-  } else {
-    // No valid token — try silent refresh. Login screen only shows if this fails.
-    showAuthLoading();
-    silentAuthInFlight = true;
-    tokenClient.requestAccessToken({ prompt: '' });
+    return;
   }
+
+  // 3. Have a session id but expired/missing token? Refresh silently.
+  if (sessionId && getWorkerUrl()) {
+    showAuthLoading();
+    if (await doRefresh()) showApp();
+    else showLogin();
+    return;
+  }
+
+  // 4. Otherwise: present login.
+  showLogin();
 }
 
-function handleAuth() {
-  showAuthLoading();
-  silentAuthInFlight = false;
-  tokenClient.requestAccessToken({ prompt: '' });
+// "Sign in with Google" button handler.
+function handleAuth() { startSignIn(); }
+
+// Render the login screen with worker-URL setup if needed.
+function renderLoginScreen() {
+  const url = getWorkerUrl();
+  const setupBlock = document.getElementById('login-setup');
+  if (!setupBlock) return;
+  if (url) {
+    setupBlock.innerHTML = `
+      <div style="font-size:11px;color:var(--text3);margin-top:16px">
+        Worker: ${esc(url)}
+        <button class="btn btn-ghost btn-sm" style="margin-left:8px"
+                onclick="localStorage.removeItem('${AI_WORKER_KEY}');renderLoginScreen()">Change</button>
+      </div>`;
+    document.getElementById('login-btn').disabled = false;
+  } else {
+    setupBlock.innerHTML = `
+      <div style="margin-top:24px;text-align:left;max-width:360px">
+        <div style="font-size:13px;font-weight:600;margin-bottom:6px">First-time setup</div>
+        <div style="font-size:12px;color:var(--text3);margin-bottom:10px">
+          Paste the URL of your deployed Cloudflare Worker (e.g. https://life-dashboard-ai.YOU.workers.dev).
+          See worker/wrangler.toml for setup commands.
+        </div>
+        <input id="login-worker-input" placeholder="https://...workers.dev"
+               style="width:100%;font-size:13px;padding:10px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg2);color:var(--text)">
+        <button class="btn btn-primary btn-sm" style="margin-top:8px"
+                onclick="setWorkerUrl(document.getElementById('login-worker-input').value.trim());renderLoginScreen()">Save</button>
+      </div>`;
+    document.getElementById('login-btn').disabled = true;
+  }
 }
 
 function showApp() {
@@ -634,16 +798,21 @@ function showApp() {
 // API HELPERS
 // ══════════════════════════════════════════════════
 async function calFetch(url, opts = {}) {
-  const r = await fetch('https://www.googleapis.com/calendar/v3' + url, {
+  const doFetch = () => fetch('https://www.googleapis.com/calendar/v3' + url, {
     ...opts,
     headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json', ...opts.headers },
   });
+
+  let r = await doFetch();
   if (r.status === 401) {
-    // Token rejected — try a silent refresh. Login screen only shows if that fails.
-    clearStoredToken();
-    silentAuthInFlight = true;
-    tokenClient.requestAccessToken({ prompt: '' });
-    throw new Error('Refreshing session...');
+    // Token rejected — refresh via worker and retry once.
+    if (await doRefresh()) {
+      r = await doFetch();
+    }
+    if (r.status === 401) {
+      showLogin();
+      throw new Error('Session expired. Please sign in again.');
+    }
   }
   if (!r.ok) throw new Error('API error: ' + r.status);
   if (r.status === 204) return null;
@@ -2091,10 +2260,10 @@ showApp = function() {
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
-</script>
 
-<!-- Google Identity Services -->
-<script src="https://accounts.google.com/gsi/client" onload="initGsi()"></script>
+// ── Bootstrap auth ──
+initAuth();
+</script>
 
 </body>
 </html>
