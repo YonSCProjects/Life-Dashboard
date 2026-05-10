@@ -447,6 +447,11 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
     </div>
   </div>
 
+  <!-- ═══ CAREGIVER VIEW ═══ -->
+  <div class="content" id="caregiver-view">
+    <div id="caregiver-body"></div>
+  </div>
+
   <!-- BOTTOM NAV -->
   <nav class="bottom-nav">
     <button class="nav-btn active" onclick="switchTab('inbox', this)" data-tab="inbox">
@@ -466,6 +471,9 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
     </button>
     <button class="nav-btn" onclick="switchTab('lists', this)" data-tab="lists">
       <span class="nav-icon">📋</span>Lists
+    </button>
+    <button class="nav-btn" onclick="switchTab('caregiver', this)" data-tab="caregiver">
+      <span class="nav-icon">👵</span>Care
     </button>
   </nav>
 </div>
@@ -496,7 +504,14 @@ const P = {
   PROJECT: '🎯',
   LIST: '📋L',
   LIST_ITEM: '📋I',
+  CG_CFG: '💼C',     // caregiver rates config (single event)
+  CG_MONTH: '💼M',   // saved monthly salary record (one per month)
+  CG_VAC: '🌴',       // vacation day (one per day)
+  CG_SICK: '🤒',      // sick day (one per day)
+  CG_PREPAY: '💸',    // pre-payment / advance
 };
+
+const CURRENCY = '₪';
 
 let accessToken = null;
 let tokenExpiresAt = 0;
@@ -504,6 +519,12 @@ let sessionId = null;
 let refreshTimer = null;
 let refreshInFlight = null; // de-dupe concurrent refreshes
 let tasks = [], shopItems = [], inboxItems = [], ideas = [], projects = [], customLists = [];
+let caregiverConfig = null;       // single config object (rates) or null if not set
+let caregiverMonths = [];         // [{id, ym:'YYYY-MM', satCount, weeksCount, foodOn, fatherOn, bonusAmt, bonusNote, prePayDeducted:[ids], total}]
+let caregiverVacation = [];       // [{id, date}]
+let caregiverSick = [];           // [{id, date}]
+let caregiverPrepays = [];        // [{id, date, amount, note}]
+let caregiverDraft = null;        // unsaved current-month inputs (kept in memory while user types)
 let activeCategory = 'all';
 let showAddFormVisible = false;
 let currentTab = 'inbox';
@@ -861,7 +882,8 @@ async function syncAll() {
   btn.textContent = '...';
   btn.disabled = true;
   try {
-    const [taskEvts, shopEvts, inboxEvts, ideaEvts, projEvts, listEvts, listItemEvts] = await Promise.all([
+    const [taskEvts, shopEvts, inboxEvts, ideaEvts, projEvts, listEvts, listItemEvts,
+           cgCfgEvts, cgMonthEvts, cgVacEvts, cgSickEvts, cgPrepayEvts] = await Promise.all([
       fetchEvents(P.TASK),
       fetchEvents(P.SHOP),
       fetchEvents(P.INBOX),
@@ -869,6 +891,11 @@ async function syncAll() {
       fetchEvents(P.PROJECT),
       fetchEvents(P.LIST),
       fetchEvents(P.LIST_ITEM),
+      fetchEvents(P.CG_CFG),
+      fetchEvents(P.CG_MONTH),
+      fetchEvents(P.CG_VAC),
+      fetchEvents(P.CG_SICK),
+      fetchEvents(P.CG_PREPAY),
     ]);
 
     tasks = taskEvts.map(parseTask);
@@ -897,6 +924,15 @@ async function syncAll() {
     projects = projEvts.map(parseProjectEvent);
 
     customLists = listEvts.map(e => parseListEvent(e, listItemEvts));
+
+    // Caregiver data
+    caregiverConfig = cgCfgEvts.length ? parseCaregiverConfig(cgCfgEvts[0]) : null;
+    caregiverMonths = cgMonthEvts.map(parseCaregiverMonth).sort((a, b) => b.ym.localeCompare(a.ym));
+    caregiverVacation = cgVacEvts.map(e => ({ id: e.id, date: e.start?.date || (e.start?.dateTime || '').split('T')[0] }))
+      .sort((a, b) => b.date.localeCompare(a.date));
+    caregiverSick = cgSickEvts.map(e => ({ id: e.id, date: e.start?.date || (e.start?.dateTime || '').split('T')[0] }))
+      .sort((a, b) => b.date.localeCompare(a.date));
+    caregiverPrepays = cgPrepayEvts.map(parseCaregiverPrepay).sort((a, b) => b.date.localeCompare(a.date));
 
     renderAll();
   } catch (e) {
@@ -1013,6 +1049,7 @@ function renderAll() {
   renderIdeas();
   renderProjects();
   renderLists();
+  renderCaregiver();
   updateBadges();
 }
 
@@ -1954,11 +1991,398 @@ async function deleteList(listId) {
 }
 
 // ══════════════════════════════════════════════════
+// CAREGIVER (salary + benefits)
+// ══════════════════════════════════════════════════
+function getYM(d = new Date()) {
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+}
+function getMonthFirst(ym) { return ym + '-01'; }
+function getMonthLabel(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+}
+function countSaturdaysInMonth(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  const last = new Date(y, m, 0).getDate();
+  let n = 0;
+  for (let d = 1; d <= last; d++) if (new Date(y, m - 1, d).getDay() === 6) n++;
+  return n;
+}
+function fmtMoney(n) {
+  return CURRENCY + Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+function safeJsonParse(s) {
+  try { return JSON.parse(s); } catch { return null; }
+}
+
+function parseCaregiverConfig(event) {
+  const cfg = safeJsonParse(event.description) || {};
+  return {
+    id: event.id,
+    baseSalary: Number(cfg.baseSalary) || 0,
+    satRate: Number(cfg.satRate) || 0,
+    weeklyPocket: Number(cfg.weeklyPocket) || 0,
+    foodMonthly: Number(cfg.foodMonthly) || 0,
+    fatherMonthly: Number(cfg.fatherMonthly) || 0,
+  };
+}
+
+function parseCaregiverMonth(event) {
+  const data = safeJsonParse(event.description) || {};
+  const ym = (event.start?.date || '').slice(0, 7);
+  return {
+    id: event.id,
+    ym,
+    satCount: Number(data.satCount) || 0,
+    weeksCount: Number(data.weeksCount) || 0,
+    foodOn: !!data.foodOn,
+    fatherOn: !!data.fatherOn,
+    bonusAmt: Number(data.bonusAmt) || 0,
+    bonusNote: data.bonusNote || '',
+    prePayDeducted: Array.isArray(data.prePayDeducted) ? data.prePayDeducted : [],
+    snapshot: data.snapshot || null,  // frozen rates at time of save
+    total: Number(data.total) || 0,
+  };
+}
+
+function parseCaregiverPrepay(event) {
+  const summary = (event.summary || '').replace(P.CG_PREPAY, '').trim();
+  const amount = Number(summary.replace(/[^\d.-]/g, '')) || 0;
+  return {
+    id: event.id,
+    date: event.start?.date || (event.start?.dateTime || '').split('T')[0],
+    amount,
+    note: event.description || '',
+  };
+}
+
+// All pre-payments not yet attached to a saved month, dated on/before targetYm.
+function unsettledPrepaysFor(ym) {
+  const settledIds = new Set();
+  caregiverMonths.forEach(m => m.prePayDeducted.forEach(id => settledIds.add(id)));
+  const cutoff = ym + '-32'; // include all dates within ym
+  return caregiverPrepays.filter(p => !settledIds.has(p.id) && p.date <= cutoff);
+}
+
+function calcMonthSalary(rates, inputs) {
+  const sat   = (rates.satRate || 0) * (inputs.satCount || 0);
+  const pock  = (rates.weeklyPocket || 0) * (inputs.weeksCount || 0);
+  const food  = inputs.foodOn   ? (rates.foodMonthly   || 0) : 0;
+  const fath  = inputs.fatherOn ? (rates.fatherMonthly || 0) : 0;
+  const bonus = inputs.bonusAmt || 0;
+  const gross = (rates.baseSalary || 0) + sat + pock + food + fath + bonus;
+  return { base: rates.baseSalary || 0, sat, pock, food, fath, bonus, gross };
+}
+
+function renderCaregiver() {
+  const body = document.getElementById('caregiver-body');
+  if (!body) return;
+
+  if (!caregiverConfig) {
+    body.innerHTML = `
+      <div style="text-align:center;padding:24px 8px">
+        <div style="font-size:36px;margin-bottom:8px">👵</div>
+        <div style="font-weight:600;font-size:16px;margin-bottom:6px">Set up caregiver rates</div>
+        <div style="font-size:12px;color:var(--text3);margin-bottom:18px">Enter the fixed monthly rates once. You can edit them anytime.</div>
+        <button class="btn btn-primary" onclick="openCaregiverRates()">Set rates</button>
+      </div>`;
+    return;
+  }
+
+  const ym = getYM();
+  const draft = caregiverDraft && caregiverDraft.ym === ym ? caregiverDraft : null;
+  const savedThisMonth = caregiverMonths.find(m => m.ym === ym);
+  const inputs = draft || savedThisMonth || {
+    ym,
+    satCount: 0,
+    weeksCount: countSaturdaysInMonth(ym),  // weeks ≈ Saturdays in month as default
+    foodOn: true,
+    fatherOn: true,
+    bonusAmt: 0,
+    bonusNote: '',
+  };
+  const breakdown = calcMonthSalary(caregiverConfig, inputs);
+  const unsettled = unsettledPrepaysFor(ym);
+  const prePaySum = unsettled.reduce((s, p) => s + p.amount, 0);
+  const netDue = Math.max(0, breakdown.gross - prePaySum);
+
+  body.innerHTML = `
+    <!-- Calculator -->
+    <div class="card" style="padding:16px;margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div style="font-weight:600;font-size:15px">${getMonthLabel(ym)}</div>
+        <button class="btn btn-ghost btn-sm" onclick="openCaregiverRates()">Edit rates</button>
+      </div>
+
+      ${cgInputRow('Saturdays worked', 'satCount', inputs.satCount, `(${countSaturdaysInMonth(ym)} in month)`)}
+      ${cgInputRow('Weeks of pocket money', 'weeksCount', inputs.weeksCount)}
+      ${cgToggleRow('Food allowance', 'foodOn', inputs.foodOn, fmtMoney(caregiverConfig.foodMonthly))}
+      ${cgToggleRow('Helping father', 'fatherOn', inputs.fatherOn, fmtMoney(caregiverConfig.fatherMonthly))}
+      ${cgInputRow('Bonus', 'bonusAmt', inputs.bonusAmt, CURRENCY)}
+      <div style="margin-top:6px;margin-bottom:12px">
+        <input id="cg-bonus-note" placeholder="Bonus note (optional)" value="${esc(inputs.bonusNote)}"
+               onchange="cgUpdateDraft('bonusNote', this.value)" style="font-size:12px;width:100%">
+      </div>
+
+      <div style="border-top:1px solid var(--border);margin-top:12px;padding-top:12px;font-size:13px">
+        ${cgBreakdownRow('Base salary', breakdown.base)}
+        ${cgBreakdownRow(`Saturdays (${inputs.satCount} × ${fmtMoney(caregiverConfig.satRate)})`, breakdown.sat)}
+        ${cgBreakdownRow(`Pocket money (${inputs.weeksCount} × ${fmtMoney(caregiverConfig.weeklyPocket)})`, breakdown.pock)}
+        ${inputs.foodOn ? cgBreakdownRow('Food', breakdown.food) : ''}
+        ${inputs.fatherOn ? cgBreakdownRow('Helping father', breakdown.fath) : ''}
+        ${breakdown.bonus ? cgBreakdownRow('Bonus' + (inputs.bonusNote ? ` (${esc(inputs.bonusNote)})` : ''), breakdown.bonus) : ''}
+        <div style="display:flex;justify-content:space-between;font-weight:600;margin-top:6px;padding-top:6px;border-top:1px solid var(--border)">
+          <span>Gross total</span><span>${fmtMoney(breakdown.gross)}</span>
+        </div>
+        ${prePaySum > 0 ? `
+          <div style="display:flex;justify-content:space-between;color:var(--text3);font-size:12px;margin-top:4px">
+            <span>Pre-payments to deduct (${unsettled.length})</span><span>− ${fmtMoney(prePaySum)}</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-weight:600;color:var(--green);margin-top:4px">
+            <span>Net to pay</span><span>${fmtMoney(netDue)}</span>
+          </div>` : ''}
+      </div>
+
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <button class="btn btn-primary" style="flex:1" onclick="saveCaregiverMonth()">${savedThisMonth ? 'Update saved month' : 'Save month'}</button>
+        ${savedThisMonth ? `<button class="btn btn-ghost btn-sm" onclick="deleteCaregiverMonth('${savedThisMonth.id}')">Delete</button>` : ''}
+      </div>
+    </div>
+
+    <!-- Tracking -->
+    <div class="card" style="padding:14px;margin-bottom:14px">
+      ${cgListSection('🌴 Vacation days', caregiverVacation, 'addCaregiverVacation', 'deleteCaregiverDay', false)}
+    </div>
+    <div class="card" style="padding:14px;margin-bottom:14px">
+      ${cgListSection('🤒 Sick days', caregiverSick, 'addCaregiverSick', 'deleteCaregiverDay', false)}
+    </div>
+    <div class="card" style="padding:14px;margin-bottom:14px">
+      ${cgPrepaysSection()}
+    </div>
+
+    <!-- History -->
+    ${caregiverMonths.length ? `
+      <div class="card" style="padding:14px;margin-bottom:14px">
+        <div style="font-weight:600;font-size:14px;margin-bottom:10px">History</div>
+        ${caregiverMonths.slice(0, 12).map(m => `
+          <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px">
+            <span>${getMonthLabel(m.ym)}</span>
+            <span style="font-weight:600">${fmtMoney(m.total)}</span>
+          </div>
+        `).join('')}
+      </div>` : ''}
+  `;
+}
+
+function cgInputRow(label, key, value, hint) {
+  return `
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px">
+      <label style="font-size:13px;flex:1">${label}${hint ? ` <span style="color:var(--text3);font-size:11px">${hint}</span>` : ''}</label>
+      <input type="number" min="0" step="${key === 'bonusAmt' ? '0.01' : '1'}" value="${value}"
+             onchange="cgUpdateDraft('${key}', Number(this.value)||0)"
+             style="width:80px;text-align:right;font-size:13px;padding:6px 8px">
+    </div>`;
+}
+
+function cgToggleRow(label, key, on, amountLabel) {
+  return `
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px">
+      <label style="font-size:13px;flex:1">${label} <span style="color:var(--text3);font-size:11px">(${amountLabel})</span></label>
+      <button class="btn btn-sm ${on ? 'btn-primary' : 'btn-ghost'}" style="min-width:60px"
+              onclick="cgUpdateDraft('${key}', ${!on})">${on ? 'On' : 'Off'}</button>
+    </div>`;
+}
+
+function cgBreakdownRow(label, amount) {
+  return `<div style="display:flex;justify-content:space-between;color:var(--text2);margin-bottom:3px">
+    <span>${label}</span><span>${fmtMoney(amount)}</span>
+  </div>`;
+}
+
+function cgListSection(title, items, addFn, delFn, showAmount) {
+  const today = new Date().toISOString().split('T')[0];
+  return `
+    <div style="font-weight:600;font-size:14px;margin-bottom:10px">${title} <span style="color:var(--text3);font-weight:400">(${items.length})</span></div>
+    <div style="display:flex;gap:6px;margin-bottom:10px">
+      <input type="date" id="cg-${addFn}-date" value="${today}" style="flex:1;font-size:12px">
+      <button class="btn btn-primary btn-sm" onclick="${addFn}()">+ Add</button>
+    </div>
+    ${items.length ? items.slice(0, 20).map(it => `
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;font-size:13px;border-bottom:1px solid var(--border)">
+        <span>${it.date}</span>
+        <button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:4px" onclick="${delFn}('${it.id}')">×</button>
+      </div>`).join('') : '<div style="color:var(--text3);font-size:12px">None recorded</div>'}`;
+}
+
+function cgPrepaysSection() {
+  const today = new Date().toISOString().split('T')[0];
+  const settledIds = new Set();
+  caregiverMonths.forEach(m => m.prePayDeducted.forEach(id => settledIds.add(id)));
+  return `
+    <div style="font-weight:600;font-size:14px;margin-bottom:10px">💸 Pre-payments <span style="color:var(--text3);font-weight:400">(${caregiverPrepays.length})</span></div>
+    <div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">
+      <input type="date" id="cg-prepay-date" value="${today}" style="flex:1;min-width:130px;font-size:12px">
+      <input type="number" id="cg-prepay-amt" placeholder="${CURRENCY}" min="0" step="0.01" style="width:80px;font-size:12px">
+      <input id="cg-prepay-note" placeholder="Note (optional)" style="flex:1;min-width:120px;font-size:12px">
+      <button class="btn btn-primary btn-sm" onclick="addCaregiverPrepay()">+ Add</button>
+    </div>
+    ${caregiverPrepays.length ? caregiverPrepays.slice(0, 30).map(p => {
+      const settled = settledIds.has(p.id);
+      return `
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;font-size:13px;border-bottom:1px solid var(--border);${settled ? 'opacity:0.5' : ''}">
+          <span style="${settled ? 'text-decoration:line-through' : ''}">${p.date} — ${fmtMoney(p.amount)}${p.note ? ' · ' + esc(p.note) : ''}</span>
+          ${settled ? '<span style="color:var(--text3);font-size:11px">deducted</span>'
+                   : `<button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:4px" onclick="deleteCaregiverPrepay('${p.id}')">×</button>`}
+        </div>`;
+    }).join('') : '<div style="color:var(--text3);font-size:12px">None recorded</div>'}`;
+}
+
+function cgUpdateDraft(key, value) {
+  const ym = getYM();
+  const savedThisMonth = caregiverMonths.find(m => m.ym === ym);
+  if (!caregiverDraft || caregiverDraft.ym !== ym) {
+    caregiverDraft = savedThisMonth ? { ...savedThisMonth, ym } : {
+      ym, satCount: 0, weeksCount: countSaturdaysInMonth(ym),
+      foodOn: true, fatherOn: true, bonusAmt: 0, bonusNote: '',
+    };
+  }
+  caregiverDraft[key] = value;
+  renderCaregiver();
+}
+
+// ── Rates editor ──
+function openCaregiverRates() {
+  const c = caregiverConfig || { baseSalary: 0, satRate: 0, weeklyPocket: 0, foodMonthly: 0, fatherMonthly: 0 };
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">Caregiver rates</span>
+      <button class="btn btn-sm btn-primary" id="save-rates-btn" onclick="saveCaregiverRates()">Save</button>
+    </div>
+    <div class="detail-body">
+      <div style="font-size:11px;color:var(--text3);margin-bottom:14px">All amounts in ${CURRENCY}. Edit anytime.</div>
+      ${cgRatesField('Base salary (monthly)', 'rate-base', c.baseSalary)}
+      ${cgRatesField('Saturday rate (per Saturday worked)', 'rate-sat', c.satRate)}
+      ${cgRatesField('Weekly pocket money (per week)', 'rate-pocket', c.weeklyPocket)}
+      ${cgRatesField('Food allowance (monthly)', 'rate-food', c.foodMonthly)}
+      ${cgRatesField('Helping father (monthly)', 'rate-father', c.fatherMonthly)}
+    </div>
+  `);
+}
+function cgRatesField(label, id, value) {
+  return `
+    <div style="margin-bottom:14px">
+      <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">${label.toUpperCase()}</label>
+      <input id="${id}" type="number" min="0" step="0.01" value="${value}" style="font-size:14px">
+    </div>`;
+}
+async function saveCaregiverRates() {
+  const cfg = {
+    baseSalary:    Number(document.getElementById('rate-base').value)   || 0,
+    satRate:       Number(document.getElementById('rate-sat').value)    || 0,
+    weeklyPocket:  Number(document.getElementById('rate-pocket').value) || 0,
+    foodMonthly:   Number(document.getElementById('rate-food').value)   || 0,
+    fatherMonthly: Number(document.getElementById('rate-father').value) || 0,
+  };
+  const btn = document.getElementById('save-rates-btn');
+  btn.textContent = '...'; btn.disabled = true;
+  try {
+    if (caregiverConfig?.id) {
+      await updateEvent(caregiverConfig.id, { description: JSON.stringify(cfg) });
+    } else {
+      await createEvent(P.CG_CFG, 'Caregiver rates', JSON.stringify(cfg), getMonthFirst(getYM()));
+    }
+    closeDetail();
+    await syncAll();
+  } catch (e) {
+    showError(e.message);
+    btn.textContent = 'Save'; btn.disabled = false;
+  }
+}
+
+// ── Save monthly salary ──
+async function saveCaregiverMonth() {
+  if (!caregiverConfig) return;
+  const ym = getYM();
+  const inputs = caregiverDraft && caregiverDraft.ym === ym ? caregiverDraft :
+    (caregiverMonths.find(m => m.ym === ym) || {
+      ym, satCount: 0, weeksCount: countSaturdaysInMonth(ym),
+      foodOn: true, fatherOn: true, bonusAmt: 0, bonusNote: '',
+    });
+  const breakdown = calcMonthSalary(caregiverConfig, inputs);
+  const unsettled = unsettledPrepaysFor(ym);
+  const prePaySum = unsettled.reduce((s, p) => s + p.amount, 0);
+  const netDue = Math.max(0, breakdown.gross - prePaySum);
+
+  const data = {
+    satCount: inputs.satCount,
+    weeksCount: inputs.weeksCount,
+    foodOn: !!inputs.foodOn,
+    fatherOn: !!inputs.fatherOn,
+    bonusAmt: inputs.bonusAmt,
+    bonusNote: inputs.bonusNote || '',
+    prePayDeducted: unsettled.map(p => p.id),
+    snapshot: { ...caregiverConfig },
+    total: netDue,
+  };
+  const summary = `${ym} | ${fmtMoney(netDue)}`;
+  try {
+    const existing = caregiverMonths.find(m => m.ym === ym);
+    if (existing) {
+      await updateEvent(existing.id, { summary: P.CG_MONTH + ' ' + summary, description: JSON.stringify(data) });
+    } else {
+      await createEvent(P.CG_MONTH, summary, JSON.stringify(data), getMonthFirst(ym));
+    }
+    caregiverDraft = null;
+    await syncAll();
+  } catch (e) { showError(e.message); }
+}
+
+async function deleteCaregiverMonth(id) {
+  if (!confirm('Delete this saved month? Pre-payments will become unsettled again.')) return;
+  try { await deleteEvent(id); await syncAll(); }
+  catch (e) { showError(e.message); }
+}
+
+// ── Day-off CRUD ──
+async function addCaregiverVacation() { await cgAddDay('addCaregiverVacation', P.CG_VAC, 'vacation'); }
+async function addCaregiverSick()     { await cgAddDay('addCaregiverSick',     P.CG_SICK, 'sick'); }
+async function cgAddDay(inputId, prefix, label) {
+  const date = document.getElementById('cg-' + inputId + '-date').value;
+  if (!date) return;
+  try { await createEvent(prefix, label, '', date); await syncAll(); }
+  catch (e) { showError(e.message); }
+}
+async function deleteCaregiverDay(id) {
+  try { await deleteEvent(id); await syncAll(); }
+  catch (e) { showError(e.message); }
+}
+
+// ── Pre-payments CRUD ──
+async function addCaregiverPrepay() {
+  const date = document.getElementById('cg-prepay-date').value;
+  const amt = Number(document.getElementById('cg-prepay-amt').value);
+  const note = document.getElementById('cg-prepay-note').value.trim();
+  if (!date || !amt) { showError('Date and amount required'); return; }
+  try {
+    await createEvent(P.CG_PREPAY, String(amt), note, date);
+    document.getElementById('cg-prepay-amt').value = '';
+    document.getElementById('cg-prepay-note').value = '';
+    await syncAll();
+  } catch (e) { showError(e.message); }
+}
+async function deleteCaregiverPrepay(id) {
+  try { await deleteEvent(id); await syncAll(); }
+  catch (e) { showError(e.message); }
+}
+
+// ══════════════════════════════════════════════════
 // NAVIGATION & UI
 // ══════════════════════════════════════════════════
 const VIEW_TITLES = {
   inbox: 'Inbox', tasks: 'Tasks', shopping: 'Shopping',
   ideas: 'Ideas', projects: 'Projects', lists: 'Lists',
+  caregiver: 'Caregiver',
 };
 
 function switchTab(tab, btn) {
