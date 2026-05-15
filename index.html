@@ -299,6 +299,15 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
   align-self: flex-start; background: var(--bg3); border: 1px solid var(--border);
   color: var(--text3); font-style: italic;
 }
+.ai-tool-call, .ai-tool-result {
+  align-self: flex-start; max-width: 88%;
+  font-size: 11px; font-family: 'JetBrains Mono', monospace;
+  padding: 6px 10px; border-radius: 8px; line-height: 1.4;
+  word-break: break-word; white-space: pre-wrap;
+}
+.ai-tool-call { background: rgba(99,102,241,0.12); color: var(--purple); border: 1px solid rgba(99,102,241,0.25); }
+.ai-tool-result { background: var(--bg3); color: var(--text2); border: 1px solid var(--border); }
+.ai-tool-result.error { background: rgba(239,68,68,0.1); color: #fca5a5; border-color: rgba(239,68,68,0.3); }
 .ai-input-row {
   padding: 12px 16px; border-top: 1px solid var(--bg4);
   display: flex; gap: 8px; background: var(--bg);
@@ -2545,9 +2554,12 @@ function buildSystemPrompt() {
     return `- ${l.icon} ${l.name}: ${l.items.length} items (${unc} remaining)`;
   }).join('\n') || '(none)';
 
-  return `You are an AI assistant embedded in a personal Life Dashboard app. Today is ${today}.
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  return `You are an AI assistant embedded in a personal Life Dashboard app. Today is ${today}. The user's timezone is ${tz}.
 
-You help the user manage their life: find tasks, analyze projects, brainstorm ideas, plan their day, and triage their inbox.
+You help the user manage their life: find tasks, analyze projects, brainstorm ideas, plan their day, triage their inbox, and manage their Google Calendar.
+
+You have tools to read, create, edit, and delete real Google Calendar events. Use them whenever the user asks about scheduling, meetings, appointments, or anything calendar-related. Always confirm what you did in plain language after a successful tool call. When the user mentions a relative time ("tomorrow at 3", "next Monday"), resolve it using today's date and the user's timezone, then pass an ISO 8601 datetime to the tool. For all-day events, pass a YYYY-MM-DD date.
 
 Be concise, actionable, and friendly. Use short responses. When suggesting actions, be specific to their actual data.
 
@@ -2574,6 +2586,180 @@ ${shopList}
 
 CUSTOM LISTS (${customLists.length}):
 ${listsSummary}`;
+}
+
+// ── Claude tool use: Google Calendar ──
+const CALENDAR_TOOLS = [
+  {
+    name: 'list_calendar_events',
+    description: "List the user's real calendar events in a time range. The app stores tasks/inbox/ideas/projects/lists/shopping as prefixed calendar events — those are filtered out so you only see real meetings and appointments.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        time_min: { type: 'string', description: 'Start of range, ISO 8601 (e.g. 2026-05-15T00:00:00Z). Defaults to now.' },
+        time_max: { type: 'string', description: 'End of range, ISO 8601. Defaults to 7 days after time_min.' },
+        query: { type: 'string', description: 'Optional free-text search over summary/description/location.' },
+        max_results: { type: 'number', description: 'Max events to return. Default 25.' },
+      },
+    },
+  },
+  {
+    name: 'create_calendar_event',
+    description: 'Create a new calendar event on the user\'s primary calendar.',
+    input_schema: {
+      type: 'object',
+      required: ['summary', 'start'],
+      properties: {
+        summary: { type: 'string', description: 'Event title.' },
+        description: { type: 'string' },
+        location: { type: 'string' },
+        start: { type: 'string', description: 'ISO 8601 datetime with timezone (e.g. 2026-05-15T15:00:00+03:00), OR a YYYY-MM-DD date for an all-day event.' },
+        end: { type: 'string', description: 'Same format as start. Defaults to start + 1 hour for timed events, or start + 1 day for all-day.' },
+      },
+    },
+  },
+  {
+    name: 'update_calendar_event',
+    description: 'Edit fields on an existing calendar event. Only fields you provide are changed.',
+    input_schema: {
+      type: 'object',
+      required: ['event_id'],
+      properties: {
+        event_id: { type: 'string' },
+        summary: { type: 'string' },
+        description: { type: 'string' },
+        location: { type: 'string' },
+        start: { type: 'string', description: 'ISO 8601 datetime or YYYY-MM-DD.' },
+        end: { type: 'string', description: 'ISO 8601 datetime or YYYY-MM-DD.' },
+      },
+    },
+  },
+  {
+    name: 'delete_calendar_event',
+    description: 'Delete a calendar event by id.',
+    input_schema: {
+      type: 'object',
+      required: ['event_id'],
+      properties: { event_id: { type: 'string' } },
+    },
+  },
+];
+
+const APP_PREFIXES = Object.values(P);
+
+function isAppManagedEvent(evt) {
+  const s = evt.summary || '';
+  return APP_PREFIXES.some(pref => s.includes(pref));
+}
+
+function toCalDate(s) {
+  // Accepts 'YYYY-MM-DD' (all-day) or ISO datetime (timed). Returns a Google Calendar start/end object.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return { date: s };
+  return { dateTime: s, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone };
+}
+
+function addDays(ymd, n) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + n);
+  return dt.toISOString().slice(0, 10);
+}
+
+function defaultEnd(start) {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(start)) return addDays(start, 1);
+  const dt = new Date(start);
+  if (isNaN(dt)) return start;
+  dt.setHours(dt.getHours() + 1);
+  return dt.toISOString();
+}
+
+async function toolListEvents({ time_min, time_max, query, max_results }) {
+  const min = time_min || new Date().toISOString();
+  const max = time_max || new Date(new Date(min).getTime() + 7 * 86400000).toISOString();
+  const limit = Math.min(Math.max(max_results || 25, 1), 100);
+  let url = `/calendars/${encodeURIComponent(CALENDAR_ID)}/events?timeMin=${encodeURIComponent(min)}&timeMax=${encodeURIComponent(max)}&maxResults=${limit * 2}&singleEvents=true&orderBy=startTime`;
+  if (query) url += `&q=${encodeURIComponent(query)}`;
+  const data = await calFetch(url);
+  const items = (data.items || [])
+    .filter(e => !isAppManagedEvent(e))
+    .slice(0, limit)
+    .map(e => ({
+      id: e.id,
+      summary: e.summary || '(no title)',
+      description: e.description || undefined,
+      location: e.location || undefined,
+      start: e.start?.dateTime || e.start?.date,
+      end: e.end?.dateTime || e.end?.date,
+      html_link: e.htmlLink,
+    }));
+  return { count: items.length, events: items };
+}
+
+async function toolCreateEvent({ summary, description, location, start, end }) {
+  if (!summary || !start) throw new Error('summary and start are required');
+  const body = { summary };
+  if (description) body.description = description;
+  if (location) body.location = location;
+  body.start = toCalDate(start);
+  body.end = toCalDate(end || defaultEnd(start));
+  const evt = await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events`, {
+    method: 'POST', body: JSON.stringify(body),
+  });
+  return { id: evt.id, summary: evt.summary, start: evt.start, end: evt.end, html_link: evt.htmlLink };
+}
+
+async function toolUpdateEvent({ event_id, summary, description, location, start, end }) {
+  if (!event_id) throw new Error('event_id is required');
+  const body = {};
+  if (summary !== undefined) body.summary = summary;
+  if (description !== undefined) body.description = description;
+  if (location !== undefined) body.location = location;
+  if (start !== undefined) body.start = toCalDate(start);
+  if (end !== undefined) body.end = toCalDate(end);
+  const evt = await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${event_id}`, {
+    method: 'PATCH', body: JSON.stringify(body),
+  });
+  return { id: evt.id, summary: evt.summary, start: evt.start, end: evt.end, html_link: evt.htmlLink };
+}
+
+async function toolDeleteEvent({ event_id }) {
+  if (!event_id) throw new Error('event_id is required');
+  await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${event_id}`, { method: 'DELETE' });
+  return { deleted: true, event_id };
+}
+
+async function executeAiTool(name, input) {
+  if (name === 'list_calendar_events')   return await toolListEvents(input || {});
+  if (name === 'create_calendar_event')  return await toolCreateEvent(input || {});
+  if (name === 'update_calendar_event')  return await toolUpdateEvent(input || {});
+  if (name === 'delete_calendar_event')  return await toolDeleteEvent(input || {});
+  throw new Error('Unknown tool: ' + name);
+}
+
+function aiExtractText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+}
+
+function aiRenderMessage(m) {
+  if (typeof m.content === 'string') {
+    return `<div class="ai-msg ${m.role}">${esc(m.content)}</div>`;
+  }
+  if (!Array.isArray(m.content)) return '';
+  return m.content.map(b => {
+    if (b.type === 'text') return `<div class="ai-msg ${m.role}">${esc(b.text)}</div>`;
+    if (b.type === 'tool_use') {
+      const args = Object.entries(b.input || {}).map(([k, v]) => `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`).join(', ');
+      return `<div class="ai-tool-call">🔧 ${esc(b.name)}(${esc(args)})</div>`;
+    }
+    if (b.type === 'tool_result') {
+      let txt = typeof b.content === 'string' ? b.content : (Array.isArray(b.content) ? b.content.map(c => c.text || '').join('') : JSON.stringify(b.content));
+      if (txt.length > 240) txt = txt.slice(0, 240) + '…';
+      return `<div class="ai-tool-result ${b.is_error ? 'error' : ''}">${b.is_error ? '⚠ ' : '↳ '}${esc(txt)}</div>`;
+    }
+    return '';
+  }).join('');
 }
 
 function openAI() {
@@ -2612,7 +2798,7 @@ function openAI() {
               <div style="font-size:28px;margin-bottom:8px">✨</div>
               <div style="font-size:13px">I can see all your tasks, ideas, and projects.<br>Ask me anything!</div>
             </div>
-          ` : aiMessages.map(m => `<div class="ai-msg ${m.role}">${esc(m.content)}</div>`).join('')}
+          ` : aiMessages.map(aiRenderMessage).join('')}
         </div>
         ${aiMessages.length === 0 ? `
           <div class="ai-suggestions">
@@ -2807,23 +2993,53 @@ async function aiSend() {
 
   try {
     const workerUrl = getWorkerUrl();
-    const response = await fetch(workerUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        system: buildSystemPrompt(),
-        messages: aiMessages.filter(m => m.role === 'user' || m.role === 'assistant'),
-      }),
-    });
+    const system = buildSystemPrompt();
+    let safety = 0;
 
-    const data = await response.json();
+    while (safety++ < 8) {
+      const response = await fetch(workerUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 2048,
+          system,
+          tools: CALENDAR_TOOLS,
+          messages: aiMessages.filter(m => m.role === 'user' || m.role === 'assistant'),
+        }),
+      });
+      const data = await response.json();
+      if (data.error) throw new Error(typeof data.error === 'string' ? data.error : data.error.message || 'API error');
 
-    if (data.error) throw new Error(typeof data.error === 'string' ? data.error : data.error.message || 'API error');
+      aiMessages.push({ role: 'assistant', content: data.content || [] });
 
-    const reply = data.content?.[0]?.text || 'No response';
-    aiMessages.push({ role: 'assistant', content: reply });
+      if (data.stop_reason !== 'tool_use') break;
+
+      const toolUses = (data.content || []).filter(b => b.type === 'tool_use');
+      const results = [];
+      for (const tu of toolUses) {
+        try {
+          const result = await executeAiTool(tu.name, tu.input);
+          results.push({ type: 'tool_result', tool_use_id: tu.id, content: JSON.stringify(result) });
+        } catch (err) {
+          results.push({ type: 'tool_result', tool_use_id: tu.id, content: 'Error: ' + err.message, is_error: true });
+        }
+      }
+      aiMessages.push({ role: 'user', content: results });
+      // Re-render between turns so the user sees tool calls live
+      openAI();
+      const msgs = document.getElementById('ai-messages');
+      if (msgs) {
+        msgs.innerHTML += '<div class="ai-msg thinking" id="ai-thinking">Thinking...</div>';
+        msgs.scrollTop = msgs.scrollHeight;
+      }
+    }
+
+    // If a tool round-trip touched the calendar, refresh app data so the views stay in sync.
+    if (aiMessages.slice(-4).some(m => Array.isArray(m.content) && m.content.some(b =>
+        b.type === 'tool_use' && b.name !== 'list_calendar_events'))) {
+      syncAll().catch(() => {});
+    }
   } catch (e) {
     aiMessages.push({ role: 'assistant', content: '⚠️ Error: ' + e.message });
   }
@@ -2831,11 +3047,12 @@ async function aiSend() {
   aiStreaming = false;
   const wasVoice = aiLastInputWasVoice;
   aiLastInputWasVoice = false;
-  openAI(); // Re-render with response
+  openAI(); // Re-render with final response
 
   const last = aiMessages[aiMessages.length - 1];
-  if (aiVoiceMode && last?.role === 'assistant' && !last.content.startsWith('⚠️')) {
-    aiSpeak(last.content, () => {
+  const spokenText = last?.role === 'assistant' ? aiExtractText(last.content) : '';
+  if (aiVoiceMode && spokenText && !spokenText.startsWith('⚠️')) {
+    aiSpeak(spokenText, () => {
       if (aiVoiceMode && wasVoice && document.getElementById('ai-mic-btn')) {
         aiStartListening();
       }

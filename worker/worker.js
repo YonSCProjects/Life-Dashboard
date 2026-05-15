@@ -128,6 +128,15 @@ async function handleAi(request, env) {
   if (!apiKey) return json({ error: 'API key not configured' }, 500);
 
   const body = await request.json();
+  const payload = {
+    model: body.model || 'claude-sonnet-4-20250514',
+    max_tokens: body.max_tokens || 2048,
+    system: body.system || '',
+    messages: body.messages || [],
+  };
+  if (body.tools) payload.tools = body.tools;
+  if (body.tool_choice) payload.tool_choice = body.tool_choice;
+
   const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -135,12 +144,7 @@ async function handleAi(request, env) {
       'x-api-key': apiKey,
       'anthropic-version': '2023-06-01',
     },
-    body: JSON.stringify({
-      model: body.model || 'claude-sonnet-4-20250514',
-      max_tokens: body.max_tokens || 1024,
-      system: body.system || '',
-      messages: body.messages || [],
-    }),
+    body: JSON.stringify(payload),
   });
 
   const data = await response.text();
