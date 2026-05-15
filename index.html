@@ -2615,6 +2615,18 @@ const CALENDAR_TOOLS = [
         location: { type: 'string' },
         start: { type: 'string', description: 'ISO 8601 datetime with timezone (e.g. 2026-05-15T15:00:00+03:00), OR a YYYY-MM-DD date for an all-day event.' },
         end: { type: 'string', description: 'Same format as start. Defaults to start + 1 hour for timed events, or start + 1 day for all-day.' },
+        reminders: {
+          type: 'array',
+          description: 'Notifications before the event. Pass an empty array [] for no reminders. "minutes" is how many minutes before event start to notify (Google\'s limit is 40320 = 4 weeks). For all-day events, event start = midnight of the start date in the user\'s timezone, so e.g. 4pm the day before an all-day event = 480 minutes.',
+          items: {
+            type: 'object',
+            required: ['minutes'],
+            properties: {
+              minutes: { type: 'number' },
+              method: { type: 'string', enum: ['popup', 'email'], description: 'Default: popup.' },
+            },
+          },
+        },
       },
     },
   },
@@ -2631,6 +2643,18 @@ const CALENDAR_TOOLS = [
         location: { type: 'string' },
         start: { type: 'string', description: 'ISO 8601 datetime or YYYY-MM-DD.' },
         end: { type: 'string', description: 'ISO 8601 datetime or YYYY-MM-DD.' },
+        reminders: {
+          type: 'array',
+          description: 'Replaces the event\'s reminders. Pass [] to clear all reminders. Same format as create_calendar_event.reminders.',
+          items: {
+            type: 'object',
+            required: ['minutes'],
+            properties: {
+              minutes: { type: 'number' },
+              method: { type: 'string', enum: ['popup', 'email'] },
+            },
+          },
+        },
       },
     },
   },
@@ -2695,20 +2719,31 @@ async function toolListEvents({ time_min, time_max, query, max_results }) {
   return { count: items.length, events: items };
 }
 
-async function toolCreateEvent({ summary, description, location, start, end }) {
+function toRemindersField(reminders) {
+  return {
+    useDefault: false,
+    overrides: (reminders || []).map(r => ({
+      method: r.method || 'popup',
+      minutes: Math.max(0, Math.min(40320, Math.round(Number(r.minutes) || 0))),
+    })),
+  };
+}
+
+async function toolCreateEvent({ summary, description, location, start, end, reminders }) {
   if (!summary || !start) throw new Error('summary and start are required');
   const body = { summary };
   if (description) body.description = description;
   if (location) body.location = location;
   body.start = toCalDate(start);
   body.end = toCalDate(end || defaultEnd(start));
+  if (reminders !== undefined) body.reminders = toRemindersField(reminders);
   const evt = await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events`, {
     method: 'POST', body: JSON.stringify(body),
   });
-  return { id: evt.id, summary: evt.summary, start: evt.start, end: evt.end, html_link: evt.htmlLink };
+  return { id: evt.id, summary: evt.summary, start: evt.start, end: evt.end, reminders: evt.reminders, html_link: evt.htmlLink };
 }
 
-async function toolUpdateEvent({ event_id, summary, description, location, start, end }) {
+async function toolUpdateEvent({ event_id, summary, description, location, start, end, reminders }) {
   if (!event_id) throw new Error('event_id is required');
   const body = {};
   if (summary !== undefined) body.summary = summary;
@@ -2716,10 +2751,11 @@ async function toolUpdateEvent({ event_id, summary, description, location, start
   if (location !== undefined) body.location = location;
   if (start !== undefined) body.start = toCalDate(start);
   if (end !== undefined) body.end = toCalDate(end);
+  if (reminders !== undefined) body.reminders = toRemindersField(reminders);
   const evt = await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${event_id}`, {
     method: 'PATCH', body: JSON.stringify(body),
   });
-  return { id: evt.id, summary: evt.summary, start: evt.start, end: evt.end, html_link: evt.htmlLink };
+  return { id: evt.id, summary: evt.summary, start: evt.start, end: evt.end, reminders: evt.reminders, html_link: evt.htmlLink };
 }
 
 async function toolDeleteEvent({ event_id }) {
