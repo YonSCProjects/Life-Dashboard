@@ -537,6 +537,7 @@ const P = {
   CG_CFG: '💼C',     // caregiver rates config (single event)
   CG_MONTH: '💼M',   // saved monthly salary record (one per month)
   CG_VAC: '🌴',       // vacation day (one per day)
+  CG_HOL: '🎊',       // holiday vacation day (one per day)
   CG_SICK: '🤒',      // sick day (one per day)
   CG_PREPAY: '💸',    // pre-payment / advance
 };
@@ -552,6 +553,7 @@ let tasks = [], shopItems = [], inboxItems = [], ideas = [], projects = [], cust
 let caregiverConfig = null;       // single config object (rates) or null if not set
 let caregiverMonths = [];         // [{id, ym:'YYYY-MM', satCount, weeksCount, foodOn, fatherOn, bonusAmt, bonusNote, prePayDeducted:[ids], total}]
 let caregiverVacation = [];       // [{id, date}]
+let caregiverHoliday = [];        // [{id, date}]  — holiday vacation days
 let caregiverSick = [];           // [{id, date}]
 let caregiverPrepays = [];        // [{id, date, amount, note}]
 let caregiverDraft = null;        // unsaved current-month inputs (kept in memory while user types)
@@ -913,7 +915,7 @@ async function syncAll() {
   btn.disabled = true;
   try {
     const [taskEvts, shopEvts, inboxEvts, ideaEvts, projEvts, listEvts, listItemEvts,
-           cgCfgEvts, cgMonthEvts, cgVacEvts, cgSickEvts, cgPrepayEvts] = await Promise.all([
+           cgCfgEvts, cgMonthEvts, cgVacEvts, cgHolEvts, cgSickEvts, cgPrepayEvts] = await Promise.all([
       fetchEvents(P.TASK),
       fetchEvents(P.SHOP),
       fetchEvents(P.INBOX),
@@ -924,6 +926,7 @@ async function syncAll() {
       fetchEvents(P.CG_CFG),
       fetchEvents(P.CG_MONTH),
       fetchEvents(P.CG_VAC),
+      fetchEvents(P.CG_HOL),
       fetchEvents(P.CG_SICK),
       fetchEvents(P.CG_PREPAY),
     ]);
@@ -959,6 +962,8 @@ async function syncAll() {
     caregiverConfig = cgCfgEvts.length ? parseCaregiverConfig(cgCfgEvts[0]) : null;
     caregiverMonths = cgMonthEvts.map(parseCaregiverMonth).sort((a, b) => b.ym.localeCompare(a.ym));
     caregiverVacation = cgVacEvts.map(e => ({ id: e.id, date: e.start?.date || (e.start?.dateTime || '').split('T')[0] }))
+      .sort((a, b) => b.date.localeCompare(a.date));
+    caregiverHoliday = cgHolEvts.map(e => ({ id: e.id, date: e.start?.date || (e.start?.dateTime || '').split('T')[0] }))
       .sort((a, b) => b.date.localeCompare(a.date));
     caregiverSick = cgSickEvts.map(e => ({ id: e.id, date: e.start?.date || (e.start?.dateTime || '').split('T')[0] }))
       .sort((a, b) => b.date.localeCompare(a.date));
@@ -2184,6 +2189,9 @@ function renderCaregiver() {
       ${cgListSection('🌴 Vacation days', caregiverVacation, 'addCaregiverVacation', 'deleteCaregiverDay', false)}
     </div>
     <div class="card" style="padding:14px;margin-bottom:14px">
+      ${cgListSection('🎊 Holiday vacation days', caregiverHoliday, 'addCaregiverHoliday', 'deleteCaregiverDay', false)}
+    </div>
+    <div class="card" style="padding:14px;margin-bottom:14px">
       ${cgListSection('🤒 Sick days', caregiverSick, 'addCaregiverSick', 'deleteCaregiverDay', false)}
     </div>
     <div class="card" style="padding:14px;margin-bottom:14px">
@@ -2376,6 +2384,7 @@ async function deleteCaregiverMonth(id) {
 
 // ── Day-off CRUD ──
 async function addCaregiverVacation() { await cgAddDay('addCaregiverVacation', P.CG_VAC, 'vacation'); }
+async function addCaregiverHoliday()  { await cgAddDay('addCaregiverHoliday',  P.CG_HOL, 'holiday'); }
 async function addCaregiverSick()     { await cgAddDay('addCaregiverSick',     P.CG_SICK, 'sick'); }
 async function cgAddDay(inputId, prefix, label) {
   const date = document.getElementById('cg-' + inputId + '-date').value;
