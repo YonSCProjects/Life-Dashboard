@@ -142,6 +142,18 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
   transition: all 0.2s; display: flex; align-items: center; justify-content: center;
 }
 .task-check:hover { transform: scale(1.1); }
+
+/* ── DRAG REORDER ── */
+.drag-handle {
+  flex-shrink: 0; cursor: grab; touch-action: none; user-select: none;
+  color: var(--text3); font-size: 16px; line-height: 1;
+  padding: 6px 4px; display: flex; align-items: center;
+}
+.drag-handle:active { cursor: grabbing; }
+.drag-handle:hover { color: var(--text2); }
+.drag-row-active {
+  opacity: 0.55; background: var(--bg4); border-radius: 8px;
+}
 .task-check.done { background: var(--green); border-color: var(--green); }
 .task-title { font-size: 13px; font-weight: 500; color: #e8e8f0; line-height: 1.4; word-break: break-word; }
 .task-title.done { color: var(--text3); text-decoration: line-through; }
@@ -932,13 +944,20 @@ async function syncAll() {
     ]);
 
     tasks = taskEvts.map(parseTask);
-    // Sort: active first by priority, then overdue first
+    // Sort: done last. Active tasks use manual drag order once any has been
+    // set; otherwise fall back to overdue-first, then priority.
+    const anyTaskOrder = tasks.some(t => !t.done && t.order != null);
     tasks.sort((a, b) => {
       if (a.done !== b.done) return a.done ? 1 : -1;
-      // Overdue tasks first
-      if (!a.done && !b.done && a.due && b.due) {
-        const da = new Date(a.due), db = new Date(b.due);
-        if (da.getTime() !== db.getTime()) return da - db;
+      if (!a.done && !b.done) {
+        if (anyTaskOrder) {
+          const ao = a.order ?? Infinity, bo = b.order ?? Infinity;
+          if (ao !== bo) return ao - bo;
+        }
+        if (a.due && b.due) {
+          const da = new Date(a.due), db = new Date(b.due);
+          if (da.getTime() !== db.getTime()) return da - db;
+        }
       }
       return (PRIS[a.priority]?.order ?? 2) - (PRIS[b.priority]?.order ?? 2);
     });
@@ -980,6 +999,112 @@ async function syncAll() {
 // ══════════════════════════════════════════════════
 // PARSERS
 // ══════════════════════════════════════════════════
+function getEventOrder(event) {
+  const v = event.extendedProperties?.private?.order;
+  const n = v == null ? NaN : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+// ── Drag-to-reorder engine (shared by tasks, shopping, custom lists) ──
+function cmpOrder(a, b) {
+  if (a.order != null && b.order != null) return a.order - b.order;
+  if (a.order != null) return -1;
+  if (b.order != null) return 1;
+  return 0;
+}
+
+async function persistOrder(id, order) {
+  return updateEvent(id, { extendedProperties: { private: { order: String(order) } } });
+}
+
+// Attaches pointer-based drag handling to a container. Rows must carry a
+// [data-drag-id] attribute and contain a .drag-handle element. onCommit is
+// called with the new id order only when the order actually changed.
+function enableDragReorder(container, onCommit) {
+  if (!container) return;
+  container.onpointerdown = (e) => {
+    const handle = e.target.closest('.drag-handle');
+    if (!handle || !container.contains(handle)) return;
+    const row = handle.closest('[data-drag-id]');
+    if (!row) return;
+    e.preventDefault();
+
+    const startIds = [...container.querySelectorAll('[data-drag-id]')].map(r => r.dataset.dragId);
+    row.classList.add('drag-row-active');
+    try { handle.setPointerCapture(e.pointerId); } catch {}
+
+    const onMove = (ev) => {
+      const others = [...container.querySelectorAll('[data-drag-id]')].filter(r => r !== row);
+      let target = null;
+      for (const r of others) {
+        const rect = r.getBoundingClientRect();
+        if (ev.clientY < rect.top + rect.height / 2) { target = r; break; }
+      }
+      if (target) container.insertBefore(row, target);
+      else container.appendChild(row);
+    };
+    const onUp = () => {
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', onUp);
+      handle.removeEventListener('pointercancel', onUp);
+      row.classList.remove('drag-row-active');
+      const endIds = [...container.querySelectorAll('[data-drag-id]')].map(r => r.dataset.dragId);
+      if (endIds.length === startIds.length && endIds.some((id, i) => id !== startIds[i])) {
+        onCommit(endIds);
+      }
+    };
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+    handle.addEventListener('pointercancel', onUp);
+  };
+}
+
+const DRAG_HANDLE_HTML = '<div class="drag-handle" title="Drag to reorder" onclick="event.stopPropagation()">⠿</div>';
+
+// Commit handlers — assign sequential order values and persist changed events.
+async function commitTaskOrder(visibleIds) {
+  const active = tasks.filter(t => !t.done);
+  const visibleSet = new Set(visibleIds);
+  const newVisible = visibleIds.map(id => active.find(t => t.id === id)).filter(Boolean);
+  let vi = 0;
+  const merged = active.map(t => visibleSet.has(t.id) ? newVisible[vi++] : t);
+  const before = new Map(active.map(t => [t.id, t.order]));
+  merged.forEach((t, i) => { t.order = i; });
+  tasks = [...merged, ...tasks.filter(t => t.done)];
+  const changed = merged.filter(t => before.get(t.id) !== t.order);
+  try {
+    await Promise.all(changed.map(t => persistOrder(t.id, t.order)));
+  } catch (e) { showError(e.message); await syncAll(); }
+}
+
+async function commitShopOrder(visibleIds) {
+  const before = new Map(shopItems.map(i => [i.id, i.order]));
+  visibleIds.forEach((id, i) => {
+    const item = shopItems.find(s => s.id === id);
+    if (item) item.order = i;
+  });
+  const changed = visibleIds.map(id => shopItems.find(s => s.id === id))
+    .filter(it => it && before.get(it.id) !== it.order);
+  try {
+    await Promise.all(changed.map(it => persistOrder(it.id, it.order)));
+  } catch (e) { showError(e.message); await syncAll(); }
+}
+
+async function commitListOrder(listId, visibleIds) {
+  const list = customLists.find(l => l.id === listId);
+  if (!list) return;
+  const before = new Map(list.items.map(i => [i.id, i.order]));
+  visibleIds.forEach((id, i) => {
+    const item = list.items.find(it => it.id === id);
+    if (item) item.order = i;
+  });
+  const changed = visibleIds.map(id => list.items.find(it => it.id === id))
+    .filter(it => it && before.get(it.id) !== it.order);
+  try {
+    await Promise.all(changed.map(it => persistOrder(it.id, it.order)));
+  } catch (e) { showError(e.message); await syncAll(); }
+}
+
 function parseTask(event) {
   const title = (event.summary || '').replace(P.TASK, '').trim();
   const desc = event.description || '';
@@ -1001,6 +1126,7 @@ function parseTask(event) {
     done: meta.includes('[DONE]'),
     project: projectMatch ? projectMatch[1].trim() : null,
     created: event.created,
+    order: getEventOrder(event),
   };
 }
 
@@ -1015,6 +1141,7 @@ function parseShopEvent(event) {
     qty: qtyMatch ? qtyMatch[1] : '1',
     checked: checkedMatch ? checkedMatch[1] === 'true' : false,
     category: catMatch ? catMatch[1].trim() : '',
+    order: getEventOrder(event),
   };
 }
 
@@ -1064,6 +1191,7 @@ function parseListEvent(event, listItemEvts) {
       return {
         id: e.id, text,
         checked: checkedMatch ? checkedMatch[1] === 'true' : false,
+        order: getEventOrder(e),
       };
     });
   return {
@@ -1262,6 +1390,7 @@ function renderTasks() {
     container.innerHTML = `<div class="empty"><div class="icon">📝</div><div class="msg">${tasks.length === 0 ? 'No tasks yet' : 'No tasks in this category'}</div></div>`;
   } else {
     container.innerHTML = filtered.map((t, i) => renderTaskItem(t, i)).join('');
+    enableDragReorder(container, commitTaskOrder);
   }
 
   // Completed section
@@ -1292,7 +1421,7 @@ function renderTaskItem(t, i) {
   const pri = PRIS[t.priority] || PRIS.Medium;
   const dueHtml = t.due ? `<span class="task-due ${getDueClass(t.due)}">${formatDue(t.due)}</span>` : '';
   return `
-    <div class="task-item fade-up" data-task="${t.id}" style="animation-delay:${i * 0.03}s" onclick="editTask('${t.id}')">
+    <div class="task-item fade-up" data-task="${t.id}" data-drag-id="${t.id}" style="animation-delay:${i * 0.03}s" onclick="editTask('${t.id}')">
       <button class="task-check" style="border-color:${pri.color}40" onclick="event.stopPropagation();completeTask('${t.id}')" title="Complete"></button>
       <div style="flex:1;min-width:0">
         <div class="task-title">${esc(t.title)}</div>
@@ -1304,6 +1433,7 @@ function renderTaskItem(t, i) {
         </div>
         ${t.notes ? `<div class="task-notes">${esc(t.notes)}</div>` : ''}
       </div>
+      ${DRAG_HANDLE_HTML}
     </div>`;
 }
 
@@ -1543,13 +1673,15 @@ function renderShop() {
       const icon = SHOP_CATS_ICONS[cat] || '📦';
       html += `<div class="shop-cat-label">${icon} ${cat}</div>`;
     }
-    html += grouped[cat].map(i => `
-      <div class="shop-item">
+    grouped[cat].sort(cmpOrder);
+    html += `<div class="shop-drag-group" data-shop-cat="${esc(cat)}">` + grouped[cat].map(i => `
+      <div class="shop-item" data-drag-id="${i.id}">
         <button class="shop-check" onclick="toggleShop('${i.id}')"></button>
         <span style="flex:1;font-size:13px">${esc(i.name)}</span>
         <span style="font-size:11px;color:var(--text3);font-family:monospace">${i.qty !== '1' ? 'x' + i.qty : ''}</span>
         <button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:4px" onclick="deleteShop('${i.id}')">x</button>
-      </div>`).join('');
+        ${DRAG_HANDLE_HTML}
+      </div>`).join('') + `</div>`;
   });
 
   if (chk.length > 0) {
@@ -1566,6 +1698,9 @@ function renderShop() {
     html += '</div>';
   }
   container.innerHTML = html;
+  container.querySelectorAll('.shop-drag-group').forEach(group => {
+    enableDragReorder(group, commitShopOrder);
+  });
 }
 
 async function addShopItem() {
@@ -1935,7 +2070,7 @@ async function saveNewList() {
 function openList(listId) {
   const list = customLists.find(l => l.id === listId);
   if (!list) return;
-  const unchecked = list.items.filter(i => !i.checked);
+  const unchecked = list.items.filter(i => !i.checked).sort(cmpOrder);
   const checked = list.items.filter(i => i.checked);
 
   showDetail(`
@@ -1950,13 +2085,16 @@ function openList(listId) {
         <button class="btn btn-primary btn-sm" onclick="addListItem('${list.id}')">+</button>
       </div>
       <div id="list-items">
+        <div id="list-drag-group">
         ${unchecked.map(item => `
-          <div class="shop-item">
+          <div class="shop-item" data-drag-id="${item.id}">
             <button class="shop-check" onclick="toggleListItem('${item.id}','${list.id}')"></button>
             <span style="flex:1;font-size:13px">${esc(item.text)}</span>
             <button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:4px" onclick="deleteListItem('${item.id}','${list.id}')">x</button>
+            ${DRAG_HANDLE_HTML}
           </div>
         `).join('')}
+        </div>
         ${checked.length > 0 ? `
           <div style="margin-top:16px">
             <span class="section-title">Done (${checked.length})</span>
@@ -1972,6 +2110,7 @@ function openList(listId) {
       </div>
     </div>
   `);
+  enableDragReorder(document.getElementById('list-drag-group'), ids => commitListOrder(list.id, ids));
 }
 
 async function addListItem(listId) {
