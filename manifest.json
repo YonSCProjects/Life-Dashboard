@@ -5,8 +5,8 @@
   "start_url": "/Life-Dashboard/",
   "scope": "/Life-Dashboard/",
   "display": "standalone",
-  "background_color": "#0a0b10",
-  "theme_color": "#0a0b10",
+  "background_color": "#eef1f5",
+  "theme_color": "#eef1f5",
   "orientation": "portrait",
   "icons": [
     {
