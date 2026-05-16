@@ -152,7 +152,9 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 .drag-handle:active { cursor: grabbing; }
 .drag-handle:hover { color: var(--text2); }
 .drag-row-active {
-  opacity: 0.55; background: var(--bg4); border-radius: 8px;
+  position: relative; z-index: 5; opacity: 0.92;
+  background: var(--bg4); border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.45);
 }
 .task-check.done { background: var(--green); border-color: var(--green); }
 .task-title { font-size: 13px; font-weight: 500; color: #e8e8f0; line-height: 1.4; word-break: break-word; }
@@ -1031,9 +1033,11 @@ function enableDragReorder(container, onCommit) {
 
     const startIds = [...container.querySelectorAll('[data-drag-id]')].map(r => r.dataset.dragId);
     row.classList.add('drag-row-active');
-    try { handle.setPointerCapture(e.pointerId); } catch {}
+    document.body.style.userSelect = 'none';
 
     const onMove = (ev) => {
+      // Measure untransformed, reorder, then follow the pointer.
+      row.style.transform = 'none';
       const others = [...container.querySelectorAll('[data-drag-id]')].filter(r => r !== row);
       let target = null;
       for (const r of others) {
@@ -1042,20 +1046,24 @@ function enableDragReorder(container, onCommit) {
       }
       if (target) container.insertBefore(row, target);
       else container.appendChild(row);
+      const r2 = row.getBoundingClientRect();
+      row.style.transform = `translateY(${ev.clientY - (r2.top + r2.height / 2)}px)`;
     };
     const onUp = () => {
-      handle.removeEventListener('pointermove', onMove);
-      handle.removeEventListener('pointerup', onUp);
-      handle.removeEventListener('pointercancel', onUp);
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+      document.removeEventListener('pointercancel', onUp);
+      document.body.style.userSelect = '';
       row.classList.remove('drag-row-active');
+      row.style.transform = '';
       const endIds = [...container.querySelectorAll('[data-drag-id]')].map(r => r.dataset.dragId);
       if (endIds.length === startIds.length && endIds.some((id, i) => id !== startIds[i])) {
         onCommit(endIds);
       }
     };
-    handle.addEventListener('pointermove', onMove);
-    handle.addEventListener('pointerup', onUp);
-    handle.addEventListener('pointercancel', onUp);
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp);
+    document.addEventListener('pointercancel', onUp);
   };
 }
 
