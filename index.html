@@ -6,16 +6,34 @@
 <meta name="apple-mobile-web-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="theme-color" content="#eef1f5">
+<script>
+  // Apply saved theme before paint to avoid a flash of the wrong scheme.
+  (function () {
+    var t = localStorage.getItem('dash-theme');
+    if (t && t !== 'mist') document.documentElement.setAttribute('data-theme', t);
+  })();
+</script>
 <link rel="manifest" href="manifest.json">
 <title>Life Dashboard</title>
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
+/* ── Cool Mist (default, light) ── */
 :root {
   --bg: #eef1f5; --bg2: #e9edf2; --bg3: #ffffff; --bg4: #dde3ea;
   --border: #d5dce4; --text: #2c333d; --text2: #5f6b7a; --text3: #828e9d;
   --green: #3d9b8f; --red: #cf5147; --orange: #c4744a;
   --yellow: #a8842f; --blue: #5b7fb0; --purple: #7b85bf; --pink: #c781a0;
   --gray: #8b94a1; --cyan: #3f9aa6;
+}
+/* ── Dusk (dark, soft blue + orange) ──
+   --green is the app's primary action color; in this theme it is mapped
+   to soft blue so buttons/accents read blue, with orange as the warm accent. */
+[data-theme="dusk"] {
+  --bg: #151a23; --bg2: #1a212c; --bg3: #222b39; --bg4: #2c3749;
+  --border: #36435a; --text: #e8ecf2; --text2: #aab4c3; --text3: #7e8a9c;
+  --green: #6f9fd8; --red: #e0796f; --orange: #e89a5e;
+  --yellow: #d9b96b; --blue: #6f9fd8; --purple: #9aa0e2; --pink: #d99cb8;
+  --gray: #8b94a1; --cyan: #5fb6c2;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -405,6 +423,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
         <p class="date" id="date-display"></p>
       </div>
       <div style="display:flex;gap:6px;align-items:center">
+        <button class="btn btn-ghost btn-sm" onclick="toggleTheme()" id="theme-toggle-btn" title="Switch color scheme">🌙</button>
         <button class="btn btn-ghost btn-sm" onclick="toggleSearch()" id="search-toggle-btn">Search</button>
         <button class="btn btn-ghost btn-sm" onclick="syncAll()" id="sync-btn">Sync</button>
       </div>
@@ -2596,6 +2615,26 @@ const VIEW_TITLES = {
   caregiver: 'Caregiver',
 };
 
+// ── Color scheme ──
+const THEMES = ['mist', 'dusk'];
+const THEME_META = { mist: '#eef1f5', dusk: '#151a23' };
+
+function applyTheme(name) {
+  if (!THEMES.includes(name)) name = 'mist';
+  if (name === 'mist') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', name);
+  localStorage.setItem('dash-theme', name);
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', THEME_META[name]);
+  const btn = document.getElementById('theme-toggle-btn');
+  if (btn) btn.textContent = name === 'dusk' ? '☀️' : '🌙';
+}
+
+function toggleTheme() {
+  const cur = localStorage.getItem('dash-theme') || 'mist';
+  applyTheme(THEMES[(THEMES.indexOf(cur) + 1) % THEMES.length]);
+}
+
 function switchTab(tab, btn) {
   currentTab = tab;
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
@@ -3289,7 +3328,8 @@ if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 
-// ── Bootstrap auth ──
+// ── Bootstrap ──
+applyTheme(localStorage.getItem('dash-theme') || 'mist');
 initAuth();
 </script>
 
