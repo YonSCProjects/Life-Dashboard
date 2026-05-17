@@ -105,11 +105,11 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 }
 .nav-btn {
   flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px;
-  padding: 8px 4px; background: none; border: none; color: var(--text3);
-  font-size: 10px; font-weight: 500; cursor: pointer; transition: color 0.2s;
-  max-width: 72px; position: relative;
+  padding: 8px 2px; background: none; border: none; color: var(--text3);
+  font-size: 9px; font-weight: 500; cursor: pointer; transition: color 0.2s;
+  max-width: 64px; position: relative;
 }
-.nav-btn .nav-icon { font-size: 20px; line-height: 1; }
+.nav-btn .nav-icon { font-size: 19px; line-height: 1; }
 .nav-btn.active { color: var(--green); }
 .nav-badge {
   position: absolute; top: 2px; right: calc(50% - 18px);
@@ -225,6 +225,30 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 .list-icon { font-size: 24px; margin-bottom: 6px; }
 .list-name { font-size: 14px; font-weight: 600; margin-bottom: 2px; }
 .list-count { font-size: 11px; color: var(--text3); }
+
+/* ── REFLECTIONS ── */
+.reflection-card .reflection-date {
+  font-size: 10px; color: var(--text3); text-transform: uppercase;
+  letter-spacing: 0.05em; font-weight: 600; margin-bottom: 6px;
+}
+.reflection-card .reflection-text {
+  font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-break: break-word;
+}
+.reflection-actions { display: flex; gap: 6px; margin-top: 10px; }
+
+/* ── LEARNING NOTES ── */
+.learning-card { cursor: pointer; }
+.learning-card .learning-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; word-break: break-word; }
+.learning-card .learning-preview {
+  font-size: 12px; color: var(--text2); line-height: 1.5;
+  margin-top: 6px; word-break: break-word;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.learning-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.learning-body-input {
+  min-height: 320px; line-height: 1.6; font-size: 14px;
+}
+.learning-save-status { font-size: 11px; color: var(--text3); }
 
 /* ── DETAIL VIEWS (overlay) ── */
 .detail-view {
@@ -496,6 +520,31 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
     <div id="caregiver-body"></div>
   </div>
 
+  <!-- ═══ REFLECTIONS VIEW ═══ -->
+  <div class="content" id="reflections-view">
+    <div class="inbox-input-wrap">
+      <textarea class="inbox-input" id="reflection-input" rows="3"
+                placeholder="How was today? Thoughts before sleep…"
+                style="resize:none;padding-right:16px"></textarea>
+      <button class="btn btn-primary" style="width:100%;margin-top:8px" onclick="addReflection()">Save reflection</button>
+    </div>
+    <div id="reflections-list"></div>
+    <div class="empty" id="reflections-empty" style="display:none">
+      <div class="icon">🌙</div>
+      <div class="msg">End each day here — jot down thoughts and reflections before sleep</div>
+    </div>
+  </div>
+
+  <!-- ═══ LEARNING NOTES VIEW ═══ -->
+  <div class="content" id="learning-view">
+    <button class="btn btn-ghost" style="width:100%;margin-bottom:16px;border-style:dashed" onclick="showAddLearningNote()">+ New Note</button>
+    <div id="learning-list"></div>
+    <div class="empty" id="learning-empty" style="display:none">
+      <div class="icon">🎓</div>
+      <div class="msg">Document courses, lectures and meetings live — Claude can help organize them</div>
+    </div>
+  </div>
+
   <!-- BOTTOM NAV -->
   <nav class="bottom-nav">
     <button class="nav-btn active" onclick="switchTab('inbox', this)" data-tab="inbox">
@@ -518,6 +567,12 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
     </button>
     <button class="nav-btn" onclick="switchTab('caregiver', this)" data-tab="caregiver">
       <span class="nav-icon">👵</span>Care
+    </button>
+    <button class="nav-btn" onclick="switchTab('reflections', this)" data-tab="reflections">
+      <span class="nav-icon">🌙</span>Reflect
+    </button>
+    <button class="nav-btn" onclick="switchTab('learning', this)" data-tab="learning">
+      <span class="nav-icon">🎓</span>Learn
     </button>
   </nav>
 </div>
@@ -554,6 +609,8 @@ const P = {
   CG_HOL: '🎊',       // holiday vacation day (one per day)
   CG_SICK: '🤒',      // sick day (one per day)
   CG_PREPAY: '💸',    // pre-payment / advance
+  REFLECT: '🌙',      // end-of-day reflection / thought
+  LEARN: '🎓',        // learning note (course / lecture / meeting documentation)
 };
 
 const CURRENCY = '₪';
@@ -564,6 +621,8 @@ let sessionId = null;
 let refreshTimer = null;
 let refreshInFlight = null; // de-dupe concurrent refreshes
 let tasks = [], shopItems = [], inboxItems = [], ideas = [], projects = [], customLists = [];
+let reflections = [];             // [{id, text, date, created}] — end-of-day thoughts
+let learningNotes = [];           // [{id, title, type, body, date, created}] — in-vivo course/lecture/meeting docs
 let caregiverConfig = null;       // single config object (rates) or null if not set
 let caregiverMonths = [];         // [{id, ym:'YYYY-MM', satCount, weeksCount, foodOn, fatherOn, bonusAmt, bonusNote, prePayDeducted:[ids], total}]
 let caregiverVacation = [];       // [{id, date}]
@@ -929,7 +988,8 @@ async function syncAll() {
   btn.disabled = true;
   try {
     const [taskEvts, shopEvts, inboxEvts, ideaEvts, projEvts, listEvts, listItemEvts,
-           cgCfgEvts, cgMonthEvts, cgVacEvts, cgHolEvts, cgSickEvts, cgPrepayEvts] = await Promise.all([
+           cgCfgEvts, cgMonthEvts, cgVacEvts, cgHolEvts, cgSickEvts, cgPrepayEvts,
+           reflectEvts, learnEvts] = await Promise.all([
       fetchEvents(P.TASK),
       fetchEvents(P.SHOP),
       fetchEvents(P.INBOX),
@@ -943,6 +1003,8 @@ async function syncAll() {
       fetchEvents(P.CG_HOL),
       fetchEvents(P.CG_SICK),
       fetchEvents(P.CG_PREPAY),
+      fetchEvents(P.REFLECT),
+      fetchEvents(P.LEARN),
     ]);
 
     tasks = taskEvts.map(parseTask);
@@ -989,6 +1051,11 @@ async function syncAll() {
     caregiverSick = cgSickEvts.map(e => ({ id: e.id, date: e.start?.date || (e.start?.dateTime || '').split('T')[0] }))
       .sort((a, b) => b.date.localeCompare(a.date));
     caregiverPrepays = cgPrepayEvts.map(parseCaregiverPrepay).sort((a, b) => b.date.localeCompare(a.date));
+
+    reflections = reflectEvts.map(parseReflection)
+      .sort((a, b) => new Date(b.created) - new Date(a.created));
+    learningNotes = learnEvts.map(parseLearningNote)
+      .sort((a, b) => (b.date || '').localeCompare(a.date || '') || (new Date(b.created) - new Date(a.created)));
 
     renderAll();
   } catch (e) {
@@ -1209,6 +1276,37 @@ function parseListEvent(event, listItemEvts) {
   };
 }
 
+function eventDate(event) {
+  return event.start?.date || (event.start?.dateTime || '').split('T')[0] || '';
+}
+
+function parseReflection(event) {
+  const desc = (event.description || '').trim();
+  const summaryText = (event.summary || '').replace(P.REFLECT, '').trim();
+  return {
+    id: event.id,
+    text: desc || summaryText,
+    date: eventDate(event),
+    created: event.created,
+  };
+}
+
+function parseLearningNote(event) {
+  const title = (event.summary || '').replace(P.LEARN, '').trim();
+  let lines = (event.description || '').split('\n');
+  let type = 'Other';
+  if (lines.length && /^type:\s*/i.test(lines[0])) {
+    type = lines[0].replace(/^type:\s*/i, '').trim() || 'Other';
+    lines = lines.slice(1);
+  }
+  return {
+    id: event.id, title, type,
+    body: lines.join('\n').trim(),
+    date: eventDate(event),
+    created: event.created,
+  };
+}
+
 // ══════════════════════════════════════════════════
 // RENDER ALL
 // ══════════════════════════════════════════════════
@@ -1221,6 +1319,8 @@ function renderAll() {
   renderProjects();
   renderLists();
   renderCaregiver();
+  renderReflections();
+  renderLearning();
   updateBadges();
 }
 
@@ -1272,6 +1372,14 @@ function doSearch(query) {
         results.push({ type: 'list item', icon: '📝', text: item.text + ' (' + l.name + ')', id: l.id });
     });
   });
+  reflections.forEach(r => {
+    if (r.text.toLowerCase().includes(q))
+      results.push({ type: 'reflection', icon: '🌙', text: r.text, id: r.id });
+  });
+  learningNotes.forEach(n => {
+    if (n.title.toLowerCase().includes(q) || n.body.toLowerCase().includes(q))
+      results.push({ type: 'note', icon: '🎓', text: n.title, id: n.id });
+  });
 
   if (results.length === 0) {
     container.innerHTML = '<div style="padding:12px;color:var(--text3);font-size:12px;text-align:center">No results found</div>';
@@ -1288,13 +1396,15 @@ function doSearch(query) {
 
 function goToSearchResult(type, id) {
   toggleSearch();
-  const tabMap = { inbox: 'inbox', task: 'tasks', shop: 'shopping', idea: 'ideas', project: 'projects', list: 'lists', 'list item': 'lists' };
+  const tabMap = { inbox: 'inbox', task: 'tasks', shop: 'shopping', idea: 'ideas', project: 'projects', list: 'lists', 'list item': 'lists', reflection: 'reflections', note: 'learning' };
   const tab = tabMap[type];
   if (tab) switchTab(tab, document.querySelector(`[data-tab="${tab}"]`));
   if (type === 'task') editTask(id);
   else if (type === 'idea') editIdea(id);
   else if (type === 'project') openProject(id);
   else if (type === 'list' || type === 'list item') openList(id);
+  else if (type === 'reflection') editReflection(id);
+  else if (type === 'note') openLearningNote(id);
 }
 
 // ══════════════════════════════════════════════════
@@ -2590,10 +2700,258 @@ async function deleteCaregiverPrepay(id) {
 // ══════════════════════════════════════════════════
 // NAVIGATION & UI
 // ══════════════════════════════════════════════════
+// ══════════════════════════════════════════════════
+// REFLECTIONS — end-of-day thoughts
+// ══════════════════════════════════════════════════
+function formatReflectionDate(r) {
+  const d = new Date(r.created || r.date);
+  if (isNaN(d)) return '';
+  return d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' })
+    + ' · ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function renderReflections() {
+  const container = document.getElementById('reflections-list');
+  const empty = document.getElementById('reflections-empty');
+  if (!container) return;
+  if (reflections.length === 0) {
+    container.innerHTML = '';
+    empty.style.display = '';
+    return;
+  }
+  empty.style.display = 'none';
+  container.innerHTML = reflections.map((r, i) => `
+    <div class="card reflection-card fade-up" style="animation-delay:${i * 0.03}s">
+      <div class="reflection-date">${esc(formatReflectionDate(r))}</div>
+      <div class="reflection-text">${esc(r.text)}</div>
+      <div class="reflection-actions">
+        <button class="btn btn-sm btn-ghost" onclick="editReflection('${r.id}')">Edit</button>
+        <button class="btn btn-sm btn-ghost" style="margin-left:auto;color:var(--red);border-color:var(--red)" onclick="deleteReflection('${r.id}')">Delete</button>
+      </div>
+    </div>`).join('');
+}
+
+async function addReflection() {
+  const input = document.getElementById('reflection-input');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  const today = new Date().toISOString().split('T')[0];
+  const snippet = text.split('\n')[0].slice(0, 60);
+  try {
+    await createEvent(P.REFLECT, snippet, text, today);
+    await syncAll();
+  } catch (e) {
+    input.value = text;
+    showError('Failed to save reflection: ' + e.message);
+  }
+}
+
+function editReflection(id) {
+  const r = reflections.find(x => x.id === id);
+  if (!r) return;
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">Edit Reflection</span>
+      <button class="btn btn-sm btn-primary" id="save-reflection-btn" onclick="saveReflection('${id}')">Save</button>
+    </div>
+    <div class="detail-body">
+      <textarea id="edit-reflection-text" style="min-height:260px;font-size:14px">${esc(r.text)}</textarea>
+    </div>
+  `);
+}
+
+async function saveReflection(id) {
+  const text = document.getElementById('edit-reflection-text').value.trim();
+  if (!text) return;
+  const btn = document.getElementById('save-reflection-btn');
+  btn.textContent = '...'; btn.disabled = true;
+  try {
+    await updateEvent(id, {
+      summary: P.REFLECT + ' ' + text.split('\n')[0].slice(0, 60),
+      description: text,
+    });
+    closeDetail();
+    await syncAll();
+  } catch (e) {
+    showError(e.message);
+    btn.textContent = 'Save'; btn.disabled = false;
+  }
+}
+
+async function deleteReflection(id) {
+  try {
+    await deleteEvent(id);
+    reflections = reflections.filter(r => r.id !== id);
+    renderReflections();
+  } catch (e) { showError(e.message); }
+}
+
+// ══════════════════════════════════════════════════
+// LEARNING NOTES — in-vivo course / lecture / meeting docs
+// ══════════════════════════════════════════════════
+const LEARN_TYPES = ['Course', 'Lecture', 'Meeting', 'Other'];
+const LEARN_TYPE_COLORS = { Course: '#5b7fb0', Lecture: '#7b85bf', Meeting: '#3f9aa6', Other: '#8b94a1' };
+let learningSaveTimer = null;
+
+function renderLearning() {
+  const container = document.getElementById('learning-list');
+  const empty = document.getElementById('learning-empty');
+  if (!container) return;
+  if (learningNotes.length === 0) {
+    container.innerHTML = '';
+    empty.style.display = '';
+    return;
+  }
+  empty.style.display = 'none';
+  container.innerHTML = learningNotes.map((n, i) => {
+    const color = LEARN_TYPE_COLORS[n.type] || LEARN_TYPE_COLORS.Other;
+    const dateStr = n.date
+      ? new Date(n.date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+      : '';
+    return `
+      <div class="card learning-card fade-up" style="animation-delay:${i * 0.03}s" onclick="openLearningNote('${n.id}')">
+        <div class="learning-title">${esc(n.title || 'Untitled note')}</div>
+        <div class="learning-meta">
+          <span class="tag" style="background:${color}22;color:${color}">${esc(n.type)}</span>
+          ${dateStr ? `<span style="font-size:10px;color:var(--text3)">${dateStr}</span>` : ''}
+        </div>
+        ${n.body ? `<div class="learning-preview">${esc(n.body)}</div>` : ''}
+      </div>`;
+  }).join('');
+}
+
+function showAddLearningNote() {
+  const today = new Date().toISOString().split('T')[0];
+  const opts = LEARN_TYPES.map(t => `<option value="${t}" ${t === 'Lecture' ? 'selected' : ''}>${t}</option>`).join('');
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">New Note</span>
+      <button class="btn btn-sm btn-primary" id="save-new-learning-btn" onclick="saveNewLearningNote()">Create</button>
+    </div>
+    <div class="detail-body">
+      <div style="margin-bottom:12px">
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">TITLE</label>
+        <input id="new-learning-title" placeholder="e.g. Algorithms — Lecture 4, Team sync">
+      </div>
+      <div style="display:flex;gap:8px">
+        <div style="flex:1">
+          <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">TYPE</label>
+          <select id="new-learning-type">${opts}</select>
+        </div>
+        <div style="flex:1">
+          <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">DATE</label>
+          <input type="date" id="new-learning-date" value="${today}">
+        </div>
+      </div>
+    </div>
+  `);
+  setTimeout(() => document.getElementById('new-learning-title')?.focus(), 100);
+}
+
+async function saveNewLearningNote() {
+  const title = document.getElementById('new-learning-title').value.trim();
+  const type = document.getElementById('new-learning-type').value;
+  const date = document.getElementById('new-learning-date').value || new Date().toISOString().split('T')[0];
+  if (!title) return;
+  const btn = document.getElementById('save-new-learning-btn');
+  btn.textContent = '...'; btn.disabled = true;
+  try {
+    const ev = await createEvent(P.LEARN, title, 'type: ' + type, date);
+    await syncAll();
+    openLearningNote(ev.id);
+  } catch (e) {
+    showError(e.message);
+    btn.textContent = 'Create'; btn.disabled = false;
+  }
+}
+
+function openLearningNote(id) {
+  const n = learningNotes.find(x => x.id === id);
+  if (!n) return;
+  const opts = LEARN_TYPES.map(t => `<option value="${t}" ${n.type === t ? 'selected' : ''}>${t}</option>`).join('');
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeLearningNote('${id}')">&larr;</button>
+      <span class="detail-title">Note</span>
+      <button class="btn btn-sm btn-danger" onclick="deleteLearningNote('${id}')">Delete</button>
+    </div>
+    <div class="detail-body">
+      <input id="learning-title-input" placeholder="Note title"
+             value="${esc(n.title)}" oninput="scheduleLearningNoteSave('${id}')"
+             style="font-size:15px;font-weight:600;margin-bottom:10px">
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <select id="learning-type-select" onchange="scheduleLearningNoteSave('${id}')" style="flex:1">${opts}</select>
+        <input type="date" id="learning-date-input" value="${n.date || ''}" onchange="scheduleLearningNoteSave('${id}')" style="flex:1">
+      </div>
+      <textarea id="learning-body-input" class="learning-body-input"
+                placeholder="Type your notes here as the session goes — they save automatically…"
+                oninput="scheduleLearningNoteSave('${id}')">${esc(n.body)}</textarea>
+      <div style="display:flex;align-items:center;gap:10px;margin-top:10px">
+        <span class="learning-save-status" id="learning-save-status">All changes saved</span>
+        <button class="btn btn-sm btn-primary" style="margin-left:auto" onclick="commitLearningNote('${id}')">Save now</button>
+      </div>
+    </div>
+  `);
+  setTimeout(() => document.getElementById('learning-body-input')?.focus(), 100);
+}
+
+function scheduleLearningNoteSave(id) {
+  const status = document.getElementById('learning-save-status');
+  if (status) status.textContent = 'Editing…';
+  if (learningSaveTimer) clearTimeout(learningSaveTimer);
+  learningSaveTimer = setTimeout(() => commitLearningNote(id), 1500);
+}
+
+async function commitLearningNote(id) {
+  if (learningSaveTimer) { clearTimeout(learningSaveTimer); learningSaveTimer = null; }
+  const note = learningNotes.find(n => n.id === id);
+  const titleEl = document.getElementById('learning-title-input');
+  if (!note || !titleEl) return;
+  const title = titleEl.value.trim() || 'Untitled note';
+  const type = document.getElementById('learning-type-select').value;
+  const date = document.getElementById('learning-date-input').value || note.date;
+  const body = document.getElementById('learning-body-input').value;
+  if (title === note.title && type === note.type && date === note.date && body === note.body) return;
+  const status = document.getElementById('learning-save-status');
+  if (status) status.textContent = 'Saving…';
+  try {
+    await updateEvent(id, {
+      summary: P.LEARN + ' ' + title,
+      description: 'type: ' + type + '\n' + body,
+      start: { date }, end: { date },
+    });
+    note.title = title; note.type = type; note.date = date; note.body = body;
+    if (status) status.textContent = 'Saved ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch (e) {
+    if (status) status.textContent = 'Save failed — tap Save now to retry';
+    showError(e.message);
+  }
+}
+
+async function closeLearningNote(id) {
+  await commitLearningNote(id);
+  closeDetail();
+  renderLearning();
+}
+
+async function deleteLearningNote(id) {
+  if (!confirm('Delete this note? This cannot be undone.')) return;
+  if (learningSaveTimer) { clearTimeout(learningSaveTimer); learningSaveTimer = null; }
+  try {
+    await deleteEvent(id);
+    learningNotes = learningNotes.filter(n => n.id !== id);
+    closeDetail();
+    renderLearning();
+  } catch (e) { showError(e.message); }
+}
+
 const VIEW_TITLES = {
   inbox: 'Inbox', tasks: 'Tasks', shopping: 'Shopping',
   ideas: 'Ideas', projects: 'Projects', lists: 'Lists',
-  caregiver: 'Caregiver',
+  caregiver: 'Caregiver', reflections: 'Reflections', learning: 'Learning Notes',
 };
 
 function switchTab(tab, btn) {
@@ -2735,12 +3093,26 @@ function buildSystemPrompt() {
     return `- ${l.icon} ${l.name}: ${l.items.length} items (${unc} remaining)`;
   }).join('\n') || '(none)';
 
+  const reflectionList = reflections.slice(0, 10).map(r => {
+    const d = new Date(r.created || r.date);
+    const label = isNaN(d) ? '' : d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+    return `- [${label}] ${r.text.replace(/\s+/g, ' ').substring(0, 160)}`;
+  }).join('\n') || '(none)';
+
+  const learningList = learningNotes.map(n => {
+    let s = `- "${n.title}" [${n.type}${n.date ? ', ' + n.date : ''}]`;
+    if (n.body) s += ` — ${n.body.replace(/\s+/g, ' ').substring(0, 160)}`;
+    return s;
+  }).join('\n') || '(none)';
+
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
   return `You are an AI assistant embedded in a personal Life Dashboard app. Today is ${today}. The user's timezone is ${tz}.
 
-You help the user manage their life: find tasks, analyze projects, brainstorm ideas, plan their day, triage their inbox, and manage their Google Calendar.
+You help the user manage their life: find tasks, analyze projects, brainstorm ideas, plan their day, triage their inbox, review their end-of-day reflections, organize their learning notes, and manage their Google Calendar.
 
 You have tools to read, create, edit, and delete real Google Calendar events. Use them whenever the user asks about scheduling, meetings, appointments, or anything calendar-related. Always confirm what you did in plain language after a successful tool call. When the user mentions a relative time ("tomorrow at 3", "next Monday"), resolve it using today's date and the user's timezone, then pass an ISO 8601 datetime to the tool. For all-day events, pass a YYYY-MM-DD date.
+
+You also have tools for the user's learning notes — documentation they type live during courses, lectures, and meetings. Use list_learning_notes to read full note content before analyzing or summarizing. When the user asks you to organize, restructure, clean up, summarize, or expand their notes, use update_learning_note to rewrite the relevant note, or create_learning_note to split content out. Use list_reflections to read their daily reflections when they ask you to look back, find patterns, or summarize how things have been going.
 
 Be concise, actionable, and friendly. Use short responses. When suggesting actions, be specific to their actual data.
 
@@ -2766,7 +3138,13 @@ SHOPPING LIST (${shopItems.filter(i => !i.checked).length} unchecked):
 ${shopList}
 
 CUSTOM LISTS (${customLists.length}):
-${listsSummary}`;
+${listsSummary}
+
+LEARNING NOTES (${learningNotes.length} — previews only, use list_learning_notes for full content):
+${learningList}
+
+RECENT REFLECTIONS (${reflections.length} total, showing latest ${Math.min(10, reflections.length)}):
+${reflectionList}`;
 }
 
 // ── Claude tool use: Google Calendar ──
@@ -2848,7 +3226,59 @@ const CALENDAR_TOOLS = [
       properties: { event_id: { type: 'string' } },
     },
   },
+  {
+    name: 'list_learning_notes',
+    description: "Get the user's learning notes (documentation typed live during courses, lectures, and meetings) including full body text. Use this before analyzing, summarizing, or reorganizing their notes.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Optional filter — only return notes whose title or body contains this text (case-insensitive).' },
+      },
+    },
+  },
+  {
+    name: 'create_learning_note',
+    description: 'Create a new learning note. Use when the user asks you to start a fresh note or split existing content into a separate note.',
+    input_schema: {
+      type: 'object',
+      required: ['title', 'body'],
+      properties: {
+        title: { type: 'string', description: 'Short note title, e.g. "Algorithms — Lecture 4".' },
+        body: { type: 'string', description: 'The note content.' },
+        type: { type: 'string', enum: ['Course', 'Lecture', 'Meeting', 'Other'], description: 'Defaults to Other.' },
+        date: { type: 'string', description: 'Session date as YYYY-MM-DD. Defaults to today.' },
+      },
+    },
+  },
+  {
+    name: 'update_learning_note',
+    description: "Edit an existing learning note — rewrite or reorganize its body, fix its title/type/date. Get note_id from list_learning_notes first. Only the fields you provide are changed.",
+    input_schema: {
+      type: 'object',
+      required: ['note_id'],
+      properties: {
+        note_id: { type: 'string' },
+        title: { type: 'string' },
+        body: { type: 'string', description: 'Replaces the entire note body.' },
+        type: { type: 'string', enum: ['Course', 'Lecture', 'Meeting', 'Other'] },
+        date: { type: 'string', description: 'YYYY-MM-DD.' },
+      },
+    },
+  },
+  {
+    name: 'list_reflections',
+    description: "Get the user's daily end-of-day reflections and thoughts, most recent first.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        limit: { type: 'number', description: 'Max reflections to return. Default 30.' },
+      },
+    },
+  },
 ];
+
+// Tools that only read data — they should not trigger an app-wide resync.
+const AI_READONLY_TOOLS = new Set(['list_calendar_events', 'list_learning_notes', 'list_reflections']);
 
 const APP_PREFIXES = Object.values(P);
 
@@ -2945,11 +3375,58 @@ async function toolDeleteEvent({ event_id }) {
   return { deleted: true, event_id };
 }
 
+async function toolListLearningNotes({ query }) {
+  let notes = learningNotes;
+  if (query) {
+    const q = query.toLowerCase();
+    notes = notes.filter(n => n.title.toLowerCase().includes(q) || n.body.toLowerCase().includes(q));
+  }
+  return {
+    count: notes.length,
+    notes: notes.map(n => ({ id: n.id, title: n.title, type: n.type, date: n.date, body: n.body })),
+  };
+}
+
+async function toolCreateLearningNote({ title, body, type, date }) {
+  if (!title) throw new Error('title is required');
+  const d = date || new Date().toISOString().split('T')[0];
+  const ev = await createEvent(P.LEARN, title, 'type: ' + (type || 'Other') + '\n' + (body || ''), d);
+  return { created: true, note_id: ev.id, title };
+}
+
+async function toolUpdateLearningNote({ note_id, title, body, type, date }) {
+  if (!note_id) throw new Error('note_id is required');
+  const note = learningNotes.find(n => n.id === note_id);
+  if (!note) throw new Error('Learning note not found: ' + note_id);
+  const newTitle = title != null ? title : note.title;
+  const newType = type != null ? type : note.type;
+  const newBody = body != null ? body : note.body;
+  const data = {
+    summary: P.LEARN + ' ' + newTitle,
+    description: 'type: ' + newType + '\n' + newBody,
+  };
+  if (date) { data.start = { date }; data.end = { date }; }
+  await updateEvent(note_id, data);
+  return { updated: true, note_id };
+}
+
+async function toolListReflections({ limit }) {
+  const r = reflections.slice(0, limit || 30);
+  return {
+    count: r.length,
+    reflections: r.map(x => ({ date: x.date, created: x.created, text: x.text })),
+  };
+}
+
 async function executeAiTool(name, input) {
   if (name === 'list_calendar_events')   return await toolListEvents(input || {});
   if (name === 'create_calendar_event')  return await toolCreateEvent(input || {});
   if (name === 'update_calendar_event')  return await toolUpdateEvent(input || {});
   if (name === 'delete_calendar_event')  return await toolDeleteEvent(input || {});
+  if (name === 'list_learning_notes')    return await toolListLearningNotes(input || {});
+  if (name === 'create_learning_note')   return await toolCreateLearningNote(input || {});
+  if (name === 'update_learning_note')   return await toolUpdateLearningNote(input || {});
+  if (name === 'list_reflections')       return await toolListReflections(input || {});
   throw new Error('Unknown tool: ' + name);
 }
 
@@ -3252,9 +3729,9 @@ async function aiSend() {
       }
     }
 
-    // If a tool round-trip touched the calendar, refresh app data so the views stay in sync.
+    // If a tool round-trip mutated data, refresh app data so the views stay in sync.
     if (aiMessages.slice(-4).some(m => Array.isArray(m.content) && m.content.some(b =>
-        b.type === 'tool_use' && b.name !== 'list_calendar_events'))) {
+        b.type === 'tool_use' && !AI_READONLY_TOOLS.has(b.name)))) {
       syncAll().catch(() => {});
     }
   } catch (e) {
