@@ -630,6 +630,7 @@ const P = {
   CG_PREPAY: '💸',    // pre-payment / advance
   REFLECT: '🌙',      // end-of-day reflection / thought
   LEARN: '🎓',        // learning note (course / lecture / meeting documentation)
+  MEM: '🧠',          // Claude's curated memory document (singleton)
 };
 
 const CURRENCY = '₪';
@@ -642,6 +643,8 @@ let refreshInFlight = null; // de-dupe concurrent refreshes
 let tasks = [], shopItems = [], inboxItems = [], ideas = [], projects = [], customLists = [];
 let reflections = [];             // [{id, text, date, created}] — end-of-day thoughts
 let learningNotes = [];           // [{id, title, type, body, date, created}] — in-vivo course/lecture/meeting docs
+let memory = '';                  // Claude's curated memory document (markdown text)
+let memoryEventId = null;         // calendar event id of the memory doc (null if not yet created)
 let caregiverConfig = null;       // single config object (rates) or null if not set
 let caregiverMonths = [];         // [{id, ym:'YYYY-MM', satCount, weeksCount, foodOn, fatherOn, bonusAmt, bonusNote, prePayDeducted:[ids], total}]
 let caregiverVacation = [];       // [{id, date}]
@@ -1008,7 +1011,7 @@ async function syncAll() {
   try {
     const [taskEvts, shopEvts, inboxEvts, ideaEvts, projEvts, listEvts, listItemEvts,
            cgCfgEvts, cgMonthEvts, cgVacEvts, cgHolEvts, cgSickEvts, cgPrepayEvts,
-           reflectEvts, learnEvts] = await Promise.all([
+           reflectEvts, learnEvts, memEvts] = await Promise.all([
       fetchEvents(P.TASK),
       fetchEvents(P.SHOP),
       fetchEvents(P.INBOX),
@@ -1024,6 +1027,7 @@ async function syncAll() {
       fetchEvents(P.CG_PREPAY),
       fetchEvents(P.REFLECT),
       fetchEvents(P.LEARN),
+      fetchEvents(P.MEM),
     ]);
 
     tasks = taskEvts.map(parseTask);
@@ -1075,6 +1079,16 @@ async function syncAll() {
       .sort((a, b) => new Date(b.created) - new Date(a.created));
     learningNotes = learnEvts.map(parseLearningNote)
       .sort((a, b) => (b.date || '').localeCompare(a.date || '') || (new Date(b.created) - new Date(a.created)));
+
+    if (memEvts.length) {
+      // Singleton — if duplicates exist, take the most recently updated.
+      const m = memEvts.slice().sort((a, b) => new Date(b.updated || b.created) - new Date(a.updated || a.created))[0];
+      memory = (m.description || '').trim();
+      memoryEventId = m.id;
+    } else {
+      memory = '';
+      memoryEventId = null;
+    }
 
     renderAll();
   } catch (e) {
@@ -3145,6 +3159,9 @@ function buildSystemPrompt() {
   }).join('\n') || '(none)';
 
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const memoryBlock = memory
+    ? `\n== YOUR MEMORY (carried over from past conversations) ==\n${memory}\n`
+    : `\n== YOUR MEMORY ==\n(empty — nothing has been remembered yet)\n`;
   return `You are an AI assistant embedded in a personal Life Dashboard app. Today is ${today}. The user's timezone is ${tz}.
 
 You help the user manage their life: find tasks, analyze projects, brainstorm ideas, plan their day, triage their inbox, review their end-of-day reflections, organize their learning notes, and manage their Google Calendar.
@@ -3152,6 +3169,13 @@ You help the user manage their life: find tasks, analyze projects, brainstorm id
 You have tools to read, create, edit, and delete real Google Calendar events. Use them whenever the user asks about scheduling, meetings, appointments, or anything calendar-related. Always confirm what you did in plain language after a successful tool call. When the user mentions a relative time ("tomorrow at 3", "next Monday"), resolve it using today's date and the user's timezone, then pass an ISO 8601 datetime to the tool. For all-day events, pass a YYYY-MM-DD date.
 
 You also have tools for the user's learning notes — documentation they type live during courses, lectures, and meetings. Use list_learning_notes to read full note content before analyzing or summarizing. When the user asks you to organize, restructure, clean up, summarize, or expand their notes, use update_learning_note to rewrite the relevant note, or create_learning_note to split content out. Use list_reflections to read their daily reflections when they ask you to look back, find patterns, or summarize how things have been going.
+
+== MEMORY — IMPORTANT ==
+You maintain a small curated memory document that is carried across every conversation. Read it at the start of every chat (it's included below) and use it to pick up where past conversations left off. Treat it as your single source of long-term continuity with the user.
+
+When something is worth carrying forward — a decision, ongoing work on an idea, a recurring pattern in their reflections, a stated preference, where a project stands — call the update_memory tool. ALWAYS pass the full rewritten document, not just additions: condense, restructure, and prune as you go so the memory stays compact and high-signal (aim for well under ~800 words). Group it into clear sections (e.g. "About the user", "Active ideas & projects", "Decisions", "Reflection patterns"). Remove stale or superseded entries.
+
+Do not update memory for trivia or for things already represented in tasks/ideas/reflections — only for cross-session insights, decisions, and progress the user would want you to remember next time. Do not announce memory updates in your reply unless the user asks; just do it.${memoryBlock}
 
 Be concise, actionable, and friendly. Use short responses. When suggesting actions, be specific to their actual data.
 
@@ -3314,6 +3338,17 @@ const CALENDAR_TOOLS = [
       },
     },
   },
+  {
+    name: 'update_memory',
+    description: "Replace your long-term memory document with a freshly rewritten, curated version. The memory is carried across every conversation with the user. Always pass the FULL rewritten document — additions only is not supported. Condense, restructure and prune as you go so it stays compact (well under ~800 words). Use clear markdown sections. Only call this when there is something genuinely worth carrying forward.",
+    input_schema: {
+      type: 'object',
+      required: ['content'],
+      properties: {
+        content: { type: 'string', description: 'The complete new memory document (markdown text). Replaces the previous one entirely.' },
+      },
+    },
+  },
 ];
 
 // Tools that only read data — they should not trigger an app-wide resync.
@@ -3457,6 +3492,25 @@ async function toolListReflections({ limit }) {
   };
 }
 
+async function toolUpdateMemory({ content }) {
+  if (typeof content !== 'string') throw new Error('content (string) is required');
+  const trimmed = content.trim();
+  const today = new Date().toISOString().split('T')[0];
+  if (memoryEventId) {
+    // Keep the event's date current so it stays inside the sync window across the years.
+    await updateEvent(memoryEventId, {
+      summary: P.MEM + ' Memory',
+      description: trimmed,
+      start: { date: today }, end: { date: today },
+    });
+  } else {
+    const ev = await createEvent(P.MEM, 'Memory', trimmed, today);
+    memoryEventId = ev.id;
+  }
+  memory = trimmed;
+  return { updated: true, length: trimmed.length };
+}
+
 async function executeAiTool(name, input) {
   if (name === 'list_calendar_events')   return await toolListEvents(input || {});
   if (name === 'create_calendar_event')  return await toolCreateEvent(input || {});
@@ -3466,6 +3520,7 @@ async function executeAiTool(name, input) {
   if (name === 'create_learning_note')   return await toolCreateLearningNote(input || {});
   if (name === 'update_learning_note')   return await toolUpdateLearningNote(input || {});
   if (name === 'list_reflections')       return await toolListReflections(input || {});
+  if (name === 'update_memory')          return await toolUpdateMemory(input || {});
   throw new Error('Unknown tool: ' + name);
 }
 
@@ -3495,6 +3550,78 @@ function aiRenderMessage(m) {
   }).join('');
 }
 
+// ── Memory viewer (Claude's long-term memory across chats) ──
+function openMemoryView() {
+  const updatedHint = memoryEventId
+    ? 'Synced — Claude reads this at the start of every conversation.'
+    : 'Not yet created. Save anything below to start the memory, or just ask Claude something — it will populate this itself when there\'s something worth remembering.';
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">🧠 Claude's Memory</span>
+      <button class="btn btn-sm btn-primary" id="save-memory-btn" onclick="saveMemory()">Save</button>
+    </div>
+    <div class="detail-body">
+      <div style="font-size:11px;color:var(--text3);margin-bottom:10px;line-height:1.5">${esc(updatedHint)}</div>
+      <textarea id="memory-textarea" style="min-height:360px;font-size:13px;line-height:1.6;font-family:'JetBrains Mono',monospace">${esc(memory)}</textarea>
+      <div style="display:flex;gap:8px;margin-top:12px;align-items:center">
+        <span id="memory-stats" style="font-size:11px;color:var(--text3)"></span>
+        <button class="btn btn-sm btn-ghost" style="margin-left:auto;color:var(--red);border-color:var(--red)"
+                onclick="clearMemory()">Clear memory</button>
+      </div>
+    </div>
+  `);
+  const ta = document.getElementById('memory-textarea');
+  const stats = document.getElementById('memory-stats');
+  const updateStats = () => {
+    const len = ta.value.length;
+    const words = ta.value.trim() ? ta.value.trim().split(/\s+/).length : 0;
+    stats.textContent = `${words} words · ${len} chars`;
+  };
+  ta.addEventListener('input', updateStats);
+  updateStats();
+}
+
+async function saveMemory() {
+  const text = document.getElementById('memory-textarea').value.trim();
+  const btn = document.getElementById('save-memory-btn');
+  btn.textContent = '...'; btn.disabled = true;
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    if (memoryEventId) {
+      await updateEvent(memoryEventId, {
+        summary: P.MEM + ' Memory',
+        description: text,
+        start: { date: today }, end: { date: today },
+      });
+    } else {
+      const ev = await createEvent(P.MEM, 'Memory', text, today);
+      memoryEventId = ev.id;
+    }
+    memory = text;
+    btn.textContent = 'Saved'; btn.disabled = false;
+    setTimeout(() => { if (btn) btn.textContent = 'Save'; }, 1200);
+  } catch (e) {
+    showError(e.message);
+    btn.textContent = 'Save'; btn.disabled = false;
+  }
+}
+
+async function clearMemory() {
+  if (!confirm("Clear Claude's memory? Everything it has remembered across past chats will be erased.")) return;
+  if (!memoryEventId) {
+    document.getElementById('memory-textarea').value = '';
+    memory = '';
+    return;
+  }
+  try {
+    await deleteEvent(memoryEventId);
+    memoryEventId = null;
+    memory = '';
+    document.getElementById('memory-textarea').value = '';
+  } catch (e) { showError(e.message); }
+}
+
 function openAI() {
   const panel = document.getElementById('ai-panel');
   const workerUrl = getWorkerUrl();
@@ -3509,6 +3636,7 @@ function openAI() {
           <div class="ai-header-subtitle">Your life assistant</div>
         </div>
         <button class="ai-voice-toggle ${aiVoiceMode ? 'on' : ''}" id="ai-voice-toggle" onclick="aiToggleVoiceMode()" title="Speak replies & hands-free mode">${aiVoiceMode ? '🔊' : '🔇'}</button>
+        <button class="btn btn-ghost btn-sm" onclick="openMemoryView()" title="View what Claude remembers across chats">🧠</button>
         <button class="btn btn-ghost btn-sm" onclick="aiClear()">Clear</button>
       </div>
       ${!workerUrl ? `
