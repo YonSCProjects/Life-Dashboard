@@ -505,22 +505,20 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
     <div id="shop-list"></div>
   </div>
 
-  <!-- ═══ IDEAS VIEW ═══ -->
-  <div class="content" id="ideas-view">
-    <div id="ideas-list"></div>
-    <div class="empty" id="ideas-empty" style="display:none">
-      <div class="icon">💡</div>
-      <div class="msg">Capture thoughts in the Inbox — promote them here to develop further</div>
-    </div>
-  </div>
-
-  <!-- ═══ PROJECTS VIEW ═══ -->
-  <div class="content" id="projects-view">
+  <!-- ═══ PROJECTS / IDEAS VIEW ═══ -->
+  <div class="content" id="projects-ideas-view">
+    <div class="section-title" style="margin-bottom:10px">🎯 Projects</div>
     <button class="btn btn-ghost" style="width:100%;margin-bottom:16px;border-style:dashed" onclick="showAddProject()">+ New Project</button>
     <div id="projects-list"></div>
     <div class="empty" id="projects-empty" style="display:none">
       <div class="icon">🎯</div>
       <div class="msg">Create a project to break big ideas into actionable steps</div>
+    </div>
+    <div class="section-title" style="margin:24px 0 10px">💡 Ideas</div>
+    <div id="ideas-list"></div>
+    <div class="empty" id="ideas-empty" style="display:none">
+      <div class="icon">💡</div>
+      <div class="msg">Capture thoughts in the Inbox — promote them here to develop further</div>
     </div>
   </div>
 
@@ -575,10 +573,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
     <button class="nav-btn" onclick="switchTab('shopping', this)" data-tab="shopping">
       <span class="nav-icon">🛒</span>Shop
     </button>
-    <button class="nav-btn" onclick="switchTab('ideas', this)" data-tab="ideas">
-      <span class="nav-icon">💡</span>Ideas
-    </button>
-    <button class="nav-btn" onclick="switchTab('projects', this)" data-tab="projects">
+    <button class="nav-btn" onclick="switchTab('projects-ideas', this)" data-tab="projects-ideas">
       <span class="nav-icon">🎯</span>Projects
     </button>
     <button class="nav-btn" onclick="switchTab('lists', this)" data-tab="lists">
@@ -1578,7 +1573,7 @@ function doSearch(query) {
 
 function goToSearchResult(type, id) {
   toggleSearch();
-  const tabMap = { inbox: 'inbox', task: 'tasks', shop: 'shopping', idea: 'ideas', project: 'projects', list: 'lists', 'list item': 'lists', reflection: 'reflections', note: 'learning' };
+  const tabMap = { inbox: 'inbox', task: 'tasks', shop: 'shopping', idea: 'projects-ideas', project: 'projects-ideas', list: 'lists', 'list item': 'lists', reflection: 'reflections', note: 'learning' };
   const tab = tabMap[type];
   if (tab) switchTab(tab, document.querySelector(`[data-tab="${tab}"]`));
   if (type === 'task') editTask(id);
@@ -2114,7 +2109,7 @@ async function promoteIdeaToProject(ideaId) {
     await createEvent(P.PROJECT, idea.text, 'status: active\ngoal: ' + (idea.notes || idea.text));
     await deleteEvent(ideaId);
     await syncAll();
-    switchTab('projects', document.querySelector('[data-tab="projects"]'));
+    switchTab('projects-ideas', document.querySelector('[data-tab="projects-ideas"]'));
   } catch (e) { showError(e.message); }
 }
 
@@ -3143,7 +3138,7 @@ async function deleteLearningNote(id) {
 
 const VIEW_TITLES = {
   inbox: 'Inbox', tasks: 'Tasks', shopping: 'Shopping',
-  ideas: 'Ideas', projects: 'Projects', lists: 'Lists',
+  'projects-ideas': 'Projects / Ideas', lists: 'Lists',
   caregiver: 'Caregiver', reflections: 'Reflections', learning: 'Learning Notes',
 };
 
@@ -3334,7 +3329,7 @@ You also have tools for the user's learning notes — documentation they type li
 == MEMORY — IMPORTANT ==
 You maintain a small curated memory document that is carried across every conversation. Read it at the start of every chat (it's included below) and use it to pick up where past conversations left off. Treat it as your single source of long-term continuity with the user.
 
-When something is worth carrying forward — a decision, ongoing work on an idea, a recurring pattern in their reflections, a stated preference, where a project stands — call the update_memory tool. ALWAYS pass the full rewritten document, not just additions: condense, restructure, and prune as you go so the memory stays compact and high-signal (aim for well under ~800 words). Group it into clear sections (e.g. "About the user", "Active ideas & projects", "Decisions", "Reflection patterns"). Remove stale or superseded entries.
+When something is worth carrying forward — a decision, ongoing work on an idea, a recurring pattern in their reflections, a stated preference, where a project stands — call the update_memory tool. ALWAYS pass the full rewritten document, not just additions: condense, restructure, and prune as you go so the memory stays compact and high-signal (aim for well under ~800 words). Group it into clear sections (e.g. "About the user", "Projects / Ideas", "Decisions", "Reflection patterns"). The user's Projects and Ideas live in a single Projects/Ideas section in the app, so memorize them together too. Remove stale or superseded entries.
 
 Do not update memory for trivia or for things already represented in tasks/ideas/reflections — only for cross-session insights, decisions, and progress the user would want you to remember next time. Do not announce memory updates in your reply unless the user asks; just do it.${memoryBlock}
 
@@ -3352,11 +3347,13 @@ ${dueToday.length > 0 ? `\n📅 DUE TODAY (${dueToday.length}): ${dueToday.map(t
 
 COMPLETED TASKS (${doneTasks.length}): ${doneTasks.map(t => t.title).join(', ') || '(none)'}
 
-IDEAS (${ideas.length}):
-${ideaList}
+PROJECTS / IDEAS:
 
-PROJECTS (${projects.length}):
+Projects (${projects.length}):
 ${projList}
+
+Ideas (${ideas.length}):
+${ideaList}
 
 SHOPPING LIST (${shopItems.filter(i => !i.checked).length} unchecked):
 ${shopList}
