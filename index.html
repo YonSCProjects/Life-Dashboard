@@ -1213,6 +1213,154 @@ async function commitListOrder(listId, visibleIds) {
   } catch (e) { showError(e.message); await syncAll(); }
 }
 
+// ══════════════════════════════════════════════════
+// TASK REMINDERS
+// ══════════════════════════════════════════════════
+// Tasks are stored as Google Calendar events. Two reminder flavors:
+//   - preset  → event stays all-day on the due date; reminders.overrides
+//               carries N minutes before midnight (Google's only option
+//               for all-day events).
+//   - custom  → event becomes a 30-min timed event at the chosen moment,
+//               with a 0-min reminder so it fires at exactly that time.
+// Reminder spec is also serialized into the description meta line so it
+// survives re-parse independently of the calendar reminders field.
+const REMINDER_PRESETS = {
+  'evening-before': { label: 'Evening before (20:00)', minutes: 240 },
+  'morning-before': { label: 'Morning before (09:00)', minutes: 900 },
+  '2days-before':   { label: '2 days before (09:00)',  minutes: 2340 },
+  'week-before':    { label: '1 week before (09:00)',  minutes: 9540 },
+};
+const USER_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+
+function parseReminder(metaLine) {
+  const m = metaLine.match(/reminder:\s*([^|]+?)(?=\s*\||$)/i);
+  if (!m) return null;
+  const val = m[1].trim();
+  if (val.toLowerCase().startsWith('custom ')) {
+    const at = val.slice(7).trim();
+    return at ? { kind: 'custom', at } : null;
+  }
+  if (REMINDER_PRESETS[val]) return { kind: 'preset', preset: val };
+  return null;
+}
+
+function serializeReminder(rem) {
+  if (!rem) return '';
+  if (rem.kind === 'custom') return 'reminder: custom ' + rem.at;
+  return 'reminder: ' + rem.preset;
+}
+
+function buildEventRemindersField(rem) {
+  if (!rem) return { useDefault: false, overrides: [] };
+  if (rem.kind === 'preset') {
+    const p = REMINDER_PRESETS[rem.preset];
+    if (!p) return { useDefault: false, overrides: [] };
+    return { useDefault: false, overrides: [{ method: 'popup', minutes: p.minutes }] };
+  }
+  return { useDefault: false, overrides: [{ method: 'popup', minutes: 0 }] };
+}
+
+function reminderToHumanString(rem) {
+  if (!rem) return '';
+  if (rem.kind === 'preset') return REMINDER_PRESETS[rem.preset]?.label || rem.preset;
+  if (rem.kind === 'custom') {
+    const d = new Date(rem.at);
+    if (isNaN(d)) return rem.at;
+    return d.toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  }
+  return '';
+}
+
+function addMinutesToLocalIso(iso, mins) {
+  const [date, time] = iso.split('T');
+  const [y, mo, d] = date.split('-').map(Number);
+  const [h, mi] = time.split(':').map(Number);
+  const dt = new Date(y, mo - 1, d, h, mi + mins, 0, 0);
+  const pad = n => String(n).padStart(2, '0');
+  return dt.getFullYear() + '-' + pad(dt.getMonth() + 1) + '-' + pad(dt.getDate())
+    + 'T' + pad(dt.getHours()) + ':' + pad(dt.getMinutes()) + ':00';
+}
+
+function taskEventBody(title, desc, due, reminder) {
+  const body = {
+    summary: P.TASK + ' ' + title,
+    description: desc,
+    reminders: buildEventRemindersField(reminder),
+  };
+  if (reminder && reminder.kind === 'custom' && reminder.at) {
+    body.start = { dateTime: reminder.at + ':00', timeZone: USER_TZ };
+    body.end   = { dateTime: addMinutesToLocalIso(reminder.at, 30), timeZone: USER_TZ };
+  } else if (due) {
+    body.start = { date: due };
+    body.end   = { date: due };
+  }
+  return body;
+}
+
+async function createTaskEvent(title, desc, due, reminder) {
+  const body = taskEventBody(title, desc, due, reminder);
+  if (!body.start) {
+    const d = new Date().toISOString().split('T')[0];
+    body.start = { date: d }; body.end = { date: d };
+  }
+  return calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events`, {
+    method: 'POST', body: JSON.stringify(body),
+  });
+}
+
+function reminderPickerHtml(prefix, current, dueDefault) {
+  const selected = current ? (current.kind === 'custom' ? 'custom' : current.preset) : '';
+  const customDate = (current && current.kind === 'custom' && current.at)
+    ? current.at.split('T')[0] : (dueDefault || '');
+  const customTime = (current && current.kind === 'custom' && current.at)
+    ? (current.at.split('T')[1] || '09:00').slice(0, 5) : '09:00';
+  const showCustom = selected === 'custom';
+  const presetOpts = Object.entries(REMINDER_PRESETS)
+    .map(([k, v]) => `<option value="${k}" ${selected === k ? 'selected' : ''}>${esc(v.label)}</option>`)
+    .join('');
+  return `
+    <div style="margin-bottom:12px">
+      <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">REMINDER 🔔</label>
+      <select id="${prefix}-reminder" onchange="onReminderSelectChange('${prefix}')">
+        <option value="">None</option>
+        ${presetOpts}
+        <option value="custom" ${selected === 'custom' ? 'selected' : ''}>Custom time…</option>
+      </select>
+      <div id="${prefix}-reminder-custom" style="display:${showCustom ? 'flex' : 'none'};gap:8px;margin-top:8px">
+        <input type="date" id="${prefix}-reminder-date" value="${customDate}" style="flex:1">
+        <input type="time" id="${prefix}-reminder-time" value="${customTime}" style="flex:1">
+      </div>
+    </div>
+  `;
+}
+
+function onReminderSelectChange(prefix) {
+  const sel = document.getElementById(prefix + '-reminder');
+  const wrap = document.getElementById(prefix + '-reminder-custom');
+  if (!sel || !wrap) return;
+  wrap.style.display = sel.value === 'custom' ? 'flex' : 'none';
+  if (sel.value === 'custom') {
+    const dateEl = document.getElementById(prefix + '-reminder-date');
+    if (dateEl && !dateEl.value) {
+      const dueEl = document.getElementById(prefix + '-due');
+      dateEl.value = (dueEl && dueEl.value) || new Date().toISOString().split('T')[0];
+    }
+  }
+}
+
+function readReminderFromForm(prefix) {
+  const sel = document.getElementById(prefix + '-reminder');
+  if (!sel || !sel.value) return null;
+  if (sel.value === 'custom') {
+    const d = document.getElementById(prefix + '-reminder-date').value;
+    const t = document.getElementById(prefix + '-reminder-time').value || '09:00';
+    if (!d) return null;
+    return { kind: 'custom', at: d + 'T' + t };
+  }
+  if (REMINDER_PRESETS[sel.value]) return { kind: 'preset', preset: sel.value };
+  return null;
+}
+
 function parseTask(event) {
   const title = (event.summary || '').replace(P.TASK, '').trim();
   const desc = event.description || '';
@@ -1233,6 +1381,7 @@ function parseTask(event) {
     id: event.id, title, category, priority, notes, due,
     done: meta.includes('[DONE]'),
     project: projectMatch ? projectMatch[1].trim() : null,
+    reminder: parseReminder(meta),
     created: event.created,
     order: getEventOrder(event),
   };
@@ -1571,6 +1720,9 @@ function renderTaskItem(t, i) {
   const cat = CATS[t.category] || CATS.Tasks;
   const pri = PRIS[t.priority] || PRIS.Medium;
   const dueHtml = t.due ? `<span class="task-due ${getDueClass(t.due)}">${formatDue(t.due)}</span>` : '';
+  const remHtml = t.reminder
+    ? `<span style="font-size:10px;color:var(--text3)" title="Reminder: ${esc(reminderToHumanString(t.reminder))}">🔔</span>`
+    : '';
   return `
     <div class="task-item fade-up" data-task="${t.id}" data-drag-id="${t.id}" style="animation-delay:${i * 0.03}s" onclick="editTask('${t.id}')">
       <button class="task-check" style="border-color:${pri.color}40" onclick="event.stopPropagation();completeTask('${t.id}')" title="Complete"></button>
@@ -1581,6 +1733,7 @@ function renderTaskItem(t, i) {
           <span class="tag" style="background:${pri.color}15;color:${pri.color}">${t.priority}</span>
           ${t.project ? `<span class="tag" style="background:var(--cyan)15;color:var(--cyan)">🎯 ${esc(t.project)}</span>` : ''}
           ${dueHtml}
+          ${remHtml}
         </div>
         ${t.notes ? `<div class="task-notes">${esc(t.notes)}</div>` : ''}
       </div>
@@ -1684,6 +1837,7 @@ function editTask(taskId) {
         <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">DUE DATE</label>
         <input type="date" id="edit-task-due" value="${t.due || ''}">
       </div>
+      ${reminderPickerHtml('edit-task', t.reminder, t.due)}
       <div style="margin-bottom:12px">
         <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">PROJECT</label>
         <select id="edit-task-proj">
@@ -1707,9 +1861,14 @@ async function saveTask(taskId) {
   const due = document.getElementById('edit-task-due').value;
   const proj = document.getElementById('edit-task-proj').value;
   const notes = document.getElementById('edit-task-notes').value.trim();
+  const reminder = readReminderFromForm('edit-task');
   if (!title) return;
 
   const btn = document.getElementById('save-task-btn');
+  if (reminder && reminder.kind === 'preset' && !due) {
+    showError('Set a due date before using a "before-the-day" reminder, or pick Custom time.');
+    return;
+  }
   btn.textContent = '...'; btn.disabled = true;
 
   const t = tasks.find(t => t.id === taskId);
@@ -1717,18 +1876,11 @@ async function saveTask(taskId) {
   if (t && t.done) metaParts.push('[DONE]');
   if (due) metaParts.push('due: ' + due);
   if (proj) metaParts.push('project: ' + proj);
+  if (reminder) metaParts.push(serializeReminder(reminder));
   const desc = metaParts.join(' | ') + (notes ? '\n' + notes : '');
 
   try {
-    const updateData = {
-      summary: P.TASK + ' ' + title,
-      description: desc,
-    };
-    if (due) {
-      updateData.start = { date: due };
-      updateData.end = { date: due };
-    }
-    await updateEvent(taskId, updateData);
+    await updateEvent(taskId, taskEventBody(title, desc, due, reminder));
     closeDetail();
     await syncAll();
   } catch (e) {
@@ -1743,7 +1895,13 @@ async function addTask() {
   const pri = document.getElementById('add-pri').value;
   const due = document.getElementById('add-due')?.value || '';
   const notes = document.getElementById('add-notes')?.value.trim() || '';
+  const reminder = readReminderFromForm('add');
   if (!title) return;
+
+  if (reminder && reminder.kind === 'preset' && !due) {
+    showError('Set a due date before using a "before-the-day" reminder, or pick Custom time.');
+    return;
+  }
 
   const addBtn = document.querySelector('#add-form-container .btn-primary');
   if (addBtn) { addBtn.textContent = 'Adding...'; addBtn.disabled = true; }
@@ -1751,8 +1909,9 @@ async function addTask() {
   try {
     const metaParts = [cat, pri + ' priority'];
     if (due) metaParts.push('due: ' + due);
+    if (reminder) metaParts.push(serializeReminder(reminder));
     const desc = metaParts.join(' | ') + (notes ? '\n' + notes : '');
-    await createEvent(P.TASK, title, desc, due || undefined);
+    await createTaskEvent(title, desc, due, reminder);
     toggleAddForm();
     await syncAll();
   } catch (e) {
@@ -1778,6 +1937,7 @@ function toggleAddForm() {
           <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">DUE DATE</label>
           <input type="date" id="add-due">
         </div>
+        ${reminderPickerHtml('add', null, '')}
         <textarea id="add-notes" placeholder="Notes (optional)" style="margin-bottom:10px" rows="2"></textarea>
         <div class="row">
           <button class="btn btn-primary" style="flex:1" onclick="addTask()">Add Task</button>
@@ -3115,6 +3275,7 @@ function buildSystemPrompt() {
   const taskList = activeTasks.map(t => {
     let s = `- ${t.title} [${t.category}, ${t.priority}]`;
     if (t.due) s += ` due: ${formatDue(t.due)}`;
+    if (t.reminder) s += ` 🔔 ${reminderToHumanString(t.reminder)}`;
     if (t.project) s += ` (project: ${t.project})`;
     if (t.notes) s += ` — ${t.notes.substring(0, 100)}`;
     return s;
