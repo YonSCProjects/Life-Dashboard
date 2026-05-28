@@ -1844,9 +1844,54 @@ function editTask(taskId) {
         <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">NOTES</label>
         <textarea id="edit-task-notes" style="min-height:120px">${esc(t.notes || '')}</textarea>
       </div>
+      <div style="margin-bottom:12px">
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">MOVE TO ANOTHER LIST</label>
+        <div style="display:flex;gap:8px">
+          <select id="edit-task-move-dest" style="flex:1">
+            <option value="">Choose…</option>
+            <option value="inbox">📥 Inbox</option>
+            <option value="shop">🛒 Shopping</option>
+            <option value="idea">💡 Idea</option>
+            ${customLists.map(l => `<option value="list:${l.id}">${esc(l.icon || '📝')} ${esc(l.name)}</option>`).join('')}
+          </select>
+          <button class="btn btn-sm btn-ghost" onclick="moveTaskFromForm('${taskId}')">Move</button>
+        </div>
+        <div style="font-size:10px;color:var(--text3);margin-top:4px">Title and notes carry over. Priority, due date, project and reminder do not.</div>
+      </div>
       <button class="btn btn-danger" style="width:100%" onclick="permanentDeleteTask('${taskId}');closeDetail()">Delete Task</button>
     </div>
   `);
+}
+
+function moveTaskFromForm(taskId) {
+  const sel = document.getElementById('edit-task-move-dest');
+  if (!sel || !sel.value) return;
+  moveTaskTo(taskId, sel.value);
+}
+
+async function moveTaskTo(taskId, dest) {
+  const t = tasks.find(x => x.id === taskId);
+  if (!t) return;
+  const notesSuffix = t.notes ? '\n' + t.notes : '';
+  try {
+    if (dest === 'inbox') {
+      await createEvent(P.INBOX, t.title, t.notes || '');
+    } else if (dest === 'shop') {
+      await createEvent(P.SHOP, t.title, 'qty: 1\nchecked: false\ncat: ' + notesSuffix);
+    } else if (dest === 'idea') {
+      await createEvent(P.IDEA, t.title, 'status: raw' + notesSuffix);
+    } else if (dest.startsWith('list:')) {
+      const listId = dest.slice(5);
+      await createEvent(P.LIST_ITEM, t.title, `list:${listId}\nchecked: false` + notesSuffix);
+    } else {
+      return;
+    }
+    await deleteEvent(taskId);
+    closeDetail();
+    await syncAll();
+  } catch (e) {
+    showError('Failed to move: ' + e.message);
+  }
 }
 
 async function saveTask(taskId) {
