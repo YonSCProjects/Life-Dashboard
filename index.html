@@ -1040,29 +1040,7 @@ async function syncAll() {
     ]);
 
     tasks = taskEvts.map(parseTask);
-    // Sort: done last; Urgent always at the top; then by priority
-    // (High → Medium → Low); within a priority tier, earlier due dates
-    // first (and tasks with a due date before tasks without); manual
-    // drag order is the final tie-breaker.
-    tasks.sort((a, b) => {
-      if (a.done !== b.done) return a.done ? 1 : -1;
-      if (!a.done && !b.done) {
-        const aTop = a.priority === 'Urgent', bTop = b.priority === 'Urgent';
-        if (aTop !== bTop) return aTop ? -1 : 1;
-        const pa = PRIS[a.priority]?.order ?? 2;
-        const pb = PRIS[b.priority]?.order ?? 2;
-        if (pa !== pb) return pa - pb;
-        if (a.due && b.due) {
-          const da = new Date(a.due).getTime(), db = new Date(b.due).getTime();
-          if (da !== db) return da - db;
-        } else if (!!a.due !== !!b.due) {
-          return a.due ? -1 : 1;
-        }
-        const ao = a.order ?? Infinity, bo = b.order ?? Infinity;
-        if (ao !== bo) return ao - bo;
-      }
-      return 0;
-    });
+    tasks.sort(compareTasks);
 
     shopItems = shopEvts.filter(e => !(e.summary || '').includes(P.TASK)).map(parseShopEvent);
 
@@ -1272,6 +1250,29 @@ function serializeTaskDesc(t) {
   if (t.project) metaParts.push('project: ' + t.project);
   if (t.reminder) metaParts.push(serializeReminder(t.reminder));
   return metaParts.join(' | ') + (t.notes ? '\n' + t.notes : '');
+}
+
+// Done last; Urgent always at top; then High → Medium → Low; within a
+// priority tier, earlier due first, due-set before due-unset, manual
+// drag order as final tie-breaker.
+function compareTasks(a, b) {
+  if (a.done !== b.done) return a.done ? 1 : -1;
+  if (!a.done && !b.done) {
+    const aTop = a.priority === 'Urgent', bTop = b.priority === 'Urgent';
+    if (aTop !== bTop) return aTop ? -1 : 1;
+    const pa = PRIS[a.priority]?.order ?? 2;
+    const pb = PRIS[b.priority]?.order ?? 2;
+    if (pa !== pb) return pa - pb;
+    if (a.due && b.due) {
+      const da = new Date(a.due).getTime(), db = new Date(b.due).getTime();
+      if (da !== db) return da - db;
+    } else if (!!a.due !== !!b.due) {
+      return a.due ? -1 : 1;
+    }
+    const ao = a.order ?? Infinity, bo = b.order ?? Infinity;
+    if (ao !== bo) return ao - bo;
+  }
+  return 0;
 }
 
 function buildEventRemindersField(rem) {
@@ -1706,6 +1707,7 @@ function renderPills() {
 
 function renderTasks() {
   const container = document.getElementById('tasks-list');
+  tasks.sort(compareTasks);
   const active = tasks.filter(t => !t.done);
   const completed = tasks.filter(t => t.done);
   const filtered = activeCategory === 'all' ? active : active.filter(t => t.category === activeCategory);
