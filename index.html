@@ -152,8 +152,22 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 /* ── TASK ITEMS ── */
 .task-item {
   display: flex; align-items: flex-start; gap: 12px; padding: 14px 0;
-  border-bottom: 1px solid var(--bg3); transition: opacity 0.3s; cursor: pointer;
+  border-bottom: 1px solid var(--bg3); transition: opacity 0.3s, background 0.2s; cursor: pointer;
 }
+.task-item.urgent {
+  background: rgba(207,81,71,0.07);
+  box-shadow: inset 4px 0 0 #cf5147;
+  border-radius: 0 8px 8px 0;
+  padding-left: 12px; padding-right: 8px;
+}
+.task-pin {
+  background: none; border: none; cursor: pointer;
+  font-size: 17px; padding: 4px 6px; line-height: 1;
+  color: var(--text3); transition: color 0.2s, transform 0.15s;
+  flex-shrink: 0; align-self: flex-start; margin-top: 1px;
+}
+.task-pin:hover { transform: scale(1.15); }
+.task-pin.active { color: #cf5147; }
 .task-check {
   width: 24px; height: 24px; border-radius: 7px; border: 2px solid;
   background: transparent; cursor: pointer; flex-shrink: 0; margin-top: 1px;
@@ -1026,12 +1040,15 @@ async function syncAll() {
     ]);
 
     tasks = taskEvts.map(parseTask);
-    // Sort: done last. Active tasks use manual drag order once any has been
-    // set; otherwise fall back to overdue-first, then priority.
+    // Sort: done last; Urgent always at the top of the active list (the
+    // "highest priority" pin); then manual drag order if any; then due date;
+    // then priority.
     const anyTaskOrder = tasks.some(t => !t.done && t.order != null);
     tasks.sort((a, b) => {
       if (a.done !== b.done) return a.done ? 1 : -1;
       if (!a.done && !b.done) {
+        const aTop = a.priority === 'Urgent', bTop = b.priority === 'Urgent';
+        if (aTop !== bTop) return aTop ? -1 : 1;
         if (anyTaskOrder) {
           const ao = a.order ?? Infinity, bo = b.order ?? Infinity;
           if (ao !== bo) return ao - bo;
@@ -1243,6 +1260,15 @@ function serializeReminder(rem) {
   if (!rem) return '';
   if (rem.kind === 'custom') return 'reminder: custom ' + rem.at;
   return 'reminder: ' + rem.preset;
+}
+
+function serializeTaskDesc(t) {
+  const metaParts = [t.category, t.priority + ' priority'];
+  if (t.done) metaParts.push('[DONE]');
+  if (t.due) metaParts.push('due: ' + t.due);
+  if (t.project) metaParts.push('project: ' + t.project);
+  if (t.reminder) metaParts.push(serializeReminder(t.reminder));
+  return metaParts.join(' | ') + (t.notes ? '\n' + t.notes : '');
 }
 
 function buildEventRemindersField(rem) {
@@ -1714,12 +1740,13 @@ function renderTasks() {
 function renderTaskItem(t, i) {
   const cat = CATS[t.category] || CATS.Tasks;
   const pri = PRIS[t.priority] || PRIS.Medium;
+  const isUrgent = t.priority === 'Urgent';
   const dueHtml = t.due ? `<span class="task-due ${getDueClass(t.due)}">${formatDue(t.due)}</span>` : '';
   const remHtml = t.reminder
     ? `<span style="font-size:10px;color:var(--text3)" title="Reminder: ${esc(reminderToHumanString(t.reminder))}">🔔</span>`
     : '';
   return `
-    <div class="task-item fade-up" data-task="${t.id}" data-drag-id="${t.id}" style="animation-delay:${i * 0.03}s" onclick="editTask('${t.id}')">
+    <div class="task-item fade-up${isUrgent ? ' urgent' : ''}" data-task="${t.id}" data-drag-id="${t.id}" style="animation-delay:${i * 0.03}s" onclick="editTask('${t.id}')">
       <button class="task-check" style="border-color:${pri.color}40" onclick="event.stopPropagation();completeTask('${t.id}')" title="Complete"></button>
       <div style="flex:1;min-width:0">
         <div class="task-title">${esc(t.title)}</div>
@@ -1732,6 +1759,7 @@ function renderTaskItem(t, i) {
         </div>
         ${t.notes ? `<div class="task-notes">${esc(t.notes)}</div>` : ''}
       </div>
+      <button class="task-pin${isUrgent ? ' active' : ''}" onclick="event.stopPropagation();toggleTopPriority('${t.id}')" title="${isUrgent ? 'Unpin from top' : 'Mark as highest priority'}">${isUrgent ? '★' : '☆'}</button>
       ${DRAG_HANDLE_HTML}
     </div>`;
 }
@@ -1763,12 +1791,7 @@ async function completeTask(id) {
   const el = document.querySelector(`[data-task="${id}"]`);
   if (el) el.style.opacity = '0.3';
   try {
-    // Mark done in description instead of deleting
-    const metaParts = [t.category, t.priority + ' priority', '[DONE]'];
-    if (t.due) metaParts.push('due: ' + t.due);
-    if (t.project) metaParts.push('project: ' + t.project);
-    const desc = metaParts.join(' | ') + (t.notes ? '\n' + t.notes : '');
-    await updateEvent(id, { description: desc });
+    await updateEvent(id, { description: serializeTaskDesc({ ...t, done: true }) });
     t.done = true;
     renderAll();
   } catch (e) {
@@ -1781,14 +1804,21 @@ async function uncompleteTask(id) {
   const t = tasks.find(t => t.id === id);
   if (!t) return;
   try {
-    const metaParts = [t.category, t.priority + ' priority'];
-    if (t.due) metaParts.push('due: ' + t.due);
-    if (t.project) metaParts.push('project: ' + t.project);
-    const desc = metaParts.join(' | ') + (t.notes ? '\n' + t.notes : '');
-    await updateEvent(id, { description: desc });
+    await updateEvent(id, { description: serializeTaskDesc({ ...t, done: false }) });
     t.done = false;
     renderAll();
   } catch (e) { showError(e.message); }
+}
+
+async function toggleTopPriority(id) {
+  const t = tasks.find(x => x.id === id);
+  if (!t || t.done) return;
+  const next = { ...t, priority: t.priority === 'Urgent' ? 'Medium' : 'Urgent' };
+  try {
+    await updateEvent(id, { description: serializeTaskDesc(next) });
+    t.priority = next.priority;
+    renderAll();
+  } catch (e) { showError('Failed to update priority: ' + e.message); }
 }
 
 async function permanentDeleteTask(id) {
@@ -1912,12 +1942,10 @@ async function saveTask(taskId) {
   btn.textContent = '...'; btn.disabled = true;
 
   const t = tasks.find(t => t.id === taskId);
-  const metaParts = [cat, pri + ' priority'];
-  if (t && t.done) metaParts.push('[DONE]');
-  if (due) metaParts.push('due: ' + due);
-  if (proj) metaParts.push('project: ' + proj);
-  if (reminder) metaParts.push(serializeReminder(reminder));
-  const desc = metaParts.join(' | ') + (notes ? '\n' + notes : '');
+  const desc = serializeTaskDesc({
+    done: !!(t && t.done),
+    category: cat, priority: pri, due, project: proj, notes, reminder,
+  });
 
   try {
     await updateEvent(taskId, taskEventBody(title, desc, due, reminder));
