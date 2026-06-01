@@ -254,6 +254,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 
 /* ── LISTS ── */
 .list-card { cursor: pointer; }
+.list-card-pinned { box-shadow: inset 4px 0 0 var(--cyan); padding-left: 14px; }
 .list-icon { font-size: 24px; margin-bottom: 6px; }
 .list-name { font-size: 14px; font-weight: 600; margin-bottom: 2px; }
 .list-count { font-size: 11px; color: var(--text3); }
@@ -497,8 +498,9 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
     <div id="completed-section"></div>
   </div>
 
-  <!-- ═══ SHOPPING VIEW ═══ -->
+  <!-- ═══ SHOPPING VIEW (opens from the Lists tab) ═══ -->
   <div class="content" id="shopping-view">
+    <button class="btn btn-ghost btn-sm" style="margin-bottom:12px" onclick="switchTab('lists', document.querySelector('[data-tab=&quot;lists&quot;]'))">← Lists</button>
     <div style="display:flex;gap:6px;margin-bottom:16px">
       <input id="shop-input" placeholder="Add item..." style="flex:1" onkeydown="if(event.key==='Enter')addShopItem()">
       <select id="shop-cat" style="width:100px;font-size:12px">
@@ -583,9 +585,6 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
     </button>
     <button class="nav-btn" onclick="switchTab('tasks', this)" data-tab="tasks">
       <span class="nav-icon">✅</span>Tasks
-    </button>
-    <button class="nav-btn" onclick="switchTab('shopping', this)" data-tab="shopping">
-      <span class="nav-icon">🛒</span>Shop
     </button>
     <button class="nav-btn" onclick="switchTab('projects-ideas', this)" data-tab="projects-ideas">
       <span class="nav-icon">🎯</span>Projects
@@ -2392,17 +2391,25 @@ function renderLists() {
   const container = document.getElementById('lists-grid');
   const empty = document.getElementById('lists-empty');
 
-  if (customLists.length === 0) {
-    container.innerHTML = '';
-    empty.style.display = '';
-    return;
-  }
-  empty.style.display = 'none';
+  // Shopping is always pinned at the top — it keeps its own aisle/qty UI.
+  const uncheckedShop = shopItems.filter(i => !i.checked).length;
+  const shopCard = `
+    <div class="card list-card list-card-pinned fade-up" onclick="openShoppingList()">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:24px">🛒</span>
+        <div>
+          <div class="list-name">Shopping</div>
+          <div class="list-count">${shopItems.length} items${uncheckedShop > 0 ? ` (${uncheckedShop} remaining)` : ''}</div>
+        </div>
+      </div>
+    </div>`;
 
-  container.innerHTML = customLists.map((list, i) => {
+  empty.style.display = customLists.length === 0 ? '' : 'none';
+
+  container.innerHTML = shopCard + customLists.map((list, i) => {
     const unchecked = list.items.filter(i => !i.checked).length;
     return `
-      <div class="card list-card fade-up" style="animation-delay:${i * 0.03}s" onclick="openList('${list.id}')">
+      <div class="card list-card fade-up" style="animation-delay:${(i + 1) * 0.03}s" onclick="openList('${list.id}')">
         <div style="display:flex;align-items:center;gap:10px">
           <span style="font-size:24px">${list.icon}</span>
           <div>
@@ -3243,10 +3250,16 @@ function toggleTheme() {
 function switchTab(tab, btn) {
   currentTab = tab;
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
-  if (btn) btn.classList.add('active');
+  // Shopping lives under the Lists tab — keep Lists highlighted while it's open.
+  const navBtn = btn || document.querySelector(`[data-tab="${tab === 'shopping' ? 'lists' : tab}"]`);
+  if (navBtn) navBtn.classList.add('active');
   document.querySelectorAll('.content').forEach(c => c.classList.remove('active'));
   document.getElementById(tab + '-view').classList.add('active');
   document.getElementById('view-title').textContent = VIEW_TITLES[tab] || tab;
+}
+
+function openShoppingList() {
+  switchTab('shopping', null);
 }
 
 function updateBadges() {
@@ -3257,7 +3270,7 @@ function updateBadges() {
 
   setBadge('inbox', inboxCount);
   setBadge('tasks', overdueTasks || '');
-  setBadge('shopping', uncheckedShop || '');
+  setBadge('lists', uncheckedShop || '');
 
   // Update date display
   document.getElementById('date-display').textContent =
