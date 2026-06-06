@@ -1,4 +1,4 @@
-const CACHE_NAME = 'life-dash-v23';
+const CACHE_NAME = 'life-dash-v24';
 const ASSETS = [
   '/Life-Dashboard/',
   '/Life-Dashboard/index.html',
@@ -56,6 +56,99 @@ self.addEventListener('message', e => {
     });
   }
 });
+
+// ══════════════════════════════════════════════════
+// URGENT TASK REMINDERS (background)
+// ══════════════════════════════════════════════════
+
+// Periodic Background Sync wakes the worker; we check whether a reminder slot
+// is due and fire an attention-catching notification for open urgent tasks.
+self.addEventListener('periodicsync', e => {
+  if (e.tag === 'urgent-reminders') e.waitUntil(runUrgentReminderCheck());
+});
+
+// Tapping a reminder focuses the app (or opens it if it isn't running).
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  const url = (e.notification.data && e.notification.data.url) || '/Life-Dashboard/';
+  e.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
+      for (const c of list) {
+        if (c.url.includes('/Life-Dashboard') && 'focus' in c) return c.focus();
+      }
+      if (self.clients.openWindow) return self.clients.openWindow(url);
+    })
+  );
+});
+
+function notifDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('life-dash-notif', 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains('state')) db.createObjectStore('state');
+      if (!db.objectStoreNames.contains('fired')) db.createObjectStore('fired');
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function notifGet(store, key) {
+  try {
+    const db = await notifDB();
+    return await new Promise(r => {
+      const req = db.transaction(store).objectStore(store).get(key);
+      req.onsuccess = () => r(req.result);
+      req.onerror = () => r(undefined);
+    });
+  } catch { return undefined; }
+}
+async function notifPut(store, key, val) {
+  try {
+    const db = await notifDB();
+    db.transaction(store, 'readwrite').objectStore(store).put(val, key);
+  } catch {}
+}
+
+async function runUrgentReminderCheck() {
+  const cfg = await notifGet('state', 'config');
+  if (!cfg || !cfg.enabled || !cfg.tasks || !cfg.tasks.length) return;
+
+  const now = new Date();
+  const ymd = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+  const times = cfg.times && cfg.times.length ? cfg.times : ['09:00', '13:00', '17:00', '21:00'];
+
+  // Periodic sync is coarse, so fire the most recent slot passed in the last 3h
+  // that hasn't already been delivered today.
+  let due = null;
+  for (const time of times) {
+    const [h, m] = time.split(':').map(Number);
+    const slot = new Date(now); slot.setHours(h, m, 0, 0);
+    const mins = (now - slot) / 60000;
+    if (mins >= 0 && mins < 180) {
+      const key = ymd + '#' + time;
+      if (!(await notifGet('fired', key))) due = { time, key };
+    }
+  }
+  if (!due) return;
+  await notifPut('fired', due.key, Date.now());
+
+  const titles = cfg.tasks.slice(0, 4).map(t => '• ' + t.title);
+  const extra = cfg.tasks.length > 4 ? `\n…and ${cfg.tasks.length - 4} more` : '';
+  await self.registration.showNotification(
+    `🚨 ${cfg.tasks.length} urgent task${cfg.tasks.length > 1 ? 's' : ''} need attention`,
+    {
+      body: titles.join('\n') + extra,
+      tag: 'urgent-tasks',
+      renotify: true,
+      requireInteraction: true,
+      vibrate: [500, 200, 500, 200, 500],
+      icon: '/Life-Dashboard/icons/icon-192.svg',
+      badge: '/Life-Dashboard/icons/icon-192.svg',
+      data: { url: '/Life-Dashboard/' },
+    }
+  );
+}
 
 // Simple IndexedDB helpers for offline queue
 function openDB() {

@@ -462,6 +462,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
         <p class="date" id="date-display"></p>
       </div>
       <div style="display:flex;gap:6px;align-items:center">
+        <button class="btn btn-ghost btn-sm" onclick="openReminderSettings()" id="reminder-btn" title="Urgent task reminders">🔔</button>
         <button class="btn btn-ghost btn-sm" onclick="toggleTheme()" id="theme-toggle-btn" title="Switch color scheme">🌙</button>
         <button class="btn btn-ghost btn-sm" onclick="toggleSearch()" id="search-toggle-btn">Search</button>
         <button class="btn btn-ghost btn-sm" onclick="syncAll()" id="sync-btn">Sync</button>
@@ -3275,6 +3276,9 @@ function updateBadges() {
   // Update date display
   document.getElementById('date-display').textContent =
     new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short', year: 'numeric' });
+
+  // Keep the background-reminder snapshot in sync with the current task list.
+  if (notifEnabled()) saveNotifState();
 }
 
 function setBadge(tab, count) {
@@ -4177,6 +4181,269 @@ showApp = function() {
   updateFabVisibility();
 };
 
+// ══════════════════════════════════════════════════
+// URGENT TASK REMINDERS
+// ══════════════════════════════════════════════════
+const NOTIF_ENABLED_KEY = 'dash-notif-enabled';
+const NOTIF_TIMES_KEY = 'dash-notif-times';
+const DEFAULT_NOTIF_TIMES = ['09:00', '13:00', '17:00', '21:00'];
+
+function notifEnabled() { return localStorage.getItem(NOTIF_ENABLED_KEY) === '1'; }
+function getNotifTimes() {
+  try {
+    const t = JSON.parse(localStorage.getItem(NOTIF_TIMES_KEY));
+    if (Array.isArray(t) && t.length) return t;
+  } catch {}
+  return DEFAULT_NOTIF_TIMES.slice();
+}
+function setNotifTimes(times) { localStorage.setItem(NOTIF_TIMES_KEY, JSON.stringify(times)); }
+
+// What counts as "urgent" for a reminder: Urgent-priority OR overdue, still open.
+function getUrgentTaskList() {
+  return tasks.filter(t => !t.done && (t.priority === 'Urgent' || (t.due && getDueClass(t.due) === 'overdue')));
+}
+
+// ── IndexedDB state, shared with the service worker so background reminders
+//    (periodic sync) can fire even when the app isn't open. ──
+function notifDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('life-dash-notif', 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains('state')) db.createObjectStore('state');
+      if (!db.objectStoreNames.contains('fired')) db.createObjectStore('fired');
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function notifGet(store, key) {
+  try {
+    const db = await notifDB();
+    return await new Promise(r => {
+      const req = db.transaction(store).objectStore(store).get(key);
+      req.onsuccess = () => r(req.result);
+      req.onerror = () => r(undefined);
+    });
+  } catch { return undefined; }
+}
+async function notifPut(store, key, val) {
+  try {
+    const db = await notifDB();
+    db.transaction(store, 'readwrite').objectStore(store).put(val, key);
+  } catch {}
+}
+
+// Persist a snapshot the service worker reads when it wakes up in the background.
+async function saveNotifState() {
+  await notifPut('state', 'config', {
+    enabled: notifEnabled(),
+    times: getNotifTimes(),
+    tasks: getUrgentTaskList().map(t => ({ title: t.title, due: t.due || '' })),
+    updated: Date.now(),
+  });
+}
+
+function slotKey(time, now = new Date()) {
+  const ymd = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
+  return ymd + '#' + time;
+}
+
+// ── Foreground scheduler — checks every 30s while the app is open ──
+let notifTimer = null;
+function startReminderScheduler() {
+  if (notifTimer) { clearInterval(notifTimer); notifTimer = null; }
+  if (!notifEnabled()) return;
+  checkReminderSlots();
+  notifTimer = setInterval(checkReminderSlots, 30000);
+}
+
+function withinSlot(time, now) {
+  const [h, m] = time.split(':').map(Number);
+  const slot = new Date(now); slot.setHours(h, m, 0, 0);
+  const diff = (now - slot) / 60000; // minutes since the slot time
+  return diff >= 0 && diff < 2;
+}
+
+async function checkReminderSlots() {
+  if (!notifEnabled() || !('Notification' in window) || Notification.permission !== 'granted') return;
+  const now = new Date();
+  for (const time of getNotifTimes()) {
+    if (!withinSlot(time, now)) continue;
+    const key = slotKey(time, now);
+    if (await notifGet('fired', key)) continue;
+    await notifPut('fired', key, Date.now());
+    fireUrgentReminder();
+  }
+}
+
+// ── The attention-catching alert ──
+function showReminderNotification(title, body, attention = true) {
+  const opts = {
+    body,
+    tag: 'urgent-tasks',
+    renotify: true,
+    requireInteraction: attention,           // stays on screen until dismissed
+    vibrate: attention ? [500, 200, 500, 200, 500] : [200],
+    icon: 'icons/icon-192.svg',
+    badge: 'icons/icon-192.svg',
+    data: { url: '/Life-Dashboard/' },
+  };
+  if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+    navigator.serviceWorker.ready
+      .then(reg => reg.showNotification(title, opts))
+      .catch(() => { try { new Notification(title, opts); } catch {} });
+  } else {
+    try { new Notification(title, opts); } catch {}
+  }
+}
+
+function fireUrgentReminder() {
+  const urgent = getUrgentTaskList();
+  if (!urgent.length) return; // nothing urgent — stay quiet
+  const titles = urgent.slice(0, 4).map(t => '• ' + t.title);
+  const extra = urgent.length > 4 ? `\n…and ${urgent.length - 4} more` : '';
+  showReminderNotification(
+    `🚨 ${urgent.length} urgent task${urgent.length > 1 ? 's' : ''} need attention`,
+    titles.join('\n') + extra,
+    true
+  );
+  playAlarmChime();
+}
+
+// A short rising 3-beep alarm (notification audio is unreliable, so we make our own).
+function playAlarmChime() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const beep = (start, freq) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'square';
+      osc.frequency.value = freq;
+      osc.connect(gain); gain.connect(ctx.destination);
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime + start);
+      gain.gain.exponentialRampToValueAtTime(0.3, ctx.currentTime + start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + start + 0.25);
+      osc.start(ctx.currentTime + start);
+      osc.stop(ctx.currentTime + start + 0.27);
+    };
+    beep(0, 880); beep(0.3, 880); beep(0.6, 1175);
+    setTimeout(() => ctx.close().catch(() => {}), 1500);
+  } catch {}
+}
+
+// ── Background reminders via Periodic Background Sync (best-effort; Chrome/installed PWA) ──
+async function registerPeriodicReminders() {
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    if (!('periodicSync' in reg)) return;
+    const status = await navigator.permissions.query({ name: 'periodic-background-sync' });
+    if (status.state === 'granted') {
+      await reg.periodicSync.register('urgent-reminders', { minInterval: 60 * 60 * 1000 });
+    }
+  } catch {}
+}
+async function unregisterPeriodicReminders() {
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    if ('periodicSync' in reg) await reg.periodicSync.unregister('urgent-reminders');
+  } catch {}
+}
+
+// ── Enable / disable ──
+async function enableReminders() {
+  if (!('Notification' in window)) {
+    showError('Notifications are not supported on this device or browser.');
+    return false;
+  }
+  let perm = Notification.permission;
+  if (perm !== 'granted') perm = await Notification.requestPermission();
+  if (perm !== 'granted') {
+    showError('Notification permission denied. Enable it in your browser settings.');
+    return false;
+  }
+  localStorage.setItem(NOTIF_ENABLED_KEY, '1');
+  await saveNotifState();
+  await registerPeriodicReminders();
+  startReminderScheduler();
+  showReminderNotification('✅ Urgent reminders on', `You'll be alerted at ${getNotifTimes().join(', ')} whenever urgent tasks are open.`, false);
+  return true;
+}
+
+function disableReminders() {
+  localStorage.setItem(NOTIF_ENABLED_KEY, '0');
+  if (notifTimer) { clearInterval(notifTimer); notifTimer = null; }
+  saveNotifState();
+  unregisterPeriodicReminders();
+}
+
+function initReminders() {
+  if (!notifEnabled()) return;
+  saveNotifState();
+  registerPeriodicReminders();
+  startReminderScheduler();
+}
+
+// ── Settings panel ──
+function openReminderSettings() {
+  const enabled = notifEnabled();
+  const times = getNotifTimes();
+  const supported = 'Notification' in window;
+  const perm = supported ? Notification.permission : 'unsupported';
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">🔔 Urgent Reminders</span>
+    </div>
+    <div class="detail-body">
+      <p style="font-size:13px;color:var(--text2);line-height:1.6;margin-bottom:20px">
+        Get an attention-grabbing alert — sound, vibration and a banner that stays on screen — whenever you still have <b>urgent or overdue</b> tasks open. It checks at your chosen times each day and stays quiet when nothing's urgent.
+      </p>
+      <div class="ai-settings-row" style="justify-content:space-between;margin-bottom:16px">
+        <span style="font-size:14px;font-weight:600">Reminders ${enabled ? 'on' : 'off'}</span>
+        <button class="btn ${enabled ? 'btn-ghost' : 'btn-primary'} btn-sm" onclick="toggleReminders()">${enabled ? 'Turn off' : 'Turn on'}</button>
+      </div>
+      ${!supported ? `<div style="font-size:12px;color:var(--red);margin-bottom:16px">Your browser doesn't support notifications.</div>`
+        : perm === 'denied' ? `<div style="font-size:12px;color:var(--red);margin-bottom:16px">Notifications are blocked for this site. Enable them in your browser settings, then turn reminders on.</div>` : ''}
+      <label style="font-size:11px;color:var(--text3);margin-bottom:6px;display:block">REMINDER TIMES (4× a day)</label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">
+        ${times.map((t, i) => `<input type="time" value="${t}" onchange="updateReminderTime(${i}, this.value)" style="flex:1;min-width:90px">`).join('')}
+      </div>
+      <button class="btn btn-ghost btn-sm" onclick="fireTestReminder()" style="width:100%"${enabled ? '' : ' disabled'}>Send a test alert</button>
+      <p style="font-size:11px;color:var(--text3);line-height:1.6;margin-top:16px">
+        Alerts fire reliably while the app is open. For alerts when it's closed, install this app to your home screen — background reminders depend on your browser's support.
+      </p>
+    </div>
+  `);
+}
+
+async function toggleReminders() {
+  if (notifEnabled()) disableReminders();
+  else await enableReminders();
+  openReminderSettings();
+}
+
+function updateReminderTime(i, val) {
+  if (!val) return;
+  const times = getNotifTimes();
+  times[i] = val;
+  setNotifTimes(times);
+  saveNotifState();
+  startReminderScheduler();
+  registerPeriodicReminders();
+}
+
+function fireTestReminder() {
+  if (getUrgentTaskList().length) {
+    fireUrgentReminder();
+  } else {
+    showReminderNotification('🔔 Test alert', "Reminders are working. You have no urgent tasks right now — nice!", true);
+    playAlarmChime();
+  }
+}
+
 // ── PWA / Service Worker ──
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
@@ -4184,6 +4451,7 @@ if ('serviceWorker' in navigator) {
 
 // ── Bootstrap ──
 applyTheme(localStorage.getItem('dash-theme') || 'mist');
+initReminders();
 initAuth();
 </script>
 
