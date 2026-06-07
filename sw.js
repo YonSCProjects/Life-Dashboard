@@ -1,4 +1,4 @@
-const CACHE_NAME = 'life-dash-v24';
+const CACHE_NAME = 'life-dash-v25';
 const ASSETS = [
   '/Life-Dashboard/',
   '/Life-Dashboard/index.html',
@@ -61,8 +61,26 @@ self.addEventListener('message', e => {
 // URGENT TASK REMINDERS (background)
 // ══════════════════════════════════════════════════
 
+// Server push (Web Push from the Cloudflare Worker) — fires even when the app
+// is fully closed. Payload is { title, body }.
+self.addEventListener('push', e => {
+  let data = { title: '🚨 Urgent tasks need attention', body: 'You have urgent tasks open.' };
+  try { if (e.data) data = e.data.json(); } catch {}
+  e.waitUntil(self.registration.showNotification(data.title, {
+    body: data.body,
+    tag: 'urgent-tasks',
+    renotify: true,
+    requireInteraction: true,
+    vibrate: [500, 200, 500, 200, 500],
+    icon: '/Life-Dashboard/icons/icon-192.svg',
+    badge: '/Life-Dashboard/icons/icon-192.svg',
+    data: { url: '/Life-Dashboard/' },
+  }));
+});
+
 // Periodic Background Sync wakes the worker; we check whether a reminder slot
 // is due and fire an attention-catching notification for open urgent tasks.
+// (Used only as a fallback when server push isn't enabled.)
 self.addEventListener('periodicsync', e => {
   if (e.tag === 'urgent-reminders') e.waitUntil(runUrgentReminderCheck());
 });

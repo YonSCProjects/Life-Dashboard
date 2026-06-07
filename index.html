@@ -4186,9 +4186,11 @@ showApp = function() {
 // ══════════════════════════════════════════════════
 const NOTIF_ENABLED_KEY = 'dash-notif-enabled';
 const NOTIF_TIMES_KEY = 'dash-notif-times';
+const PUSH_ENABLED_KEY = 'dash-push-enabled';
 const DEFAULT_NOTIF_TIMES = ['09:00', '13:00', '17:00', '21:00'];
 
 function notifEnabled() { return localStorage.getItem(NOTIF_ENABLED_KEY) === '1'; }
+function pushActive() { return localStorage.getItem(PUSH_ENABLED_KEY) === '1'; }
 function getNotifTimes() {
   try {
     const t = JSON.parse(localStorage.getItem(NOTIF_TIMES_KEY));
@@ -4234,7 +4236,8 @@ async function notifPut(store, key, val) {
   } catch {}
 }
 
-// Persist a snapshot the service worker reads when it wakes up in the background.
+// Persist a snapshot the service worker reads when it wakes up in the background,
+// and (if server push is on) keep the worker's copy of the urgent list fresh.
 async function saveNotifState() {
   await notifPut('state', 'config', {
     enabled: notifEnabled(),
@@ -4242,6 +4245,7 @@ async function saveNotifState() {
     tasks: getUrgentTaskList().map(t => ({ title: t.title, due: t.due || '' })),
     updated: Date.now(),
   });
+  refreshPushState();
 }
 
 function slotKey(time, now = new Date()) {
@@ -4253,7 +4257,9 @@ function slotKey(time, now = new Date()) {
 let notifTimer = null;
 function startReminderScheduler() {
   if (notifTimer) { clearInterval(notifTimer); notifTimer = null; }
-  if (!notifEnabled()) return;
+  // When server push is active it owns scheduling (works open or closed) —
+  // skip the local timer so reminders don't fire twice.
+  if (!notifEnabled() || pushActive()) return;
   checkReminderSlots();
   notifTimer = setInterval(checkReminderSlots, 30000);
 }
@@ -4336,6 +4342,7 @@ function playAlarmChime() {
 
 // ── Background reminders via Periodic Background Sync (best-effort; Chrome/installed PWA) ──
 async function registerPeriodicReminders() {
+  if (pushActive()) return; // server push covers the background case
   try {
     const reg = await navigator.serviceWorker.ready;
     if (!('periodicSync' in reg)) return;
@@ -4375,6 +4382,7 @@ async function enableReminders() {
 function disableReminders() {
   localStorage.setItem(NOTIF_ENABLED_KEY, '0');
   if (notifTimer) { clearInterval(notifTimer); notifTimer = null; }
+  if (pushActive()) unsubscribeFromPush();
   saveNotifState();
   unregisterPeriodicReminders();
 }
@@ -4382,13 +4390,132 @@ function disableReminders() {
 function initReminders() {
   if (!notifEnabled()) return;
   saveNotifState();
+  if (pushActive()) { refreshPushState(true); return; } // server handles scheduling
   registerPeriodicReminders();
   startReminderScheduler();
+}
+
+// ── Server push (background reminders via the Cloudflare Worker) ──
+function pushSupported() { return 'serviceWorker' in navigator && 'PushManager' in window; }
+function workerBase() { return getWorkerUrl().replace(/\/$/, ''); }
+function localTz() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch { return 'UTC'; }
+}
+function urlB64ToBytes(base64String) {
+  const pad = '='.repeat((4 - base64String.length % 4) % 4);
+  const b64 = (base64String + pad).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(b64);
+  const arr = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+}
+
+async function postPushState(sub) {
+  if (!workerBase() || !sub) return;
+  await fetch(workerBase() + '/push/subscribe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      subscription: sub.toJSON ? sub.toJSON() : sub,
+      times: getNotifTimes(),
+      tz: localTz(),
+      tasks: getUrgentTaskList().map(t => ({ title: t.title, due: t.due || '' })),
+    }),
+  }).catch(() => {});
+}
+
+let lastPushPost = 0;
+async function refreshPushState(force) {
+  if (!pushActive() || !workerBase()) return;
+  if (!force && Date.now() - lastPushPost < 120000) return; // throttle background updates
+  lastPushPost = Date.now();
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) await postPushState(sub);
+  } catch {}
+}
+
+async function subscribeToPush() {
+  if (!workerBase()) {
+    showError('Connect your AI Worker first (open ✨ Claude) — push uses the same worker.');
+    return false;
+  }
+  if (!pushSupported()) {
+    showError('Background push is not supported on this browser.');
+    return false;
+  }
+  try {
+    const res = await fetch(workerBase() + '/push/key');
+    const { publicKey } = await res.json();
+    if (!publicKey) { showError('Worker has no VAPID key set. See worker setup notes.'); return false; }
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlB64ToBytes(publicKey),
+      });
+    }
+    await postPushState(sub);
+    localStorage.setItem(PUSH_ENABLED_KEY, '1');
+    // Server now owns scheduling — stand down the local fallbacks.
+    if (notifTimer) { clearInterval(notifTimer); notifTimer = null; }
+    unregisterPeriodicReminders();
+    return true;
+  } catch (e) {
+    showError('Push subscribe failed: ' + e.message);
+    return false;
+  }
+}
+
+async function unsubscribeFromPush() {
+  localStorage.setItem(PUSH_ENABLED_KEY, '0');
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) {
+      if (workerBase()) await fetch(workerBase() + '/push/unsubscribe', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint: sub.endpoint }),
+      }).catch(() => {});
+      await sub.unsubscribe().catch(() => {});
+    }
+  } catch {}
+  // Fall back to local scheduling so reminders keep working while the app is open.
+  if (notifEnabled()) { registerPeriodicReminders(); startReminderScheduler(); }
+}
+
+async function togglePush() {
+  if (pushActive()) {
+    await unsubscribeFromPush();
+  } else {
+    if (!notifEnabled()) { const ok = await enableReminders(); if (!ok) return; }
+    await subscribeToPush();
+  }
+  openReminderSettings();
+}
+
+async function testPush() {
+  if (!workerBase()) { showError('Connect your AI Worker first.'); return; }
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (!sub) { showError('Turn on background push first.'); return; }
+    const res = await fetch(workerBase() + '/push/test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subscription: sub.toJSON() }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!data.ok) showError('Test push failed (status ' + (data.status || res.status) + ').');
+  } catch (e) { showError('Test push failed: ' + e.message); }
 }
 
 // ── Settings panel ──
 function openReminderSettings() {
   const enabled = notifEnabled();
+  const push = pushActive();
+  const worker = !!workerBase();
   const times = getNotifTimes();
   const supported = 'Notification' in window;
   const perm = supported ? Notification.permission : 'unsupported';
@@ -4412,8 +4539,22 @@ function openReminderSettings() {
         ${times.map((t, i) => `<input type="time" value="${t}" onchange="updateReminderTime(${i}, this.value)" style="flex:1;min-width:90px">`).join('')}
       </div>
       <button class="btn btn-ghost btn-sm" onclick="fireTestReminder()" style="width:100%"${enabled ? '' : ' disabled'}>Send a test alert</button>
+
+      <div style="border-top:1px solid var(--bg4);margin:20px 0 16px"></div>
+
+      <div class="ai-settings-row" style="justify-content:space-between;margin-bottom:8px">
+        <span style="font-size:14px;font-weight:600">Background push ${push ? 'on' : 'off'}</span>
+        <button class="btn ${push ? 'btn-ghost' : 'btn-primary'} btn-sm" onclick="togglePush()"${pushSupported() ? '' : ' disabled'}>${push ? 'Turn off' : 'Turn on'}</button>
+      </div>
+      <p style="font-size:12px;color:var(--text2);line-height:1.6;margin-bottom:8px">
+        Delivers reminders through your Cloudflare Worker, so they arrive even when the app is fully closed — on any device. Uses the same worker as Claude.
+      </p>
+      ${!pushSupported() ? `<div style="font-size:12px;color:var(--red);margin-bottom:8px">This browser doesn't support push.</div>`
+        : !worker ? `<div style="font-size:12px;color:var(--text3);margin-bottom:8px">Connect your AI Worker (open ✨ Claude) to enable push.</div>` : ''}
+      ${push ? `<button class="btn btn-ghost btn-sm" onclick="testPush()" style="width:100%">Send a test push</button>` : ''}
+
       <p style="font-size:11px;color:var(--text3);line-height:1.6;margin-top:16px">
-        Alerts fire reliably while the app is open. For alerts when it's closed, install this app to your home screen — background reminders depend on your browser's support.
+        Without background push, alerts still fire reliably while the app is open. Install the app to your home screen for the best background behavior.
       </p>
     </div>
   `);

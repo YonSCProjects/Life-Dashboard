@@ -6,6 +6,15 @@ compatibility_date = "2024-01-01"
 #   ANTHROPIC_API_KEY     — Claude API key
 #   GOOGLE_CLIENT_ID      — same Web-application OAuth client ID used by the frontend
 #   GOOGLE_CLIENT_SECRET  — its corresponding client secret (Google Cloud Console → Credentials)
+#   VAPID_PUBLIC_KEY      — Web Push: base64url raw P-256 public key
+#   VAPID_PRIVATE_KEY     — Web Push: base64url raw P-256 private scalar
+#   VAPID_SUBJECT         — Web Push: e.g. mailto:you@example.com
+# Generate VAPID keys once with: npx web-push generate-vapid-keys
+
+# Cron trigger that fires the urgent-task reminders. Runs every 15 minutes;
+# each subscriber is alerted at most once per configured slot per local day.
+[triggers]
+crons = ["*/15 * * * *"]
 
 # KV namespace for refresh tokens.
 # Create with: npx wrangler kv:namespace create AUTH_TOKENS
