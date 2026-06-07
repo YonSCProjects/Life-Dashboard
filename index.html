@@ -4411,11 +4411,12 @@ function urlB64ToBytes(base64String) {
 }
 
 async function postPushState(sub) {
-  if (!workerBase() || !sub) return;
+  if (!workerBase() || !sub || !sessionId) return;
   await fetch(workerBase() + '/push/subscribe', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
+      session_id: sessionId,
       subscription: sub.toJSON ? sub.toJSON() : sub,
       times: getNotifTimes(),
       tz: localTz(),
@@ -4475,9 +4476,9 @@ async function unsubscribeFromPush() {
     const reg = await navigator.serviceWorker.ready;
     const sub = await reg.pushManager.getSubscription();
     if (sub) {
-      if (workerBase()) await fetch(workerBase() + '/push/unsubscribe', {
+      if (workerBase() && sessionId) await fetch(workerBase() + '/push/unsubscribe', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ endpoint: sub.endpoint }),
+        body: JSON.stringify({ session_id: sessionId, endpoint: sub.endpoint }),
       }).catch(() => {});
       await sub.unsubscribe().catch(() => {});
     }
@@ -4502,9 +4503,10 @@ async function testPush() {
     const reg = await navigator.serviceWorker.ready;
     const sub = await reg.pushManager.getSubscription();
     if (!sub) { showError('Turn on background push first.'); return; }
+    if (!sessionId) { showError('Sign in first — push needs your session.'); return; }
     const res = await fetch(workerBase() + '/push/test', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ subscription: sub.toJSON() }),
+      body: JSON.stringify({ session_id: sessionId, subscription: sub.toJSON() }),
     });
     const data = await res.json().catch(() => ({}));
     if (!data.ok) showError('Test push failed (status ' + (data.status || res.status) + ').');

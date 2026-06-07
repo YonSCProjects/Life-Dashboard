@@ -284,8 +284,24 @@ async function subKey(endpoint) {
 
 const DEFAULT_TIMES = ['09:00', '13:00', '17:00', '21:00'];
 
+// Reads the request body once, then verifies the supplied session_id against the
+// OAuth sessions in KV. Returns { body } on success or { error: Response } if
+// the session is missing/invalid — caller should bail out with that response.
+async function authedBody(request, env) {
+  let body;
+  try { body = await request.json(); }
+  catch { return { error: json({ error: 'invalid json' }, 400) }; }
+  const sid = body && body.session_id;
+  if (!sid || typeof sid !== 'string') return { error: json({ error: 'missing session_id' }, 401) };
+  const stored = await env.AUTH_TOKENS.get(`session:${sid}`);
+  if (!stored) return { error: json({ error: 'invalid session' }, 401) };
+  return { body };
+}
+
 async function handlePushSubscribe(request, env) {
-  const { subscription, times, tz, tasks } = await request.json();
+  const { body, error } = await authedBody(request, env);
+  if (error) return error;
+  const { subscription, times, tz, tasks } = body;
   if (!subscription || !subscription.endpoint) return json({ error: 'missing subscription' }, 400);
   const key = await subKey(subscription.endpoint);
   const existing = await env.AUTH_TOKENS.get(key);
@@ -302,7 +318,9 @@ async function handlePushSubscribe(request, env) {
 }
 
 async function handlePushUnsubscribe(request, env) {
-  const { endpoint } = await request.json();
+  const { body, error } = await authedBody(request, env);
+  if (error) return error;
+  const { endpoint } = body;
   if (!endpoint) return json({ error: 'missing endpoint' }, 400);
   await env.AUTH_TOKENS.delete(await subKey(endpoint));
   return json({ ok: true });
@@ -310,7 +328,9 @@ async function handlePushUnsubscribe(request, env) {
 
 async function handlePushTest(request, env) {
   if (!env.VAPID_PRIVATE_KEY) return json({ error: 'VAPID keys not configured on the worker' }, 500);
-  const { subscription } = await request.json();
+  const { body, error } = await authedBody(request, env);
+  if (error) return error;
+  const { subscription } = body;
   if (!subscription || !subscription.endpoint) return json({ error: 'missing subscription' }, 400);
   const res = await sendPush(env, subscription, {
     title: '🔔 Test alert',
