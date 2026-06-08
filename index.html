@@ -88,6 +88,21 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 .header .date { font-size: 11px; color: var(--text3); font-family: 'JetBrains Mono', monospace; margin-top: 2px; }
 .header-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 
+/* ── SYNC STATUS DOT & OFFLINE BANNER ── */
+.sync-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--text3); margin-left: 2px; vertical-align: middle;
+  transition: background 0.2s;
+}
+.sync-dot.online  { background: var(--green); }
+.sync-dot.offline { background: var(--gray); }
+.sync-dot.pending { background: var(--yellow); }
+#offline-banner {
+  padding: 8px 16px; margin: 0 16px 12px; border-radius: 8px;
+  background: rgba(168, 132, 47, 0.15); color: var(--yellow);
+  border: 1px solid rgba(168, 132, 47, 0.3); font-size: 12px; text-align: center;
+}
+
 /* ── SEARCH BAR ── */
 .search-bar {
   margin: 0 -20px; padding: 0 20px 12px;
@@ -466,6 +481,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
         <button class="btn btn-ghost btn-sm" onclick="toggleTheme()" id="theme-toggle-btn" title="Switch color scheme">🌙</button>
         <button class="btn btn-ghost btn-sm" onclick="toggleSearch()" id="search-toggle-btn">Search</button>
         <button class="btn btn-ghost btn-sm" onclick="syncAll()" id="sync-btn">Sync</button>
+        <span id="sync-dot" class="sync-dot" title="Connecting..."></span>
       </div>
     </div>
     <div class="search-bar" id="search-bar" style="display:none">
@@ -479,6 +495,8 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
   </div>
 
   <div id="error-container"></div>
+
+  <div id="offline-banner" style="display:none"></div>
 
   <!-- ═══ INBOX VIEW ═══ -->
   <div class="content active" id="inbox-view">
@@ -862,6 +880,7 @@ async function signOut() {
     }).catch(() => {});
   }
   clearLocalAuth();
+  offlineCacheClear().catch(() => {});
   showLogin();
 }
 
@@ -947,7 +966,12 @@ function showApp() {
   appEl.style.display = 'block';
   if (firstShow) {
     updateDate();
-    syncAll();
+    updateSyncIndicator();
+    // Paint cached data immediately so the app is usable instantly, even offline.
+    loadCacheSnapshot().then(hadCache => {
+      if (hadCache) renderAll();
+      syncAll(); // refresh from network in the background
+    });
   }
 }
 
@@ -955,12 +979,29 @@ function showApp() {
 // API HELPERS
 // ══════════════════════════════════════════════════
 async function calFetch(url, opts = {}) {
+  const method = (opts.method || 'GET').toUpperCase();
+  // Mutations are blocked offline — viewing cached data is fine, but writes
+  // would silently disappear. Surface a clear error to the caller.
+  if (method !== 'GET' && !navigator.onLine) {
+    throw new Error('Offline — can\'t save changes. Try again when you\'re back online.');
+  }
+
   const doFetch = () => fetch('https://www.googleapis.com/calendar/v3' + url, {
     ...opts,
     headers: { Authorization: 'Bearer ' + accessToken, 'Content-Type': 'application/json', ...opts.headers },
   });
 
-  let r = await doFetch();
+  let r;
+  try { r = await doFetch(); }
+  catch (e) {
+    // Network failure (DNS, no signal, etc.) — surface a clean message
+    if (isOfflineError(e)) {
+      isOffline = true;
+      updateSyncIndicator();
+      throw new Error(method === 'GET' ? 'Network error — using cached data.' : 'Offline — can\'t save changes.');
+    }
+    throw e;
+  }
   if (r.status === 401) {
     // Token rejected — refresh via worker and retry once.
     if (await doRefresh()) {
@@ -1009,6 +1050,149 @@ async function fetchEvents(prefix) {
   );
   return (data.items || []).filter(e => (e.summary || '').includes(prefix));
 }
+
+// ══════════════════════════════════════════════════
+// OFFLINE CACHE & SYNC STATUS
+// ══════════════════════════════════════════════════
+const IDB_NAME = 'life-dash-offline';
+const IDB_VERSION = 1;
+const CACHE_KEYS = [
+  'tasks','shopItems','inboxItems','ideas','projects','customLists',
+  'caregiverConfig','caregiverMonths','caregiverVacation','caregiverHoliday','caregiverSick','caregiverPrepays',
+  'reflections','learningNotes','memory','memoryEventId','lastSyncAt',
+];
+
+let isOffline = !navigator.onLine;
+let lastSyncAt = 0;
+let lastSyncStatus = 'unknown'; // 'ok' | 'fallback-cache' | 'unknown'
+
+function openOfflineDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains('cache')) db.createObjectStore('cache');
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function offlineCacheSet(obj) {
+  try {
+    const db = await openOfflineDB();
+    await new Promise((res, rej) => {
+      const tx = db.transaction('cache', 'readwrite');
+      const s = tx.objectStore('cache');
+      for (const [k, v] of Object.entries(obj)) s.put(v, k);
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
+    });
+  } catch (e) { /* IDB unavailable — silently skip */ }
+}
+
+async function offlineCacheGetAll() {
+  try {
+    const db = await openOfflineDB();
+    return await new Promise((res, rej) => {
+      const tx = db.transaction('cache', 'readonly');
+      const s = tx.objectStore('cache');
+      const out = {};
+      let pending = CACHE_KEYS.length;
+      CACHE_KEYS.forEach(k => {
+        const r = s.get(k);
+        r.onsuccess = () => { if (r.result !== undefined) out[k] = r.result; if (--pending === 0) res(out); };
+        r.onerror = () => { if (--pending === 0) res(out); };
+      });
+      tx.onerror = () => rej(tx.error);
+    });
+  } catch (e) { return {}; }
+}
+
+async function offlineCacheClear() {
+  try {
+    const db = await openOfflineDB();
+    await new Promise((res, rej) => {
+      const tx = db.transaction('cache', 'readwrite');
+      tx.objectStore('cache').clear();
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error);
+    });
+  } catch (e) {}
+}
+
+async function saveCacheSnapshot() {
+  await offlineCacheSet({
+    tasks, shopItems, inboxItems, ideas, projects, customLists,
+    caregiverConfig, caregiverMonths, caregiverVacation, caregiverHoliday, caregiverSick, caregiverPrepays,
+    reflections, learningNotes, memory, memoryEventId,
+    lastSyncAt: Date.now(),
+  });
+}
+
+async function loadCacheSnapshot() {
+  const c = await offlineCacheGetAll();
+  if (c.tasks !== undefined)            tasks = c.tasks;
+  if (c.shopItems !== undefined)        shopItems = c.shopItems;
+  if (c.inboxItems !== undefined)       inboxItems = c.inboxItems;
+  if (c.ideas !== undefined)            ideas = c.ideas;
+  if (c.projects !== undefined)         projects = c.projects;
+  if (c.customLists !== undefined)      customLists = c.customLists;
+  if (c.caregiverConfig !== undefined)  caregiverConfig = c.caregiverConfig;
+  if (c.caregiverMonths !== undefined)  caregiverMonths = c.caregiverMonths;
+  if (c.caregiverVacation !== undefined) caregiverVacation = c.caregiverVacation;
+  if (c.caregiverHoliday !== undefined) caregiverHoliday = c.caregiverHoliday;
+  if (c.caregiverSick !== undefined)    caregiverSick = c.caregiverSick;
+  if (c.caregiverPrepays !== undefined) caregiverPrepays = c.caregiverPrepays;
+  if (c.reflections !== undefined)      reflections = c.reflections;
+  if (c.learningNotes !== undefined)    learningNotes = c.learningNotes;
+  if (c.memory !== undefined)           memory = c.memory;
+  if (c.memoryEventId !== undefined)    memoryEventId = c.memoryEventId;
+  if (c.lastSyncAt !== undefined)       lastSyncAt = c.lastSyncAt;
+  return c.lastSyncAt !== undefined;
+}
+
+function isOfflineError(err) {
+  // fetch() throws TypeError on network failure (DNS, no connection, etc.)
+  return err instanceof TypeError || (err && err.message && /failed to fetch|network/i.test(err.message));
+}
+
+function updateSyncIndicator() {
+  const dot = document.getElementById('sync-dot');
+  const banner = document.getElementById('offline-banner');
+  if (dot) {
+    let cls = 'sync-dot';
+    let title = 'Online';
+    if (isOffline) { cls += ' offline'; title = 'Offline — viewing cached data'; }
+    else if (lastSyncStatus === 'fallback-cache') { cls += ' pending'; title = 'Online but last sync failed — viewing cached data'; }
+    else if (lastSyncStatus === 'ok') { cls += ' online'; title = lastSyncAt ? 'Synced ' + timeAgo(new Date(lastSyncAt).toISOString()) : 'Online'; }
+    else { cls += ' pending'; title = 'Connecting...'; }
+    dot.className = cls;
+    dot.title = title;
+  }
+  if (banner) {
+    const showBanner = isOffline || lastSyncStatus === 'fallback-cache';
+    banner.style.display = showBanner ? '' : 'none';
+    if (showBanner) {
+      banner.textContent = isOffline
+        ? '📡 Offline — viewing cached data. Changes won\'t save until back online.'
+        : '⚠️ Sync failed — viewing cached data. Tap Sync to retry.';
+    }
+  }
+}
+
+window.addEventListener('online', () => {
+  isOffline = false;
+  updateSyncIndicator();
+  // Refresh data when reconnecting, but only if app is showing
+  if (document.getElementById('app').style.display === 'block' && accessToken) {
+    syncAll();
+  }
+});
+window.addEventListener('offline', () => {
+  isOffline = true;
+  updateSyncIndicator();
+});
 
 // ══════════════════════════════════════════════════
 // SYNC ALL
@@ -1084,9 +1268,23 @@ async function syncAll() {
     }
 
     renderAll();
+    lastSyncAt = Date.now();
+    lastSyncStatus = 'ok';
+    isOffline = false;
+    saveCacheSnapshot();
   } catch (e) {
-    showError(e.message);
+    // Network failed → fall back to cached snapshot if we have one
+    const hadCache = await loadCacheSnapshot();
+    if (hadCache) {
+      renderAll();
+      lastSyncStatus = isOfflineError(e) ? 'fallback-cache' : 'fallback-cache';
+      if (isOfflineError(e) || !navigator.onLine) isOffline = true;
+      // Don't shout — banner will show the offline state
+    } else {
+      showError(e.message);
+    }
   }
+  updateSyncIndicator();
   btn.textContent = 'Sync';
   btn.disabled = false;
 }
