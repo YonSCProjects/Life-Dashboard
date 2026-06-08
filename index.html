@@ -599,9 +599,10 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 
   <!-- ═══ ORDERS VIEW ═══ -->
   <div class="content" id="orders-view">
-    <div style="display:flex;gap:6px;margin-bottom:16px">
+    <div style="display:flex;gap:6px;margin-bottom:12px">
       <button class="btn btn-primary" style="flex:1" onclick="openOrderPasteSheet()">📥 Paste message</button>
       <button class="btn btn-ghost" onclick="openOrderManualForm()">+ Manual</button>
+      <button class="btn btn-ghost" onclick="openOrderAutoImport()" title="Auto-import setup">⚙️</button>
     </div>
     <div id="orders-body"></div>
   </div>
@@ -649,7 +650,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 // CONFIG
 // ══════════════════════════════════════════════════
 const CLIENT_ID = '724457331852-5jpikras7qjphvgbqg2blfs17m1bu21e.apps.googleusercontent.com';
-const SCOPES = 'https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/drive.file';
+const SCOPES = 'https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/gmail.readonly';
 const CALENDAR_ID = 'yon.level@gmail.com';
 
 // Prefixes for Calendar events — each data type gets a unique emoji prefix
@@ -3934,6 +3935,113 @@ async function notifyArrivalImmediate(order) {
       }),
     });
   } catch (e) { /* best-effort, non-blocking */ }
+}
+
+// ── Auto-import setup: Gmail polling + Tasker/SMS forwarding ──
+async function openOrderAutoImport() {
+  if (!getWorkerUrl() || !sessionId) {
+    showError('Sign in and connect your Worker first (open ✨ Claude).');
+    return;
+  }
+  const ingestUrl = workerEndpoint('/orders/ingest-sms');
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">⚙️ Auto-import orders</span>
+      <span></span>
+    </div>
+    <div class="detail-body">
+      <div style="font-size:13px;font-weight:600;margin-bottom:6px">📧 Gmail auto-import</div>
+      <div style="font-size:12px;color:var(--text3);margin-bottom:8px">
+        Claude scans your inbox for shipping emails every ~15 min and tracks them automatically — even when the app is closed.
+      </div>
+      <label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px;background:var(--bg3);border-radius:8px;font-size:13px">
+        <span>Import shipping emails from Gmail</span>
+        <input type="checkbox" id="gmail-toggle" style="width:auto;transform:scale(1.3)" onchange="toggleGmailAutoImport(this)">
+      </label>
+      <div id="gmail-import-status" style="font-size:11px;color:var(--text3);margin-top:6px"></div>
+
+      <div style="height:1px;background:var(--border);margin:18px 0"></div>
+
+      <div style="font-size:13px;font-weight:600;margin-bottom:6px">📲 SMS forwarding (Tasker)</div>
+      <div style="font-size:12px;color:var(--text3);margin-bottom:8px">
+        Forward shipping SMS to this endpoint with an Android automation app (Tasker, MacroDroid). The worker parses and tracks each one — even when the app is closed.
+      </div>
+      <div style="font-size:11px;color:var(--text3);margin-bottom:2px">POST URL (session_id is in the query — keep it private)</div>
+      <div style="display:flex;gap:6px;margin-bottom:8px">
+        <input id="ingest-url" value="${esc(ingestUrl)}?session_id=${esc(sessionId)}" readonly style="font-size:11px;flex:1;font-family:'JetBrains Mono',monospace">
+        <button class="btn btn-sm btn-ghost" onclick="copyField('ingest-url')">Copy</button>
+      </div>
+      <details style="margin-top:10px">
+        <summary style="cursor:pointer;font-size:12px;color:var(--green)">Tasker setup steps</summary>
+        <ol style="font-size:12px;color:var(--text2);line-height:1.6;padding-left:18px;margin-top:8px">
+          <li>New Profile → <b>Event → Phone → Received Text</b> (leave Sender blank for all, or filter to carriers).</li>
+          <li>Add Task → <b>Net → HTTP Request</b>.</li>
+          <li>Method <b>POST</b>, URL = the POST URL above (already includes your session_id).</li>
+          <li>Body: just <code>%SMSRB</code> — Tasker's variable for the raw message text. No JSON, no quotes.</li>
+          <li>Leave Content-Type as-is (text). Save.</li>
+          <li>New shipping SMS now appear in 📦 Orders automatically.</li>
+        </ol>
+        <div style="font-size:11px;color:var(--text3);margin-top:6px">
+          ⚠️ The URL contains your <code>session_id</code> — it grants order access. Don't share it.
+        </div>
+      </details>
+    </div>
+  `);
+  // Load current Gmail toggle state.
+  try {
+    const r = await fetch(workerEndpoint('/orders/gmail-config'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    const data = await r.json().catch(() => ({}));
+    const box = document.getElementById('gmail-toggle');
+    const status = document.getElementById('gmail-import-status');
+    if (box && data.enabled) box.checked = true;
+    if (status) {
+      status.textContent = data.enabled
+        ? (data.lastPolledAt ? 'On · last checked ' + timeAgo(new Date(data.lastPolledAt).toISOString()) : 'On · waiting for first check')
+        : 'Off';
+    }
+  } catch (e) { /* leave defaults */ }
+}
+
+async function toggleGmailAutoImport(box) {
+  const status = document.getElementById('gmail-import-status');
+  const want = box.checked;
+  box.disabled = true;
+  if (status) status.textContent = want ? 'Enabling…' : 'Disabling…';
+  try {
+    const r = await fetch(workerEndpoint('/orders/gmail-config'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, enabled: want }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.status === 403 && data.error === 'insufficient_scope') {
+      box.checked = false;
+      if (status) status.innerHTML = 'Gmail access not granted yet. <a href="#" onclick="startSignIn();return false" style="color:var(--green)">Re-connect Google</a> to allow reading shipping emails.';
+      return;
+    }
+    if (!r.ok || !data.ok) throw new Error(data.message || data.error || 'failed to update');
+    box.checked = !!data.enabled;
+    if (status) status.textContent = data.enabled ? 'On · first check within ~15 min' : 'Off';
+  } catch (e) {
+    box.checked = !want;
+    if (status) status.textContent = '';
+    showError('Auto-import: ' + e.message);
+  } finally {
+    box.disabled = false;
+  }
+}
+
+function copyField(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.select();
+  navigator.clipboard?.writeText(el.value).then(
+    () => { const old = el.style.background; el.style.background = 'rgba(106,168,79,0.25)'; setTimeout(() => el.style.background = old, 600); },
+    () => { try { document.execCommand('copy'); } catch {} }
+  );
 }
 
 const VIEW_TITLES = {

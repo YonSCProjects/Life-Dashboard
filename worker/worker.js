@@ -428,11 +428,53 @@ const ORDER_PARSE_TOOL = {
       ordered_at: { type: 'string', description: 'YYYY-MM-DD if mentioned, else empty string.' },
       expected_at: { type: 'string', description: 'YYYY-MM-DD expected delivery/pickup-by date if mentioned, else empty string.' },
       matched_order_id: { type: 'string', description: 'If this message clearly updates one of the existing orders provided in context (matched by tracking number, merchant, or product), the matching order id. Otherwise empty string.' },
+      is_order_message: { type: 'boolean', description: 'TRUE only if this is a genuine transactional order/shipping notification about a specific purchase or parcel. FALSE for marketing/promotional emails, newsletters, coupons, "items left in your cart", wishlist nudges, or anything that is not a real order/shipment update. Used to filter auto-imported mail.' },
       confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: 'Confidence in the extracted fields and the match.' },
       reasoning: { type: 'string', description: 'One short sentence explaining the classification + match decision (for the user to read).' },
     },
   },
 };
+
+// Calls Claude with the forced parse tool. Returns the parsed input object.
+// `existing` is an array of compact { id, merchant, product, tracking_number, status } records for matching.
+// Throws on API/transport errors so callers can decide how to surface them.
+async function parseShippingMessage(env, text, existing) {
+  const apiKey = env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error('Claude API key not configured on worker');
+  const ctx = Array.isArray(existing) ? existing.slice(0, 30) : [];
+
+  const system = `You extract structured order/shipping info from SMS and email messages, often in Hebrew, English, or Chinese (AliExpress).
+Common Israeli context: packages often go to דואר ישראל (Israel Post) branches, Boxit/Yango lockers, or kiosks for pickup — those messages indicate status "arrived" (waiting to be collected), not delivered to the door.
+Today's date: ${new Date().toISOString().slice(0, 10)}.
+You MUST call the parse_shipping_message tool exactly once with your best extraction. Use empty strings for unknown fields rather than guessing.`;
+
+  const userContent = ctx.length
+    ? `EXISTING ACTIVE ORDERS (for matching):\n${JSON.stringify(ctx, null, 2)}\n\nMESSAGE TO PARSE:\n${text}`
+    : `MESSAGE TO PARSE:\n${text}`;
+
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      system,
+      tools: [ORDER_PARSE_TOOL],
+      tool_choice: { type: 'tool', name: 'parse_shipping_message' },
+      messages: [{ role: 'user', content: userContent }],
+    }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const e = new Error((data && data.error && data.error.message) || ('Claude API error ' + r.status));
+    e.apiDetails = data;
+    e.status = r.status;
+    throw e;
+  }
+  const toolUse = (data.content || []).find(b => b.type === 'tool_use' && b.name === 'parse_shipping_message');
+  if (!toolUse) throw new Error('Claude did not return parsed fields');
+  return toolUse.input;
+}
 
 async function handleOrderParse(request, env) {
   const apiKey = env.ANTHROPIC_API_KEY;
@@ -441,38 +483,273 @@ async function handleOrderParse(request, env) {
   if (error) return error;
   const text = (body.text || '').trim();
   if (!text) return json({ error: 'missing text' }, 400);
-  const existing = Array.isArray(body.existing_orders) ? body.existing_orders.slice(0, 30) : [];
+  const existing = Array.isArray(body.existing_orders) ? body.existing_orders : [];
 
-  const system = `You extract structured order/shipping info from SMS and email messages, often in Hebrew, English, or Chinese (AliExpress).
-Common Israeli context: packages often go to דואר ישראל (Israel Post) branches, Boxit/Yango lockers, or kiosks for pickup — those messages indicate status "arrived" (waiting to be collected), not delivered to the door.
-Today's date: ${new Date().toISOString().slice(0, 10)}.
-You MUST call the parse_shipping_message tool exactly once with your best extraction. Use empty strings for unknown fields rather than guessing.`;
+  try {
+    const parsed = await parseShippingMessage(env, text, existing);
+    return json({ parsed });
+  } catch (e) {
+    // API errors carry apiDetails; other failures (e.g. no tool_use) surface their own message.
+    return json({ error: e.apiDetails ? 'Claude API error' : e.message, details: e.apiDetails }, e.status || 502);
+  }
+}
 
-  const userContent = existing.length
-    ? `EXISTING ACTIVE ORDERS (for matching):\n${JSON.stringify(existing, null, 2)}\n\nMESSAGE TO PARSE:\n${text}`
-    : `MESSAGE TO PARSE:\n${text}`;
+// ══════════════════════════════════════════════════
+// SERVER-SIDE ORDER STORE (Google Calendar via the session's refresh token)
+// Mirrors the frontend's order<->calendar-event serialization so orders the
+// worker writes look identical to ones the app writes.
+// ══════════════════════════════════════════════════
+const ORDER_PREFIX = '📦';
+const ORDER_STATUSES = ['ordered', 'shipped', 'arrived', 'collected', 'lost'];
 
-  const apiBody = {
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 1024,
-    system,
-    tools: [ORDER_PARSE_TOOL],
-    tool_choice: { type: 'tool', name: 'parse_shipping_message' },
-    messages: [{ role: 'user', content: userContent }],
-  };
-
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify(apiBody),
+// Mint a fresh Google access token for a session from its stored refresh token.
+// Returns null (and prunes a dead session) if the grant is gone.
+async function googleAccessTokenForSession(env, sessionId) {
+  const stored = await env.AUTH_TOKENS.get(`session:${sessionId}`);
+  if (!stored) return null;
+  let refresh_token;
+  try { ({ refresh_token } = JSON.parse(stored)); } catch { return null; }
+  if (!refresh_token) return null;
+  const result = await googleTokenRequest({
+    client_id: env.GOOGLE_CLIENT_ID,
+    client_secret: env.GOOGLE_CLIENT_SECRET,
+    refresh_token,
+    grant_type: 'refresh_token',
   });
+  if (!result.ok) {
+    if (result.data && result.data.error === 'invalid_grant') {
+      await env.AUTH_TOKENS.delete(`session:${sessionId}`);
+    }
+    return null;
+  }
+  return result.data.access_token;
+}
+
+async function calApi(accessToken, path, opts = {}) {
+  const r = await fetch('https://www.googleapis.com/calendar/v3' + path, {
+    ...opts,
+    headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json', ...(opts.headers || {}) },
+  });
+  if (r.status === 204) return {};
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) return json({ error: 'Claude API error', details: data }, r.status);
+  if (!r.ok) {
+    const e = new Error('calendar API ' + r.status);
+    e.status = r.status; e.apiDetails = data;
+    throw e;
+  }
+  return data;
+}
 
-  const toolUse = (data.content || []).find(b => b.type === 'tool_use' && b.name === 'parse_shipping_message');
-  if (!toolUse) return json({ error: 'Claude did not return parsed fields' }, 502);
+// Parse a calendar event into an order object — mirror of the frontend parseOrder().
+function parseOrderEvent(event) {
+  let data = {};
+  try { data = JSON.parse(event.description || '{}') || {}; } catch { data = {}; }
+  const summaryText = (event.summary || '').replace(ORDER_PREFIX, '').trim();
+  const dashSplit = summaryText.split('—').map(s => s.trim());
+  return {
+    id: event.id,
+    merchant: data.merchant || dashSplit[0] || 'Unknown',
+    product: data.product || dashSplit.slice(1).join(' — ') || summaryText,
+    trackingNumber: data.trackingNumber || '',
+    status: data.status || 'ordered',
+    orderedAt: data.orderedAt || (event.start && event.start.date) || '',
+    expectedAt: data.expectedAt || null,
+    statusHistory: Array.isArray(data.statusHistory) ? data.statusHistory : [],
+    notes: data.notes || '',
+    sourceMessages: Array.isArray(data.sourceMessages) ? data.sourceMessages : [],
+  };
+}
 
-  return json({ parsed: toolUse.input });
+async function fetchActiveOrders(accessToken) {
+  const now = new Date();
+  const min = new Date(now.getFullYear() - 1, 0, 1).toISOString();
+  const max = new Date(now.getFullYear() + 2, 0, 1).toISOString();
+  const data = await calApi(accessToken,
+    `/calendars/primary/events?timeMin=${encodeURIComponent(min)}&timeMax=${encodeURIComponent(max)}&maxResults=500&singleEvents=true&q=${encodeURIComponent(ORDER_PREFIX)}`);
+  return (data.items || [])
+    .filter(e => (e.summary || '').includes(ORDER_PREFIX))
+    .map(parseOrderEvent)
+    .filter(o => o.status !== 'collected' && o.status !== 'lost');
+}
+
+function orderSummary(o) {
+  const m = (o.merchant || 'Order').trim();
+  const p = (o.product || '').trim();
+  return p ? m + ' — ' + p : m;
+}
+
+// Accept only a real YYYY-MM-DD calendar date; reject model misformats
+// ('soon', '2026-13-45', '2026-02-30', localized strings) that would 400 the
+// Calendar API. The round-trip check rejects impossible-but-well-formatted days.
+function validDate(s) {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return '';
+  const d = new Date(s + 'T00:00:00Z');
+  return (!isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s) ? s : '';
+}
+
+// Google Calendar caps event descriptions at 8192 chars; stay safely under so an
+// order accumulating many archived shipping messages can never 400 the write.
+const CAL_DESC_LIMIT = 8000;
+function orderEventBody(o) {
+  const base = {
+    merchant: o.merchant || '',
+    product: o.product || '',
+    trackingNumber: o.trackingNumber || '',
+    status: o.status || 'ordered',
+    orderedAt: o.orderedAt || '',
+    expectedAt: o.expectedAt || null,
+    statusHistory: o.statusHistory || [],
+    notes: o.notes || '',
+    sourceMessages: (o.sourceMessages || []).slice(-20),
+    lastUpdated: new Date().toISOString(),
+  };
+  let out = JSON.stringify(base);
+  while (out.length > CAL_DESC_LIMIT && base.sourceMessages.length) {
+    base.sourceMessages.shift(); // drop oldest archived message until it fits
+    out = JSON.stringify(base);
+  }
+  return out;
+}
+
+// Push a single notification to every subscription belonging to a session.
+async function pushToSession(env, sessionId, title, body) {
+  if (!env.VAPID_PRIVATE_KEY) return 0;
+  const list = await env.AUTH_TOKENS.list({ prefix: 'push:' });
+  let sent = 0;
+  for (const k of list.keys) {
+    const raw = await env.AUTH_TOKENS.get(k.name);
+    if (!raw) continue;
+    let rec; try { rec = JSON.parse(raw); } catch { continue; }
+    if (rec.sessionId && rec.sessionId !== sessionId) continue;
+    if (!rec.subscription) continue;
+    try {
+      const res = await sendPush(env, rec.subscription, { title, body });
+      if (res.status === 404 || res.status === 410) await env.AUTH_TOKENS.delete(k.name);
+      else sent++;
+    } catch { /* best-effort */ }
+  }
+  return sent;
+}
+
+// Decide whether a parsed message is worth turning into/updating an order.
+// Filters out marketing mail and ambiguous noise from auto-import sources.
+function isIngestableParse(parsed) {
+  if (parsed.is_order_message === false) return false;
+  if (parsed.status === 'unknown' && parsed.confidence === 'low') return false;
+  return true;
+}
+
+// Create or update the calendar event for a parsed message. Fires an arrival
+// push when status crosses into 'arrived'. `existing` is the active-order list
+// (it is mutated in place so callers batching multiple messages stay current).
+async function ingestParsedOrder(env, sessionId, accessToken, parsed, originalText, existing) {
+  const sourceMsg = { at: new Date().toISOString(), text: (originalText || '').slice(0, 2000) };
+  const matched = parsed.matched_order_id ? existing.find(o => o.id === parsed.matched_order_id) : null;
+  const status = ORDER_STATUSES.includes(parsed.status)
+    ? parsed.status
+    : (matched ? matched.status : 'shipped');
+
+  if (matched) {
+    const prevStatus = matched.status;
+    const updated = {
+      ...matched,
+      merchant: parsed.merchant || matched.merchant,
+      product: parsed.product || matched.product,
+      trackingNumber: parsed.tracking_number || matched.trackingNumber,
+      status,
+      orderedAt: validDate(parsed.ordered_at) || matched.orderedAt,
+      expectedAt: validDate(parsed.expected_at) || matched.expectedAt,
+      statusHistory: [...(matched.statusHistory || []), { at: sourceMsg.at, status, note: 'Auto-imported' }],
+      sourceMessages: [...(matched.sourceMessages || []), sourceMsg],
+    };
+    await calApi(accessToken, `/calendars/primary/events/${matched.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ summary: ORDER_PREFIX + ' ' + orderSummary(updated), description: orderEventBody(updated) }),
+    });
+    Object.assign(matched, updated); // keep batch view fresh
+    if (prevStatus !== 'arrived' && status === 'arrived') {
+      await pushToSession(env, sessionId, '📦 Package ready to collect', orderSummary(updated));
+    }
+    return { action: 'updated', order: updated };
+  }
+
+  const ord = {
+    merchant: parsed.merchant || 'Order',
+    product: parsed.product || '',
+    trackingNumber: parsed.tracking_number || '',
+    status,
+    orderedAt: validDate(parsed.ordered_at) || new Date().toISOString().slice(0, 10),
+    expectedAt: validDate(parsed.expected_at) || null,
+    statusHistory: [{ at: sourceMsg.at, status, note: 'Auto-imported' }],
+    sourceMessages: [sourceMsg],
+  };
+  const d = ord.orderedAt;
+  const ev = await calApi(accessToken, `/calendars/primary/events`, {
+    method: 'POST',
+    body: JSON.stringify({ summary: ORDER_PREFIX + ' ' + orderSummary(ord), description: orderEventBody(ord), start: { date: d }, end: { date: d } }),
+  });
+  ord.id = ev.id;
+  existing.push(ord); // keep batch view fresh
+  if (status === 'arrived') {
+    await pushToSession(env, sessionId, '📦 Package ready to collect', orderSummary(ord));
+  }
+  return { action: 'created', order: ord };
+}
+
+// Compact existing-order list passed to Claude for matching.
+function matchContext(existing) {
+  return existing.slice(0, 30).map(o => ({
+    id: o.id, merchant: o.merchant, product: o.product,
+    tracking_number: o.trackingNumber, status: o.status,
+  }));
+}
+
+// ── /orders/ingest-sms — Tasker (or anything) forwards a raw shipping message ──
+// Two call styles, so phone-automation apps don't have to hand-build JSON:
+//   A) JSON:      POST { session_id, text }
+//   B) raw text:  POST <raw SMS body>, with session_id in ?session_id= or the
+//                 X-Session-Id header. Avoids JSON-escaping the message text.
+async function handleIngestSms(request, env) {
+  if (!env.ANTHROPIC_API_KEY) return json({ error: 'Claude API key not configured on worker' }, 500);
+
+  const url = new URL(request.url);
+  const ct = request.headers.get('content-type') || '';
+  let sessionId, text;
+  if (ct.includes('application/json')) {
+    let body; try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
+    sessionId = body && body.session_id;
+    text = body && body.text;
+  } else {
+    sessionId = url.searchParams.get('session_id') || request.headers.get('x-session-id');
+    text = await request.text();
+  }
+
+  if (!sessionId || typeof sessionId !== 'string') return json({ error: 'missing session_id' }, 401);
+  if (!(await env.AUTH_TOKENS.get(`session:${sessionId}`))) return json({ error: 'invalid session' }, 401);
+  text = (typeof text === 'string' ? text : '').trim();
+  if (!text) return json({ error: 'missing text' }, 400);
+
+  const accessToken = await googleAccessTokenForSession(env, sessionId);
+  if (!accessToken) return json({ error: 'google_auth_failed', message: 'session may need to re-connect Google' }, 401);
+
+  let existing;
+  try { existing = await fetchActiveOrders(accessToken); }
+  catch (e) { return json({ error: 'calendar_read_failed', details: e.apiDetails || e.message }, 502); }
+
+  let parsed;
+  try { parsed = await parseShippingMessage(env, text, matchContext(existing)); }
+  catch (e) { return json({ error: 'parse_failed', details: e.apiDetails || e.message }, e.status || 502); }
+
+  if (!isIngestableParse(parsed)) {
+    return json({ ok: true, action: 'skipped', reason: 'not a recognizable order/shipping update', parsed });
+  }
+
+  try {
+    const result = await ingestParsedOrder(env, sessionId, accessToken, parsed, text, existing);
+    return json({ ok: true, action: result.action, order: { id: result.order.id, merchant: result.order.merchant, product: result.order.product, status: result.order.status } });
+  } catch (e) {
+    return json({ error: 'save_failed', details: e.apiDetails || e.message }, 502);
+  }
 }
 
 // ══════════════════════════════════════════════════
@@ -484,23 +761,180 @@ async function handleNotifyNow(request, env) {
   if (error) return error;
   const title = (body.title || '🔔 Reminder').toString().slice(0, 120);
   const text  = (body.body  || '').toString().slice(0, 300);
+  const sent = await pushToSession(env, body.session_id, title, text);
+  return json({ ok: true, sent });
+}
 
-  // Find all push subscriptions belonging to this session.
-  const list = await env.AUTH_TOKENS.list({ prefix: 'push:' });
-  const results = [];
+// ══════════════════════════════════════════════════
+// GMAIL AUTO-PULL — cron polls each opted-in session's inbox for shipping mail
+// and runs it through the same parse + upsert core. Server-side, app-closed.
+// Opt-in state lives at  gmailpoll:<sessionId>  in KV.
+// ══════════════════════════════════════════════════
+// Pre-filter at Gmail so Claude only sees plausibly-relevant mail. Claude's
+// is_order_message flag does the final filtering on top of this.
+const GMAIL_QUERY = 'newer_than:2d -in:chats -category:promotions ' +
+  '(tracking OR shipped OR shipment OR delivery OR delivered OR package OR parcel OR "out for delivery" OR ' +
+  'order OR aliexpress OR ebay OR amazon OR "track your" OR ' +
+  'משלוח OR חבילה OR מעקב OR נשלח OR "דואר ישראל" OR איסוף OR "הזמנה")';
+const GMAIL_MAX_PER_RUN = 8;     // cap Claude calls per session per cron tick
+const GMAIL_PROCESSED_CAP = 400; // ring buffer of seen message ids
+
+function b64urlDecodeToString(s) {
+  return new TextDecoder().decode(b64urlToBytes(s));
+}
+
+function stripHtml(html) {
+  return html
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Walk a Gmail message payload, preferring text/plain, falling back to stripped HTML.
+function extractBodyText(payload) {
+  if (!payload) return '';
+  const findPlain = (part) => {
+    if (!part) return '';
+    if (part.mimeType === 'text/plain' && part.body && part.body.data) return b64urlDecodeToString(part.body.data);
+    if (Array.isArray(part.parts)) for (const p of part.parts) { const t = findPlain(p); if (t) return t; }
+    return '';
+  };
+  const findHtml = (part) => {
+    if (!part) return '';
+    if (part.mimeType === 'text/html' && part.body && part.body.data) return stripHtml(b64urlDecodeToString(part.body.data));
+    if (Array.isArray(part.parts)) for (const p of part.parts) { const t = findHtml(p); if (t) return t; }
+    return '';
+  };
+  return findPlain(payload) || findHtml(payload) || '';
+}
+
+async function fetchGmailMessageText(accessToken, id) {
+  const r = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!r.ok) return '';
+  const data = await r.json().catch(() => ({}));
+  const headers = (data.payload && data.payload.headers) || [];
+  const h = (name) => (headers.find(x => x.name.toLowerCase() === name) || {}).value || '';
+  const bodyText = extractBodyText(data.payload) || data.snippet || '';
+  return `From: ${h('from')}\nSubject: ${h('subject')}\n\n${bodyText}`.slice(0, 6000);
+}
+
+async function pollGmailForSession(env, sessionId, accessToken, cfg, kvKey) {
+  const listResp = await fetch(
+    'https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=20&q=' + encodeURIComponent(GMAIL_QUERY),
+    { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (!listResp.ok) {
+    if (listResp.status === 403) { cfg.scopeError = true; await env.AUTH_TOKENS.put(kvKey, JSON.stringify(cfg)); }
+    return;
+  }
+  const listData = await listResp.json().catch(() => ({}));
+  const msgs = listData.messages || [];
+  if (!msgs.length) { cfg.lastPolledAt = Date.now(); await env.AUTH_TOKENS.put(kvKey, JSON.stringify(cfg)); return; }
+
+  const processed = new Set(cfg.processedIds || []);
+  let existing = [];
+  try { existing = await fetchActiveOrders(accessToken); } catch { /* proceed without match context */ }
+
+  const newlySeen = [];
+  let handled = 0;
+  for (const m of msgs) {
+    if (processed.has(m.id)) continue;
+    if (handled >= GMAIL_MAX_PER_RUN) break;
+    let text;
+    try { text = await fetchGmailMessageText(accessToken, m.id); } catch { continue; } // transient → retry next run
+    if (!text) continue;
+    handled++;
+    let parsed;
+    try { parsed = await parseShippingMessage(env, text, matchContext(existing)); }
+    catch { continue; } // Claude hiccup → leave unseen so it retries
+    if (!isIngestableParse(parsed)) { newlySeen.push(m.id); continue; } // junk → mark seen, don't re-Claude
+    try {
+      await ingestParsedOrder(env, sessionId, accessToken, parsed, text, existing);
+      newlySeen.push(m.id); // imported → mark seen
+    } catch (e) {
+      // Non-transient write failure (e.g. 400/404 bad data) fails identically every
+      // tick — mark seen so it can't loop and re-spend Claude tokens forever.
+      // Transient (401/403/429/5xx) → leave unseen to retry next tick.
+      const st = e && e.status;
+      if (st >= 400 && st < 500 && st !== 401 && st !== 403 && st !== 429) newlySeen.push(m.id);
+    }
+  }
+
+  const merged = [...(cfg.processedIds || []), ...newlySeen];
+  cfg.processedIds = merged.slice(-GMAIL_PROCESSED_CAP);
+  cfg.lastPolledAt = Date.now();
+  cfg.sessionId = sessionId;
+  delete cfg.scopeError;
+  await env.AUTH_TOKENS.put(kvKey, JSON.stringify(cfg));
+}
+
+async function runGmailPoll(env) {
+  if (!env.ANTHROPIC_API_KEY) return;
+  const list = await env.AUTH_TOKENS.list({ prefix: 'gmailpoll:' });
   for (const k of list.keys) {
     const raw = await env.AUTH_TOKENS.get(k.name);
     if (!raw) continue;
-    let rec; try { rec = JSON.parse(raw); } catch { continue; }
-    if (rec.sessionId && rec.sessionId !== body.session_id) continue;
-    if (!rec.subscription) continue;
-    try {
-      const res = await sendPush(env, rec.subscription, { title, body: text });
-      results.push({ status: res.status });
-      if (res.status === 404 || res.status === 410) await env.AUTH_TOKENS.delete(k.name);
-    } catch (e) { results.push({ error: e.message }); }
+    let cfg; try { cfg = JSON.parse(raw); } catch { continue; }
+    if (!cfg.enabled) continue;
+    const sessionId = cfg.sessionId || k.name.slice('gmailpoll:'.length);
+    const accessToken = await googleAccessTokenForSession(env, sessionId);
+    if (!accessToken) {
+      // Null can mean a revoked grant OR a transient Google token failure (5xx/429).
+      // googleAccessTokenForSession deletes session:<id> only on invalid_grant, so
+      // only abandon the opt-in when the session is actually gone — otherwise retry next tick.
+      if (!(await env.AUTH_TOKENS.get(`session:${sessionId}`))) await env.AUTH_TOKENS.delete(k.name);
+      continue;
+    }
+    try { await pollGmailForSession(env, sessionId, accessToken, cfg, k.name); }
+    catch { /* isolate failures per session */ }
   }
-  return json({ ok: true, sent: results.length, results });
+}
+
+// ── /orders/gmail-config — enable/disable auto-import, or read status ──
+// POST { session_id }                     → { enabled, lastPolledAt }
+// POST { session_id, enabled: true|false} → set (enabling verifies gmail scope)
+async function handleGmailConfig(request, env) {
+  const { body, error } = await authedBody(request, env);
+  if (error) return error;
+  const key = 'gmailpoll:' + body.session_id;
+
+  if (body.enabled === undefined) {
+    const raw = await env.AUTH_TOKENS.get(key);
+    const cfg = raw ? (JSON.parse(raw) || {}) : {};
+    return json({ ok: true, enabled: !!cfg.enabled, lastPolledAt: cfg.lastPolledAt || 0 });
+  }
+
+  if (!body.enabled) {
+    await env.AUTH_TOKENS.delete(key);
+    return json({ ok: true, enabled: false });
+  }
+
+  // Enabling: confirm the session actually granted gmail.readonly.
+  const accessToken = await googleAccessTokenForSession(env, body.session_id);
+  if (!accessToken) return json({ error: 'google_auth_failed' }, 401);
+  const test = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (test.status === 403) return json({ error: 'insufficient_scope', message: 'Re-connect Google to grant Gmail read access' }, 403);
+  if (!test.ok) return json({ error: 'gmail_check_failed', status: test.status }, 502);
+
+  const existing = await env.AUTH_TOKENS.get(key);
+  const prev = existing ? (JSON.parse(existing) || {}) : {};
+  await env.AUTH_TOKENS.put(key, JSON.stringify({
+    enabled: true,
+    sessionId: body.session_id,
+    processedIds: prev.processedIds || [],
+    lastPolledAt: prev.lastPolledAt || 0,
+    createdAt: prev.createdAt || Date.now(),
+  }));
+  return json({ ok: true, enabled: true });
 }
 
 export default {
@@ -529,6 +963,8 @@ export default {
       if (url.pathname === '/push/test')        return await handlePushTest(request, env);
       if (url.pathname === '/push/notify-now')  return await handleNotifyNow(request, env);
       if (url.pathname === '/orders/parse')     return await handleOrderParse(request, env);
+      if (url.pathname === '/orders/ingest-sms')  return await handleIngestSms(request, env);
+      if (url.pathname === '/orders/gmail-config') return await handleGmailConfig(request, env);
       // Default: Claude proxy (preserves existing AI panel behavior, which posts to root).
       return await handleAi(request, env);
     } catch (e) {
@@ -538,5 +974,6 @@ export default {
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runScheduled(env));
+    ctx.waitUntil(runGmailPoll(env));
   },
 };
