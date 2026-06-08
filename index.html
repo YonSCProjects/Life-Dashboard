@@ -597,6 +597,15 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
     </div>
   </div>
 
+  <!-- ═══ ORDERS VIEW ═══ -->
+  <div class="content" id="orders-view">
+    <div style="display:flex;gap:6px;margin-bottom:16px">
+      <button class="btn btn-primary" style="flex:1" onclick="openOrderPasteSheet()">📥 Paste message</button>
+      <button class="btn btn-ghost" onclick="openOrderManualForm()">+ Manual</button>
+    </div>
+    <div id="orders-body"></div>
+  </div>
+
   <!-- BOTTOM NAV -->
   <nav class="bottom-nav">
     <button class="nav-btn active" onclick="switchTab('inbox', this)" data-tab="inbox">
@@ -619,6 +628,9 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
     </button>
     <button class="nav-btn" onclick="switchTab('learning', this)" data-tab="learning">
       <span class="nav-icon">🎓</span>Learn
+    </button>
+    <button class="nav-btn" onclick="switchTab('orders', this)" data-tab="orders">
+      <span class="nav-icon">📦</span>Orders
     </button>
   </nav>
 </div>
@@ -658,6 +670,7 @@ const P = {
   REFLECT: '🌙',      // end-of-day reflection / thought
   LEARN: '🎓',        // learning note (course / lecture / meeting documentation)
   MEM: '🧠',          // Claude's curated memory document (singleton)
+  ORDER: '📦',        // tracked online order (AliExpress, etc.) with shipping status
 };
 
 const CURRENCY = '₪';
@@ -672,6 +685,8 @@ let reflections = [];             // [{id, text, date, created}] — end-of-day 
 let learningNotes = [];           // [{id, title, type, body, date, created}] — in-vivo course/lecture/meeting docs
 let memory = '';                  // Claude's curated memory document (markdown text)
 let memoryEventId = null;         // calendar event id of the memory doc (null if not yet created)
+let orders = [];                  // [{id, merchant, product, trackingNumber, status, orderedAt, expectedAt, statusHistory, notes, sourceMessages, lastUpdated}]
+let orderParseDraft = null;       // {originalText, parsed:{...}, matchedOrderId|null, confidence} while reviewing a paste
 let caregiverConfig = null;       // single config object (rates) or null if not set
 let caregiverMonths = [];         // [{id, ym:'YYYY-MM', satCount, weeksCount, foodOn, fatherOn, bonusAmt, bonusNote, prePayDeducted:[ids], total}]
 let caregiverVacation = [];       // [{id, date}]
@@ -1059,7 +1074,7 @@ const IDB_VERSION = 1;
 const CACHE_KEYS = [
   'tasks','shopItems','inboxItems','ideas','projects','customLists',
   'caregiverConfig','caregiverMonths','caregiverVacation','caregiverHoliday','caregiverSick','caregiverPrepays',
-  'reflections','learningNotes','memory','memoryEventId','lastSyncAt',
+  'reflections','learningNotes','memory','memoryEventId','orders','lastSyncAt',
 ];
 
 let isOffline = !navigator.onLine;
@@ -1125,7 +1140,7 @@ async function saveCacheSnapshot() {
   await offlineCacheSet({
     tasks, shopItems, inboxItems, ideas, projects, customLists,
     caregiverConfig, caregiverMonths, caregiverVacation, caregiverHoliday, caregiverSick, caregiverPrepays,
-    reflections, learningNotes, memory, memoryEventId,
+    reflections, learningNotes, memory, memoryEventId, orders,
     lastSyncAt: Date.now(),
   });
 }
@@ -1148,6 +1163,7 @@ async function loadCacheSnapshot() {
   if (c.learningNotes !== undefined)    learningNotes = c.learningNotes;
   if (c.memory !== undefined)           memory = c.memory;
   if (c.memoryEventId !== undefined)    memoryEventId = c.memoryEventId;
+  if (c.orders !== undefined)           orders = c.orders;
   if (c.lastSyncAt !== undefined)       lastSyncAt = c.lastSyncAt;
   return c.lastSyncAt !== undefined;
 }
@@ -1204,7 +1220,7 @@ async function syncAll() {
   try {
     const [taskEvts, shopEvts, inboxEvts, ideaEvts, projEvts, listEvts, listItemEvts,
            cgCfgEvts, cgMonthEvts, cgVacEvts, cgHolEvts, cgSickEvts, cgPrepayEvts,
-           reflectEvts, learnEvts, memEvts] = await Promise.all([
+           reflectEvts, learnEvts, memEvts, orderEvts] = await Promise.all([
       fetchEvents(P.TASK),
       fetchEvents(P.SHOP),
       fetchEvents(P.INBOX),
@@ -1221,6 +1237,7 @@ async function syncAll() {
       fetchEvents(P.REFLECT),
       fetchEvents(P.LEARN),
       fetchEvents(P.MEM),
+      fetchEvents(P.ORDER),
     ]);
 
     tasks = taskEvts.map(parseTask);
@@ -1267,11 +1284,21 @@ async function syncAll() {
       memoryEventId = null;
     }
 
+    orders = orderEvts.map(parseOrder).sort((a, b) => {
+      // Active orders first, then by lastUpdated desc
+      const aActive = a.status !== 'collected' && a.status !== 'lost';
+      const bActive = b.status !== 'collected' && b.status !== 'lost';
+      if (aActive !== bActive) return aActive ? -1 : 1;
+      return (b.lastUpdated || '').localeCompare(a.lastUpdated || '');
+    });
+
     renderAll();
     lastSyncAt = Date.now();
     lastSyncStatus = 'ok';
     isOffline = false;
     saveCacheSnapshot();
+    // Keep server-side push state (urgent tasks + ready-to-collect orders) in sync
+    refreshPushState && refreshPushState();
   } catch (e) {
     // Network failed → fall back to cached snapshot if we have one
     const hadCache = await loadCacheSnapshot();
@@ -1712,6 +1739,30 @@ function parseLearningNote(event) {
   };
 }
 
+function parseOrder(event) {
+  const summaryText = (event.summary || '').replace(P.ORDER, '').trim();
+  const data = (function () {
+    try { return JSON.parse(event.description || '{}') || {}; }
+    catch { return {}; }
+  })();
+  // Fallbacks from summary if description JSON is missing fields
+  const dashSplit = summaryText.split('—').map(s => s.trim());
+  return {
+    id: event.id,
+    merchant: data.merchant || dashSplit[0] || 'Unknown',
+    product: data.product || dashSplit.slice(1).join(' — ') || summaryText,
+    trackingNumber: data.trackingNumber || '',
+    status: data.status || 'ordered',
+    orderedAt: data.orderedAt || event.start?.date || '',
+    expectedAt: data.expectedAt || null,
+    statusHistory: Array.isArray(data.statusHistory) ? data.statusHistory : [],
+    notes: data.notes || '',
+    sourceMessages: Array.isArray(data.sourceMessages) ? data.sourceMessages : [],
+    lastUpdated: data.lastUpdated || event.updated || event.created,
+    created: event.created,
+  };
+}
+
 // ══════════════════════════════════════════════════
 // RENDER ALL
 // ══════════════════════════════════════════════════
@@ -1726,6 +1777,7 @@ function renderAll() {
   renderCaregiver();
   renderReflections();
   renderLearning();
+  renderOrders();
   updateBadges();
 }
 
@@ -3420,10 +3472,468 @@ async function deleteLearningNote(id) {
   } catch (e) { showError(e.message); }
 }
 
+// ══════════════════════════════════════════════════
+// ORDERS (online order tracking with shipping status)
+// ══════════════════════════════════════════════════
+const ORDER_STATUSES = ['ordered', 'shipped', 'arrived', 'collected', 'lost'];
+const ORDER_STATUS_LABEL = {
+  ordered:   { icon: '📋', label: 'Ordered',          tone: 'var(--text2)' },
+  shipped:   { icon: '🚚', label: 'In transit',       tone: 'var(--blue)' },
+  arrived:   { icon: '🔔', label: 'Ready to collect', tone: 'var(--orange)' },
+  collected: { icon: '✅', label: 'Collected',        tone: 'var(--green)' },
+  lost:      { icon: '❌', label: 'Lost / cancelled', tone: 'var(--red)' },
+};
+
+function isOrderActive(o) { return o.status !== 'collected' && o.status !== 'lost'; }
+function readyToCollect() { return orders.filter(o => o.status === 'arrived'); }
+
+function getOrderSummary(o) {
+  const m = (o.merchant || 'Order').trim();
+  const p = (o.product || '').trim();
+  if (!p) return m;
+  return m + ' — ' + p;
+}
+
+function orderEventBody(o) {
+  // What goes into the calendar event description as JSON
+  return JSON.stringify({
+    merchant: o.merchant || '',
+    product: o.product || '',
+    trackingNumber: o.trackingNumber || '',
+    status: o.status || 'ordered',
+    orderedAt: o.orderedAt || '',
+    expectedAt: o.expectedAt || null,
+    statusHistory: o.statusHistory || [],
+    notes: o.notes || '',
+    sourceMessages: (o.sourceMessages || []).slice(-20), // cap history
+    lastUpdated: new Date().toISOString(),
+  });
+}
+
+function renderOrders() {
+  const body = document.getElementById('orders-body');
+  if (!body) return;
+  if (orders.length === 0) {
+    body.innerHTML = `
+      <div class="empty">
+        <div class="icon">📦</div>
+        <div class="msg">No orders tracked yet. Paste a shipping SMS or email to get started.</div>
+      </div>`;
+    return;
+  }
+
+  const sectionFor = (status, title, alwaysOpen) => {
+    const list = orders.filter(o => o.status === status);
+    if (!list.length) return '';
+    const lbl = ORDER_STATUS_LABEL[status];
+    const id = 'orders-section-' + status;
+    const opened = alwaysOpen ? true : true; // all open for now
+    return `
+      <div class="orders-section" style="margin-bottom:18px">
+        <div style="font-size:13px;font-weight:600;color:${lbl.tone};margin-bottom:8px">
+          ${lbl.icon} ${title} <span style="color:var(--text3);font-weight:400">(${list.length})</span>
+        </div>
+        <div id="${id}">
+          ${list.map(o => renderOrderCard(o)).join('')}
+        </div>
+      </div>`;
+  };
+
+  // Collapsed sections for completed
+  const collectedList = orders.filter(o => o.status === 'collected');
+  const lostList = orders.filter(o => o.status === 'lost');
+  const collectedBlock = (collectedList.length || lostList.length) ? `
+    <details style="margin-top:8px">
+      <summary style="cursor:pointer;font-size:12px;color:var(--text3);padding:8px 0">
+        Show completed (${collectedList.length + lostList.length})
+      </summary>
+      ${sectionFor('collected', 'Collected', true)}
+      ${sectionFor('lost', 'Lost / cancelled', true)}
+    </details>` : '';
+
+  body.innerHTML = `
+    ${sectionFor('arrived', 'Ready to collect')}
+    ${sectionFor('shipped', 'In transit')}
+    ${sectionFor('ordered', 'Ordered')}
+    ${collectedBlock}
+  `;
+}
+
+function renderOrderCard(o) {
+  const lbl = ORDER_STATUS_LABEL[o.status] || ORDER_STATUS_LABEL.ordered;
+  const since = o.lastUpdated ? timeAgo(o.lastUpdated) : '';
+  const tracking = o.trackingNumber ? `<div style="font-size:11px;color:var(--text3);font-family:'JetBrains Mono',monospace">#${esc(o.trackingNumber)}</div>` : '';
+  const expected = o.expectedAt && o.status !== 'arrived' && o.status !== 'collected'
+    ? `<div style="font-size:11px;color:var(--text3)">expected ${o.expectedAt}</div>` : '';
+  return `
+    <div class="card" style="padding:12px;margin-bottom:8px;cursor:pointer;border-left:3px solid ${lbl.tone}"
+         onclick="openOrderDetail('${o.id}')">
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+        <div style="flex:1;min-width:0">
+          <div style="font-weight:600;font-size:14px">${esc(o.merchant || 'Order')}</div>
+          ${o.product ? `<div style="font-size:13px;color:var(--text2);margin-top:2px">${esc(o.product)}</div>` : ''}
+          ${tracking}
+          ${expected}
+        </div>
+        <div style="text-align:right;font-size:11px;color:var(--text3);white-space:nowrap">${since}</div>
+      </div>
+    </div>`;
+}
+
+// ── Paste-message sheet (Claude parses) ──
+function openOrderPasteSheet() {
+  orderParseDraft = null;
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">📥 Paste shipping message</span>
+      <span></span>
+    </div>
+    <div class="detail-body">
+      <div style="font-size:12px;color:var(--text3);margin-bottom:8px">
+        Paste the SMS or email text below. Claude will figure out the merchant, tracking #, status, and match it to an existing order if it can.
+      </div>
+      <textarea id="order-paste-input" rows="8" placeholder="Paste message text here..."
+                style="font-size:13px;width:100%;min-height:160px"></textarea>
+      <button class="btn btn-primary" style="margin-top:10px;width:100%" onclick="parseOrderMessage()" id="order-parse-btn">
+        ✨ Parse with Claude
+      </button>
+      <div id="order-parse-review" style="margin-top:14px"></div>
+    </div>
+  `);
+  setTimeout(() => document.getElementById('order-paste-input')?.focus(), 100);
+}
+
+async function parseOrderMessage() {
+  const text = document.getElementById('order-paste-input').value.trim();
+  if (!text) return;
+  const btn = document.getElementById('order-parse-btn');
+  btn.disabled = true; btn.textContent = '…parsing';
+  const review = document.getElementById('order-parse-review');
+  review.innerHTML = '<div class="spinner"></div>';
+
+  try {
+    if (!getWorkerUrl()) throw new Error('Connect your Worker URL first (open ✨ Claude).');
+    if (!sessionId) throw new Error('Sign in first — Claude parsing needs your session.');
+
+    const existing = orders.filter(isOrderActive).map(o => ({
+      id: o.id,
+      merchant: o.merchant,
+      product: o.product,
+      tracking_number: o.trackingNumber,
+      status: o.status,
+    }));
+
+    const r = await fetch(workerEndpoint('/orders/parse'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, text, existing_orders: existing }),
+    });
+    const data = await r.json();
+    if (!r.ok || !data.parsed) throw new Error(data.error || 'parse failed');
+
+    orderParseDraft = {
+      originalText: text,
+      parsed: data.parsed,
+      matchedOrderId: data.parsed.matched_order_id || null,
+      confidence: data.parsed.confidence || 'low',
+    };
+    renderOrderParseReview();
+  } catch (e) {
+    review.innerHTML = `<div style="color:var(--red);font-size:13px">${esc(e.message)}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = '✨ Parse with Claude';
+  }
+}
+
+function renderOrderParseReview() {
+  const review = document.getElementById('order-parse-review');
+  if (!review || !orderParseDraft) return;
+  const p = orderParseDraft.parsed;
+  const matched = orderParseDraft.matchedOrderId
+    ? orders.find(o => o.id === orderParseDraft.matchedOrderId) : null;
+  const conf = orderParseDraft.confidence;
+
+  review.innerHTML = `
+    <div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:12px">
+      <div style="font-size:11px;color:var(--text3);margin-bottom:8px">
+        ${matched ? '✏️ Updating <b>' + esc(matched.merchant) + (matched.product ? ' — ' + esc(matched.product) : '') + '</b>' : '✨ Creating new order'}
+        <span style="margin-left:8px;padding:2px 6px;border-radius:4px;background:rgba(168,132,47,0.15)">${esc(conf)} confidence</span>
+      </div>
+      ${renderOrderEditField('Merchant',   'op-merchant',  p.merchant || '')}
+      ${renderOrderEditField('Product',    'op-product',   p.product || '')}
+      ${renderOrderEditField('Tracking #', 'op-tracking',  p.tracking_number || '')}
+      ${renderOrderStatusSelect('op-status', p.status || 'shipped')}
+      ${renderOrderEditField('Ordered (YYYY-MM-DD)',  'op-ordered',  p.ordered_at || '')}
+      ${renderOrderEditField('Expected (YYYY-MM-DD)', 'op-expected', p.expected_at || '')}
+      ${matched ? `
+        <label style="display:flex;align-items:center;gap:6px;margin:10px 0;font-size:12px;color:var(--text2)">
+          <input type="checkbox" id="op-create-new" style="width:auto"> Create as separate new order instead of updating
+        </label>` : ''}
+      <button class="btn btn-primary" style="width:100%;margin-top:8px" onclick="saveOrderFromParse()">Save</button>
+    </div>`;
+}
+
+function renderOrderEditField(label, id, value) {
+  return `
+    <div style="margin-bottom:8px">
+      <label style="font-size:11px;color:var(--text3);display:block;margin-bottom:2px">${label}</label>
+      <input id="${id}" value="${esc(value)}" style="font-size:13px;width:100%">
+    </div>`;
+}
+
+function renderOrderStatusSelect(id, current) {
+  const opts = ORDER_STATUSES.map(s =>
+    `<option value="${s}" ${s === current ? 'selected' : ''}>${ORDER_STATUS_LABEL[s].icon} ${ORDER_STATUS_LABEL[s].label}</option>`).join('');
+  return `
+    <div style="margin-bottom:8px">
+      <label style="font-size:11px;color:var(--text3);display:block;margin-bottom:2px">Status</label>
+      <select id="${id}" style="font-size:13px;width:100%">${opts}</select>
+    </div>`;
+}
+
+async function saveOrderFromParse() {
+  if (!orderParseDraft) return;
+  const merchant  = document.getElementById('op-merchant').value.trim();
+  const product   = document.getElementById('op-product').value.trim();
+  const tracking  = document.getElementById('op-tracking').value.trim();
+  const status    = document.getElementById('op-status').value;
+  const orderedAt = document.getElementById('op-ordered').value.trim();
+  const expectedAt = document.getElementById('op-expected').value.trim() || null;
+
+  const forceNew = document.getElementById('op-create-new')?.checked;
+  const existing = (!forceNew && orderParseDraft.matchedOrderId)
+    ? orders.find(o => o.id === orderParseDraft.matchedOrderId) : null;
+
+  const sourceMsg = { at: new Date().toISOString(), text: orderParseDraft.originalText };
+  try {
+    if (existing) {
+      const prevStatus = existing.status;
+      const updated = {
+        ...existing,
+        merchant: merchant || existing.merchant,
+        product: product || existing.product,
+        trackingNumber: tracking || existing.trackingNumber,
+        status,
+        orderedAt: orderedAt || existing.orderedAt,
+        expectedAt: expectedAt || existing.expectedAt,
+        statusHistory: [...(existing.statusHistory || []), { at: sourceMsg.at, status, note: 'From pasted message' }],
+        sourceMessages: [...(existing.sourceMessages || []), sourceMsg],
+      };
+      await updateEvent(existing.id, {
+        summary: P.ORDER + ' ' + getOrderSummary(updated),
+        description: orderEventBody(updated),
+      });
+      orderParseDraft = null;
+      closeDetail();
+      await syncAll();
+      if (prevStatus !== 'arrived' && status === 'arrived') notifyArrivalImmediate(updated);
+    } else {
+      const ord = {
+        merchant: merchant || 'Order',
+        product, trackingNumber: tracking, status,
+        orderedAt: orderedAt || new Date().toISOString().slice(0, 10),
+        expectedAt,
+        statusHistory: [{ at: sourceMsg.at, status, note: 'Initial' }],
+        sourceMessages: [sourceMsg],
+      };
+      const ev = await createEvent(P.ORDER, getOrderSummary(ord), orderEventBody(ord), ord.orderedAt);
+      orderParseDraft = null;
+      closeDetail();
+      await syncAll();
+      if (status === 'arrived' && ev?.id) {
+        const just = orders.find(o => o.id === ev.id);
+        if (just) notifyArrivalImmediate(just);
+      }
+    }
+  } catch (e) { showError(e.message); }
+}
+
+// ── Manual entry form ──
+function openOrderManualForm() {
+  const today = new Date().toISOString().slice(0, 10);
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">+ New order</span>
+      <button class="btn btn-sm btn-primary" onclick="saveManualOrder()" id="order-manual-save">Save</button>
+    </div>
+    <div class="detail-body">
+      ${renderOrderEditField('Merchant',   'om-merchant',  '')}
+      ${renderOrderEditField('Product',    'om-product',   '')}
+      ${renderOrderEditField('Tracking #', 'om-tracking',  '')}
+      ${renderOrderStatusSelect('om-status', 'ordered')}
+      ${renderOrderEditField('Ordered (YYYY-MM-DD)',  'om-ordered',  today)}
+      ${renderOrderEditField('Expected (YYYY-MM-DD)', 'om-expected', '')}
+      <div style="margin-top:8px">
+        <label style="font-size:11px;color:var(--text3);display:block;margin-bottom:2px">Notes</label>
+        <textarea id="om-notes" rows="3" style="font-size:13px;width:100%"></textarea>
+      </div>
+    </div>
+  `);
+  setTimeout(() => document.getElementById('om-merchant')?.focus(), 100);
+}
+
+async function saveManualOrder() {
+  const btn = document.getElementById('order-manual-save');
+  const merchant = document.getElementById('om-merchant').value.trim();
+  if (!merchant) { showError('Merchant required'); return; }
+  const ord = {
+    merchant,
+    product: document.getElementById('om-product').value.trim(),
+    trackingNumber: document.getElementById('om-tracking').value.trim(),
+    status: document.getElementById('om-status').value,
+    orderedAt: document.getElementById('om-ordered').value.trim() || new Date().toISOString().slice(0, 10),
+    expectedAt: document.getElementById('om-expected').value.trim() || null,
+    notes: document.getElementById('om-notes').value.trim(),
+    statusHistory: [{ at: new Date().toISOString(), status: document.getElementById('om-status').value, note: 'Manual entry' }],
+    sourceMessages: [],
+  };
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const ev = await createEvent(P.ORDER, getOrderSummary(ord), orderEventBody(ord), ord.orderedAt);
+    closeDetail();
+    await syncAll();
+    if (ord.status === 'arrived' && ev?.id) {
+      const just = orders.find(o => o.id === ev.id);
+      if (just) notifyArrivalImmediate(just);
+    }
+  } catch (e) {
+    showError(e.message);
+    btn.disabled = false; btn.textContent = 'Save';
+  }
+}
+
+// ── Detail view ──
+function openOrderDetail(id) {
+  const o = orders.find(x => x.id === id);
+  if (!o) return;
+  const lbl = ORDER_STATUS_LABEL[o.status] || ORDER_STATUS_LABEL.ordered;
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">📦 Order</span>
+      <button class="btn btn-sm btn-danger" onclick="deleteOrder('${o.id}')">Delete</button>
+    </div>
+    <div class="detail-body">
+      <div style="display:inline-block;padding:4px 10px;border-radius:6px;background:${lbl.tone};color:white;font-size:11px;margin-bottom:14px">
+        ${lbl.icon} ${lbl.label}
+      </div>
+
+      ${renderOrderEditField('Merchant',   'od-merchant',  o.merchant)}
+      ${renderOrderEditField('Product',    'od-product',   o.product)}
+      ${renderOrderEditField('Tracking #', 'od-tracking',  o.trackingNumber)}
+      ${renderOrderStatusSelect('od-status', o.status)}
+      ${renderOrderEditField('Ordered',    'od-ordered',   o.orderedAt || '')}
+      ${renderOrderEditField('Expected',   'od-expected',  o.expectedAt || '')}
+      <div style="margin-bottom:8px">
+        <label style="font-size:11px;color:var(--text3);display:block;margin-bottom:2px">Notes</label>
+        <textarea id="od-notes" rows="3" style="font-size:13px;width:100%">${esc(o.notes || '')}</textarea>
+      </div>
+
+      <div style="display:flex;gap:8px;margin:14px 0">
+        <button class="btn btn-primary" style="flex:1" onclick="saveOrderEdit('${o.id}')">Save changes</button>
+        ${o.status === 'arrived' ? `<button class="btn btn-ghost" onclick="markOrderCollected('${o.id}')">✅ Mark collected</button>` : ''}
+      </div>
+
+      ${o.statusHistory && o.statusHistory.length ? `
+        <div style="margin-top:14px">
+          <div style="font-size:11px;color:var(--text3);margin-bottom:6px">STATUS HISTORY</div>
+          ${o.statusHistory.slice().reverse().map(h => `
+            <div style="font-size:12px;padding:6px 0;border-bottom:1px solid var(--bg4)">
+              <b>${esc((ORDER_STATUS_LABEL[h.status] || {}).label || h.status)}</b>
+              <span style="color:var(--text3);margin-left:6px">${timeAgo(h.at)}</span>
+              ${h.note ? `<div style="color:var(--text3);font-size:11px;margin-top:2px">${esc(h.note)}</div>` : ''}
+            </div>`).join('')}
+        </div>` : ''}
+
+      ${o.sourceMessages && o.sourceMessages.length ? `
+        <details style="margin-top:14px">
+          <summary style="cursor:pointer;font-size:11px;color:var(--text3)">View source messages (${o.sourceMessages.length})</summary>
+          ${o.sourceMessages.slice().reverse().map(m => `
+            <div style="margin-top:8px;padding:8px;background:var(--bg3);border-radius:6px;font-size:11px;white-space:pre-wrap">${esc(m.text || '')}</div>
+          `).join('')}
+        </details>` : ''}
+    </div>
+  `);
+}
+
+async function saveOrderEdit(id) {
+  const existing = orders.find(o => o.id === id);
+  if (!existing) return;
+  const newStatus = document.getElementById('od-status').value;
+  const prevStatus = existing.status;
+  const updated = {
+    ...existing,
+    merchant: document.getElementById('od-merchant').value.trim() || existing.merchant,
+    product: document.getElementById('od-product').value.trim(),
+    trackingNumber: document.getElementById('od-tracking').value.trim(),
+    status: newStatus,
+    orderedAt: document.getElementById('od-ordered').value.trim() || existing.orderedAt,
+    expectedAt: document.getElementById('od-expected').value.trim() || null,
+    notes: document.getElementById('od-notes').value.trim(),
+    statusHistory: newStatus !== prevStatus
+      ? [...(existing.statusHistory || []), { at: new Date().toISOString(), status: newStatus, note: 'Edited' }]
+      : (existing.statusHistory || []),
+  };
+  try {
+    await updateEvent(id, {
+      summary: P.ORDER + ' ' + getOrderSummary(updated),
+      description: orderEventBody(updated),
+    });
+    closeDetail();
+    await syncAll();
+    if (prevStatus !== 'arrived' && newStatus === 'arrived') notifyArrivalImmediate(updated);
+  } catch (e) { showError(e.message); }
+}
+
+async function markOrderCollected(id) {
+  const existing = orders.find(o => o.id === id);
+  if (!existing) return;
+  const updated = {
+    ...existing,
+    status: 'collected',
+    statusHistory: [...(existing.statusHistory || []), { at: new Date().toISOString(), status: 'collected', note: 'Picked up' }],
+  };
+  try {
+    await updateEvent(id, {
+      summary: P.ORDER + ' ' + getOrderSummary(updated),
+      description: orderEventBody(updated),
+    });
+    closeDetail();
+    await syncAll();
+  } catch (e) { showError(e.message); }
+}
+
+async function deleteOrder(id) {
+  if (!confirm('Delete this order? This cannot be undone.')) return;
+  try {
+    await deleteEvent(id);
+    orders = orders.filter(o => o.id !== id);
+    closeDetail();
+    renderOrders();
+  } catch (e) { showError(e.message); }
+}
+
+// ── Immediate push when an order becomes 'arrived' ──
+async function notifyArrivalImmediate(order) {
+  if (!getWorkerUrl() || !sessionId) return;
+  try {
+    await fetch(workerEndpoint('/push/notify-now'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: sessionId,
+        title: '📦 Package ready to collect',
+        body: (order.merchant || 'Order') + (order.product ? ' — ' + order.product : ''),
+      }),
+    });
+  } catch (e) { /* best-effort, non-blocking */ }
+}
+
 const VIEW_TITLES = {
   inbox: 'Inbox', tasks: 'Tasks', shopping: 'Shopping',
   'projects-ideas': 'Projects / Ideas', lists: 'Lists',
   caregiver: 'Caregiver', reflections: 'Reflections', learning: 'Learning Notes',
+  orders: 'Orders',
 };
 
 // ── Color scheme ──
@@ -4619,6 +5129,11 @@ async function postPushState(sub) {
       times: getNotifTimes(),
       tz: localTz(),
       tasks: getUrgentTaskList().map(t => ({ title: t.title, due: t.due || '' })),
+      orders: readyToCollect().map(o => ({
+        id: o.id,
+        merchant: o.merchant || 'Order',
+        product: o.product || '',
+      })),
     }),
   }).catch(() => {});
 }

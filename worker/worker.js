@@ -301,16 +301,18 @@ async function authedBody(request, env) {
 async function handlePushSubscribe(request, env) {
   const { body, error } = await authedBody(request, env);
   if (error) return error;
-  const { subscription, times, tz, tasks } = body;
+  const { subscription, times, tz, tasks, orders } = body;
   if (!subscription || !subscription.endpoint) return json({ error: 'missing subscription' }, 400);
   const key = await subKey(subscription.endpoint);
   const existing = await env.AUTH_TOKENS.get(key);
   const prev = existing ? JSON.parse(existing) : {};
   await env.AUTH_TOKENS.put(key, JSON.stringify({
     subscription,
+    sessionId: body.session_id, // used by /push/notify-now lookup
     times: Array.isArray(times) && times.length ? times : (prev.times || DEFAULT_TIMES),
     tz: tz || prev.tz || 'UTC',
     tasks: Array.isArray(tasks) ? tasks : (prev.tasks || []),
+    orders: Array.isArray(orders) ? orders : (prev.orders || []),
     fired: prev.fired || {},
     updated: Date.now(),
   }));
@@ -349,7 +351,8 @@ async function runScheduled(env) {
     if (!raw) continue;
     let rec; try { rec = JSON.parse(raw); } catch { continue; }
     const tasks = rec.tasks || [];
-    if (!rec.subscription || !tasks.length) continue; // stay quiet when nothing's urgent
+    const orders = rec.orders || [];
+    if (!rec.subscription || (!tasks.length && !orders.length)) continue; // nothing to remind about
 
     const fmt = new Intl.DateTimeFormat('en-CA', {
       timeZone: rec.tz || 'UTC', hour12: false,
@@ -371,13 +374,30 @@ async function runScheduled(env) {
     }
     if (!dueSlot) continue;
 
-    const titles = tasks.slice(0, 4).map(t => '• ' + t.title);
-    const extra = tasks.length > 4 ? `\n…and ${tasks.length - 4} more` : '';
+    // Compose attention-grabbing message that mixes urgent tasks + ready-to-collect packages.
+    const lines = [];
+    if (orders.length) {
+      orders.slice(0, 3).forEach(o => {
+        const label = (o.merchant || 'Order') + (o.product ? ' — ' + o.product : '');
+        lines.push('📦 ' + label.slice(0, 80));
+      });
+      if (orders.length > 3) lines.push(`📦 …and ${orders.length - 3} more package${orders.length - 3 > 1 ? 's' : ''}`);
+    }
+    if (tasks.length) {
+      const taskBudget = Math.max(0, 4 - lines.length);
+      tasks.slice(0, taskBudget).forEach(t => lines.push('• ' + (t.title || '').slice(0, 80)));
+      const taskExtra = tasks.length - taskBudget;
+      if (taskExtra > 0) lines.push(`…and ${taskExtra} more task${taskExtra > 1 ? 's' : ''}`);
+    }
+    const parts2 = [];
+    if (orders.length) parts2.push(`${orders.length} package${orders.length > 1 ? 's' : ''} waiting`);
+    if (tasks.length)  parts2.push(`${tasks.length} urgent task${tasks.length > 1 ? 's' : ''}`);
+    const titlePrefix = orders.length ? '📦' : '🚨';
     let res;
     try {
       res = await sendPush(env, rec.subscription, {
-        title: `🚨 ${tasks.length} urgent task${tasks.length > 1 ? 's' : ''} need attention`,
-        body: titles.join('\n') + extra,
+        title: `${titlePrefix} ${parts2.join(' + ')}`,
+        body: lines.join('\n'),
       });
     } catch { continue; }
 
@@ -389,6 +409,98 @@ async function runScheduled(env) {
     rec.updated = Date.now();
     await env.AUTH_TOKENS.put(k.name, JSON.stringify(rec));
   }
+}
+
+// ══════════════════════════════════════════════════
+// ORDERS — parse shipping messages with Claude
+// ══════════════════════════════════════════════════
+const ORDER_PARSE_TOOL = {
+  name: 'parse_shipping_message',
+  description: 'Extract structured fields from a shipping/order notification message (SMS or email).',
+  input_schema: {
+    type: 'object',
+    required: ['merchant', 'status', 'confidence'],
+    properties: {
+      merchant: { type: 'string', description: 'Merchant or sender (AliExpress, Amazon, the carrier name, the postal service, etc.). Best guess if unclear.' },
+      product: { type: 'string', description: 'Product/item description if mentioned. Empty string if not.' },
+      tracking_number: { type: 'string', description: 'Shipment tracking number / package number if present. Empty string if absent.' },
+      status: { type: 'string', enum: ['ordered', 'shipped', 'arrived', 'collected', 'lost', 'unknown'], description: '"arrived" means it has reached its pickup point and is waiting to be collected (e.g., at a post office, locker, or kiosk). "shipped" means in transit. "ordered" means paid but not yet shipped. Use "unknown" if the message does not clearly indicate status.' },
+      ordered_at: { type: 'string', description: 'YYYY-MM-DD if mentioned, else empty string.' },
+      expected_at: { type: 'string', description: 'YYYY-MM-DD expected delivery/pickup-by date if mentioned, else empty string.' },
+      matched_order_id: { type: 'string', description: 'If this message clearly updates one of the existing orders provided in context (matched by tracking number, merchant, or product), the matching order id. Otherwise empty string.' },
+      confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: 'Confidence in the extracted fields and the match.' },
+      reasoning: { type: 'string', description: 'One short sentence explaining the classification + match decision (for the user to read).' },
+    },
+  },
+};
+
+async function handleOrderParse(request, env) {
+  const apiKey = env.ANTHROPIC_API_KEY;
+  if (!apiKey) return json({ error: 'Claude API key not configured on worker' }, 500);
+  const { body, error } = await authedBody(request, env);
+  if (error) return error;
+  const text = (body.text || '').trim();
+  if (!text) return json({ error: 'missing text' }, 400);
+  const existing = Array.isArray(body.existing_orders) ? body.existing_orders.slice(0, 30) : [];
+
+  const system = `You extract structured order/shipping info from SMS and email messages, often in Hebrew, English, or Chinese (AliExpress).
+Common Israeli context: packages often go to דואר ישראל (Israel Post) branches, Boxit/Yango lockers, or kiosks for pickup — those messages indicate status "arrived" (waiting to be collected), not delivered to the door.
+Today's date: ${new Date().toISOString().slice(0, 10)}.
+You MUST call the parse_shipping_message tool exactly once with your best extraction. Use empty strings for unknown fields rather than guessing.`;
+
+  const userContent = existing.length
+    ? `EXISTING ACTIVE ORDERS (for matching):\n${JSON.stringify(existing, null, 2)}\n\nMESSAGE TO PARSE:\n${text}`
+    : `MESSAGE TO PARSE:\n${text}`;
+
+  const apiBody = {
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 1024,
+    system,
+    tools: [ORDER_PARSE_TOOL],
+    tool_choice: { type: 'tool', name: 'parse_shipping_message' },
+    messages: [{ role: 'user', content: userContent }],
+  };
+
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify(apiBody),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) return json({ error: 'Claude API error', details: data }, r.status);
+
+  const toolUse = (data.content || []).find(b => b.type === 'tool_use' && b.name === 'parse_shipping_message');
+  if (!toolUse) return json({ error: 'Claude did not return parsed fields' }, 502);
+
+  return json({ parsed: toolUse.input });
+}
+
+// ══════════════════════════════════════════════════
+// IMMEDIATE PUSH (used when an order is marked 'arrived' right now)
+// ══════════════════════════════════════════════════
+async function handleNotifyNow(request, env) {
+  if (!env.VAPID_PRIVATE_KEY) return json({ error: 'VAPID keys not configured' }, 500);
+  const { body, error } = await authedBody(request, env);
+  if (error) return error;
+  const title = (body.title || '🔔 Reminder').toString().slice(0, 120);
+  const text  = (body.body  || '').toString().slice(0, 300);
+
+  // Find all push subscriptions belonging to this session.
+  const list = await env.AUTH_TOKENS.list({ prefix: 'push:' });
+  const results = [];
+  for (const k of list.keys) {
+    const raw = await env.AUTH_TOKENS.get(k.name);
+    if (!raw) continue;
+    let rec; try { rec = JSON.parse(raw); } catch { continue; }
+    if (rec.sessionId && rec.sessionId !== body.session_id) continue;
+    if (!rec.subscription) continue;
+    try {
+      const res = await sendPush(env, rec.subscription, { title, body: text });
+      results.push({ status: res.status });
+      if (res.status === 404 || res.status === 410) await env.AUTH_TOKENS.delete(k.name);
+    } catch (e) { results.push({ error: e.message }); }
+  }
+  return json({ ok: true, sent: results.length, results });
 }
 
 export default {
@@ -415,6 +527,8 @@ export default {
       if (url.pathname === '/push/subscribe')   return await handlePushSubscribe(request, env);
       if (url.pathname === '/push/unsubscribe') return await handlePushUnsubscribe(request, env);
       if (url.pathname === '/push/test')        return await handlePushTest(request, env);
+      if (url.pathname === '/push/notify-now')  return await handleNotifyNow(request, env);
+      if (url.pathname === '/orders/parse')     return await handleOrderParse(request, env);
       // Default: Claude proxy (preserves existing AI panel behavior, which posts to root).
       return await handleAi(request, env);
     } catch (e) {
