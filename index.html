@@ -3960,6 +3960,8 @@ async function openOrderAutoImport() {
         <input type="checkbox" id="gmail-toggle" style="width:auto;transform:scale(1.3)" onchange="toggleGmailAutoImport(this)">
       </label>
       <div id="gmail-import-status" style="font-size:11px;color:var(--text3);margin-top:6px"></div>
+      <button class="btn btn-sm btn-ghost" id="gmail-backfill-btn" style="margin-top:8px;width:100%;display:none"
+              onclick="startGmailBackfill(this)">⤓ Import shipping emails from the last 30 days</button>
 
       <div style="height:1px;background:var(--border);margin:18px 0"></div>
 
@@ -3997,11 +3999,16 @@ async function openOrderAutoImport() {
     const data = await r.json().catch(() => ({}));
     const box = document.getElementById('gmail-toggle');
     const status = document.getElementById('gmail-import-status');
+    const bf = document.getElementById('gmail-backfill-btn');
     if (box && data.enabled) box.checked = true;
+    if (bf) bf.style.display = data.enabled ? 'block' : 'none';
+    if (data.backfill && bf) { bf.disabled = true; bf.textContent = '⏳ Importing last 30 days…'; }
     if (status) {
-      status.textContent = data.enabled
-        ? (data.lastPolledAt ? 'On · last checked ' + timeAgo(new Date(data.lastPolledAt).toISOString()) : 'On · waiting for first check')
-        : 'Off';
+      status.textContent = data.backfill
+        ? 'On · importing last 30 days (trickling in over the next few hours)'
+        : data.enabled
+          ? (data.lastPolledAt ? 'On · last checked ' + timeAgo(new Date(data.lastPolledAt).toISOString()) : 'On · waiting for first check')
+          : 'Off';
     }
   } catch (e) { /* leave defaults */ }
 }
@@ -4024,6 +4031,12 @@ async function toggleGmailAutoImport(box) {
     }
     if (!r.ok || !data.ok) throw new Error(data.message || data.error || 'failed to update');
     box.checked = !!data.enabled;
+    const bf = document.getElementById('gmail-backfill-btn');
+    if (bf) {
+      bf.style.display = data.enabled ? 'block' : 'none';
+      bf.disabled = false;
+      bf.textContent = '⤓ Import shipping emails from the last 30 days';
+    }
     if (status) status.textContent = data.enabled ? 'On · first check within ~15 min' : 'Off';
   } catch (e) {
     box.checked = !want;
@@ -4031,6 +4044,33 @@ async function toggleGmailAutoImport(box) {
     showError('Auto-import: ' + e.message);
   } finally {
     box.disabled = false;
+  }
+}
+
+// One-time 30-day Gmail import. The worker walks older mail one page per cron
+// tick, so results trickle into 📦 Orders over a few hours.
+async function startGmailBackfill(btn) {
+  if (!confirm('Scan your last 30 days of email for shipping notifications?\n\nThis runs in the background over a few hours and uses Claude to read each candidate email.')) return;
+  const status = document.getElementById('gmail-import-status');
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Starting…';
+  try {
+    const r = await fetch(workerEndpoint('/orders/gmail-config'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, backfill: true }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.status === 403 && data.error === 'insufficient_scope') {
+      btn.disabled = false; btn.textContent = old;
+      if (status) status.innerHTML = 'Gmail access not granted yet. <a href="#" onclick="startSignIn();return false" style="color:var(--green)">Re-connect Google</a> first.';
+      return;
+    }
+    if (!r.ok || !data.ok) throw new Error(data.message || data.error || 'failed to start');
+    btn.textContent = '⏳ Importing last 30 days…';
+    if (status) status.textContent = 'On · importing last 30 days (trickling in over the next few hours)';
+  } catch (e) {
+    btn.disabled = false; btn.textContent = old;
+    showError('Backfill: ' + e.message);
   }
 }
 

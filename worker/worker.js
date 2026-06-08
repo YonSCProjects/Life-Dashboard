@@ -772,12 +772,23 @@ async function handleNotifyNow(request, env) {
 // ══════════════════════════════════════════════════
 // Pre-filter at Gmail so Claude only sees plausibly-relevant mail. Claude's
 // is_order_message flag does the final filtering on top of this.
-const GMAIL_QUERY = 'newer_than:2d -in:chats -category:promotions ' +
+const GMAIL_KEYWORDS = '-in:chats -category:promotions ' +
   '(tracking OR shipped OR shipment OR delivery OR delivered OR package OR parcel OR "out for delivery" OR ' +
   'order OR aliexpress OR ebay OR amazon OR "track your" OR ' +
   'משלוח OR חבילה OR מעקב OR נשלח OR "דואר ישראל" OR איסוף OR "הזמנה")';
-const GMAIL_MAX_PER_RUN = 8;     // cap Claude calls per session per cron tick
-const GMAIL_PROCESSED_CAP = 400; // ring buffer of seen message ids
+const GMAIL_QUERY = 'newer_than:2d ' + GMAIL_KEYWORDS; // steady-state window
+const GMAIL_MAX_PER_RUN = 8;          // cap Claude calls per session per cron tick (steady-state)
+const GMAIL_BACKFILL_BATCH = 8;       // messages per page processed per tick during a 30-day backfill
+const GMAIL_BACKFILL_DAYS = 31;       // one-time backfill window
+const GMAIL_PROCESSED_CAP = 400;      // steady-state ring buffer of seen message ids (2-day window only)
+const GMAIL_BACKFILL_SEEN_CAP = 5000; // separate seen-set for the backfill walk (lives only while it runs)
+const GMAIL_BACKFILL_PAGE_RETRIES = 3;// re-attempt a page this many ticks before skipping its stragglers
+
+// Gmail's after: operator wants YYYY/MM/DD. Absolute (not relative) so paging is stable across ticks.
+function gmailAfterDate(daysAgo) {
+  const d = new Date(Date.now() - daysAgo * 86400000);
+  return `${d.getUTCFullYear()}/${String(d.getUTCMonth() + 1).padStart(2, '0')}/${String(d.getUTCDate()).padStart(2, '0')}`;
+}
 
 function b64urlDecodeToString(s) {
   return new TextDecoder().decode(b64urlToBytes(s));
@@ -826,49 +837,92 @@ async function fetchGmailMessageText(accessToken, id) {
   return `From: ${h('from')}\nSubject: ${h('subject')}\n\n${bodyText}`.slice(0, 6000);
 }
 
-async function pollGmailForSession(env, sessionId, accessToken, cfg, kvKey) {
-  const listResp = await fetch(
-    'https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=20&q=' + encodeURIComponent(GMAIL_QUERY),
-    { headers: { Authorization: `Bearer ${accessToken}` } });
-  if (!listResp.ok) {
-    if (listResp.status === 403) { cfg.scopeError = true; await env.AUTH_TOKENS.put(kvKey, JSON.stringify(cfg)); }
-    return;
-  }
-  const listData = await listResp.json().catch(() => ({}));
-  const msgs = listData.messages || [];
-  if (!msgs.length) { cfg.lastPolledAt = Date.now(); await env.AUTH_TOKENS.put(kvKey, JSON.stringify(cfg)); return; }
+async function gmailList(accessToken, query, maxResults, pageToken) {
+  let u = 'https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=' + maxResults +
+    '&q=' + encodeURIComponent(query);
+  if (pageToken) u += '&pageToken=' + encodeURIComponent(pageToken);
+  const r = await fetch(u, { headers: { Authorization: `Bearer ${accessToken}` } });
+  return r;
+}
 
-  const processed = new Set(cfg.processedIds || []);
-  let existing = [];
-  try { existing = await fetchActiveOrders(accessToken); } catch { /* proceed without match context */ }
-
-  const newlySeen = [];
-  let handled = 0;
+// Process up to `budget` not-yet-seen messages from `msgs`. Mutates `processed`
+// (same-tick dedup) and `sink` (ids to persist as seen) and `existing` (match
+// context). Returns { handled, transient } — transient>0 means some messages hit
+// a retryable error (fetch/Claude/transient write) and were intentionally left
+// unseen, so a forward-only caller (backfill) should re-attempt the page.
+async function processGmailMessages(env, sessionId, accessToken, msgs, processed, sink, existing, budget) {
+  let handled = 0, transient = 0;
   for (const m of msgs) {
+    if (handled >= budget) break;
     if (processed.has(m.id)) continue;
-    if (handled >= GMAIL_MAX_PER_RUN) break;
     let text;
-    try { text = await fetchGmailMessageText(accessToken, m.id); } catch { continue; } // transient → retry next run
-    if (!text) continue;
+    try { text = await fetchGmailMessageText(accessToken, m.id); }
+    catch { transient++; continue; } // transient fetch → retry
+    if (!text) continue;             // permanently empty → skip, don't count as retryable
     handled++;
     let parsed;
     try { parsed = await parseShippingMessage(env, text, matchContext(existing)); }
-    catch { continue; } // Claude hiccup → leave unseen so it retries
-    if (!isIngestableParse(parsed)) { newlySeen.push(m.id); continue; } // junk → mark seen, don't re-Claude
+    catch { transient++; continue; } // Claude hiccup → retry
+    processed.add(m.id);             // evaluated → don't re-process in the other batch this tick
+    if (!isIngestableParse(parsed)) { sink.push(m.id); continue; } // junk → mark seen, don't re-Claude
     try {
       await ingestParsedOrder(env, sessionId, accessToken, parsed, text, existing);
-      newlySeen.push(m.id); // imported → mark seen
+      sink.push(m.id); // imported → mark seen
     } catch (e) {
       // Non-transient write failure (e.g. 400/404 bad data) fails identically every
       // tick — mark seen so it can't loop and re-spend Claude tokens forever.
       // Transient (401/403/429/5xx) → leave unseen to retry next tick.
       const st = e && e.status;
-      if (st >= 400 && st < 500 && st !== 401 && st !== 403 && st !== 429) newlySeen.push(m.id);
+      if (st >= 400 && st < 500 && st !== 401 && st !== 403 && st !== 429) sink.push(m.id);
+      else transient++;
     }
   }
+  return { handled, transient };
+}
 
-  const merged = [...(cfg.processedIds || []), ...newlySeen];
-  cfg.processedIds = merged.slice(-GMAIL_PROCESSED_CAP);
+async function pollGmailForSession(env, sessionId, accessToken, cfg, kvKey) {
+  // Seed same-tick dedup from BOTH the steady ring buffer and the backfill's own
+  // seen-set, but persist them to separate stores below so the high-churn backfill
+  // can never evict a steady id inside its 2-day re-list window.
+  const processed = new Set([...(cfg.processedIds || []), ...((cfg.backfill && cfg.backfill.seen) || [])]);
+  const steadySeen = [];
+  const backfillSeen = [];
+  let existing = [];
+  try { existing = await fetchActiveOrders(accessToken); } catch { /* proceed without match context */ }
+
+  // 1) Steady-state sweep over the last 2 days. Only a 403 scope error aborts the
+  //    tick; a transient list failure just skips the steady batch (backfill still runs).
+  const steadyResp = await gmailList(accessToken, GMAIL_QUERY, 20, null);
+  if (steadyResp.status === 403) { cfg.scopeError = true; await env.AUTH_TOKENS.put(kvKey, JSON.stringify(cfg)); return; }
+  const steadyMsgs = steadyResp.ok ? (((await steadyResp.json().catch(() => ({}))).messages) || []) : [];
+  await processGmailMessages(env, sessionId, accessToken, steadyMsgs, processed, steadySeen, existing, GMAIL_MAX_PER_RUN);
+
+  // 2) One-time 30-day backfill: one page per tick, forward-only. Hold the cursor
+  //    (capped) on a page that hit transient errors so its mail isn't silently dropped.
+  if (cfg.backfill && cfg.backfill.after) {
+    // older_than:2d keeps the backfill window DISJOINT from the steady newer_than:2d
+    // sweep, so a message can never be owned by both batches (no overlap re-import).
+    const q = 'after:' + cfg.backfill.after + ' older_than:2d ' + GMAIL_KEYWORDS;
+    const bfResp = await gmailList(accessToken, q, GMAIL_BACKFILL_BATCH, cfg.backfill.pageToken);
+    if (bfResp.ok) {
+      const bfData = await bfResp.json().catch(() => ({}));
+      const res = await processGmailMessages(env, sessionId, accessToken, bfData.messages || [], processed, backfillSeen, existing, GMAIL_BACKFILL_BATCH);
+      const retries = cfg.backfill.pageRetries || 0;
+      if (res.transient > 0 && retries < GMAIL_BACKFILL_PAGE_RETRIES) {
+        cfg.backfill.pageRetries = retries + 1; // hold page, re-attempt only its unfinished ids next tick
+      } else {
+        cfg.backfill.pageRetries = 0;
+        if (bfData.nextPageToken) cfg.backfill.pageToken = bfData.nextPageToken; // advance
+        else delete cfg.backfill;                                               // exhausted → revert to steady-state
+      }
+    }
+    // a transient backfill list error leaves cfg.backfill untouched → retry next tick
+  }
+
+  // Persist: steady ids in the shared buffer; backfill ids in their own store
+  // (discarded when cfg.backfill is deleted, since steady never re-lists that old mail).
+  cfg.processedIds = [...(cfg.processedIds || []), ...steadySeen].slice(-GMAIL_PROCESSED_CAP);
+  if (cfg.backfill) cfg.backfill.seen = [...(cfg.backfill.seen || []), ...backfillSeen].slice(-GMAIL_BACKFILL_SEEN_CAP);
   cfg.lastPolledAt = Date.now();
   cfg.sessionId = sessionId;
   delete cfg.scopeError;
@@ -897,26 +951,29 @@ async function runGmailPoll(env) {
   }
 }
 
-// ── /orders/gmail-config — enable/disable auto-import, or read status ──
-// POST { session_id }                     → { enabled, lastPolledAt }
-// POST { session_id, enabled: true|false} → set (enabling verifies gmail scope)
+// ── /orders/gmail-config — enable/disable auto-import, read status, or backfill ──
+// POST { session_id }                      → { enabled, lastPolledAt, backfill }
+// POST { session_id, enabled: true|false } → set (enabling verifies gmail scope)
+// POST { session_id, backfill: true }      → enable + kick off a one-time 30-day import
 async function handleGmailConfig(request, env) {
   const { body, error } = await authedBody(request, env);
   if (error) return error;
   const key = 'gmailpoll:' + body.session_id;
 
-  if (body.enabled === undefined) {
+  // Status read.
+  if (body.enabled === undefined && !body.backfill) {
     const raw = await env.AUTH_TOKENS.get(key);
     const cfg = raw ? (JSON.parse(raw) || {}) : {};
-    return json({ ok: true, enabled: !!cfg.enabled, lastPolledAt: cfg.lastPolledAt || 0 });
+    return json({ ok: true, enabled: !!cfg.enabled, lastPolledAt: cfg.lastPolledAt || 0, backfill: !!cfg.backfill });
   }
 
-  if (!body.enabled) {
+  // Disable.
+  if (body.enabled === false) {
     await env.AUTH_TOKENS.delete(key);
     return json({ ok: true, enabled: false });
   }
 
-  // Enabling: confirm the session actually granted gmail.readonly.
+  // Enable and/or start a backfill — both require confirming gmail.readonly is granted.
   const accessToken = await googleAccessTokenForSession(env, body.session_id);
   if (!accessToken) return json({ error: 'google_auth_failed' }, 401);
   const test = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
@@ -927,14 +984,19 @@ async function handleGmailConfig(request, env) {
 
   const existing = await env.AUTH_TOKENS.get(key);
   const prev = existing ? (JSON.parse(existing) || {}) : {};
-  await env.AUTH_TOKENS.put(key, JSON.stringify({
+  const next = {
     enabled: true,
     sessionId: body.session_id,
     processedIds: prev.processedIds || [],
     lastPolledAt: prev.lastPolledAt || 0,
     createdAt: prev.createdAt || Date.now(),
-  }));
-  return json({ ok: true, enabled: true });
+  };
+  // Starting a backfill is idempotent: never rewind an in-flight walk (preserve its
+  // advanced pageToken/seen). Only start a fresh one when none is already running.
+  if (prev.backfill) next.backfill = prev.backfill;
+  else if (body.backfill) next.backfill = { after: gmailAfterDate(GMAIL_BACKFILL_DAYS), pageToken: undefined, started: Date.now() };
+  await env.AUTH_TOKENS.put(key, JSON.stringify(next));
+  return json({ ok: true, enabled: true, backfill: !!next.backfill });
 }
 
 export default {
