@@ -3628,8 +3628,15 @@ async function parseOrderMessage() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: sessionId, text, existing_orders: existing }),
     });
-    const data = await r.json();
-    if (!r.ok || !data.parsed) throw new Error(data.error || 'parse failed');
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.parsed) {
+      const errMsg = typeof data.error === 'string'
+        ? data.error
+        : (data.error && (data.error.message || data.error.type))
+          || (data.details && (data.details.error?.message || data.details.message))
+          || ('parse failed (status ' + r.status + ' — did you redeploy the worker?)');
+      throw new Error(errMsg);
+    }
 
     orderParseDraft = {
       originalText: text,
