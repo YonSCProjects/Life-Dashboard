@@ -284,6 +284,39 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 }
 .reflection-actions { display: flex; gap: 6px; margin-top: 10px; }
 
+/* ── FOOD / CALORIES ── */
+.food-total-card {
+  background: var(--green); color: #fff; border-radius: 14px;
+  padding: 18px 20px; margin-bottom: 16px; text-align: center;
+}
+.food-total-card .food-total-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.85;
+}
+.food-total-card .food-total-num { font-size: 38px; font-weight: 700; line-height: 1.1; margin: 4px 0; }
+.food-total-card .food-total-sub { font-size: 12px; opacity: 0.85; }
+.food-day {
+  font-size: 10px; color: var(--text3); text-transform: uppercase;
+  letter-spacing: 0.05em; font-weight: 600; margin: 18px 0 8px;
+  display: flex; justify-content: space-between; align-items: baseline;
+}
+.food-day .food-day-total { color: var(--text2); font-weight: 700; }
+.food-item {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg3); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 12px; margin-bottom: 6px;
+}
+.food-item .food-name { flex: 1; font-size: 14px; word-break: break-word; }
+.food-item .food-cal {
+  width: 64px; text-align: right; font-size: 14px; font-weight: 600;
+  padding: 4px 6px; border-radius: 6px;
+}
+.food-item .food-unit { font-size: 11px; color: var(--text3); }
+.food-item .food-del {
+  background: none; border: none; color: var(--text3); font-size: 18px;
+  cursor: pointer; padding: 0 2px; line-height: 1;
+}
+.food-item.pending { opacity: 0.6; }
+
 /* ── LEARNING NOTES ── */
 .learning-card { cursor: pointer; }
 .learning-card .learning-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; word-break: break-word; }
@@ -587,6 +620,22 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
     </div>
   </div>
 
+  <!-- ═══ FOOD / CALORIES VIEW ═══ -->
+  <div class="content" id="food-view">
+    <div id="food-today-total"></div>
+    <div class="inbox-input-wrap">
+      <input class="inbox-input" id="food-input" placeholder="What did you eat? e.g. 2 eggs and toast"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();addFood()}">
+      <button class="btn btn-primary" style="width:100%;margin-top:8px" id="food-add-btn" onclick="addFood()">Add &amp; estimate calories</button>
+      <div style="font-size:11px;color:var(--text3);margin-top:6px">Claude estimates the calories — tap any number to correct it.</div>
+    </div>
+    <div id="food-list"></div>
+    <div class="empty" id="food-empty" style="display:none">
+      <div class="icon">🍽️</div>
+      <div class="msg">Log what you eat and see your calories add up through the day</div>
+    </div>
+  </div>
+
   <!-- ═══ LEARNING NOTES VIEW ═══ -->
   <div class="content" id="learning-view">
     <button class="btn btn-ghost" style="width:100%;margin-bottom:16px;border-style:dashed" onclick="showAddLearningNote()">+ New Note</button>
@@ -626,6 +675,9 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
     </button>
     <button class="nav-btn" onclick="switchTab('reflections', this)" data-tab="reflections">
       <span class="nav-icon">🌙</span>Reflect
+    </button>
+    <button class="nav-btn" onclick="switchTab('food', this)" data-tab="food">
+      <span class="nav-icon">🍽️</span>Food
     </button>
     <button class="nav-btn" onclick="switchTab('learning', this)" data-tab="learning">
       <span class="nav-icon">🎓</span>Learn
@@ -670,6 +722,7 @@ const P = {
   CG_PREPAY: '💸',    // pre-payment / advance
   REFLECT: '🌙',      // end-of-day reflection / thought
   LEARN: '🎓',        // learning note (course / lecture / meeting documentation)
+  FOOD: '🍽️',         // food / calorie log entry (one per item eaten)
   MEM: '🧠',          // Claude's curated memory document (singleton)
   ORDER: '📦',        // tracked online order (AliExpress, etc.) with shipping status
 };
@@ -683,6 +736,7 @@ let refreshTimer = null;
 let refreshInFlight = null; // de-dupe concurrent refreshes
 let tasks = [], shopItems = [], inboxItems = [], ideas = [], projects = [], customLists = [];
 let reflections = [];             // [{id, text, date, created}] — end-of-day thoughts
+let foodEntries = [];             // [{id, food, calories, date, created}] — calorie log
 let learningNotes = [];           // [{id, title, type, body, date, created}] — in-vivo course/lecture/meeting docs
 let memory = '';                  // Claude's curated memory document (markdown text)
 let memoryEventId = null;         // calendar event id of the memory doc (null if not yet created)
@@ -1221,7 +1275,7 @@ async function syncAll() {
   try {
     const [taskEvts, shopEvts, inboxEvts, ideaEvts, projEvts, listEvts, listItemEvts,
            cgCfgEvts, cgMonthEvts, cgVacEvts, cgHolEvts, cgSickEvts, cgPrepayEvts,
-           reflectEvts, learnEvts, memEvts, orderEvts] = await Promise.all([
+           reflectEvts, foodEvts, learnEvts, memEvts, orderEvts] = await Promise.all([
       fetchEvents(P.TASK),
       fetchEvents(P.SHOP),
       fetchEvents(P.INBOX),
@@ -1236,6 +1290,7 @@ async function syncAll() {
       fetchEvents(P.CG_SICK),
       fetchEvents(P.CG_PREPAY),
       fetchEvents(P.REFLECT),
+      fetchEvents(P.FOOD),
       fetchEvents(P.LEARN),
       fetchEvents(P.MEM),
       fetchEvents(P.ORDER),
@@ -1272,6 +1327,8 @@ async function syncAll() {
 
     reflections = reflectEvts.map(parseReflection)
       .sort((a, b) => new Date(b.created) - new Date(a.created));
+    foodEntries = foodEvts.map(parseFoodEntry)
+      .sort((a, b) => (b.date || '').localeCompare(a.date || '') || (new Date(b.created) - new Date(a.created)));
     learningNotes = learnEvts.map(parseLearningNote)
       .sort((a, b) => (b.date || '').localeCompare(a.date || '') || (new Date(b.created) - new Date(a.created)));
 
@@ -1724,6 +1781,18 @@ function parseReflection(event) {
   };
 }
 
+function parseFoodEntry(event) {
+  const food = (event.summary || '').replace(P.FOOD, '').trim();
+  const m = (event.description || '').match(/cal:\s*(-?\d+)/i);
+  return {
+    id: event.id,
+    food,
+    calories: m ? parseInt(m[1], 10) : 0,
+    date: eventDate(event),
+    created: event.created,
+  };
+}
+
 function parseLearningNote(event) {
   const title = (event.summary || '').replace(P.LEARN, '').trim();
   let lines = (event.description || '').split('\n');
@@ -1777,6 +1846,7 @@ function renderAll() {
   renderLists();
   renderCaregiver();
   renderReflections();
+  renderFood();
   renderLearning();
   renderOrders();
   updateBadges();
@@ -3314,6 +3384,131 @@ async function deleteReflection(id) {
 }
 
 // ══════════════════════════════════════════════════
+// FOOD / CALORIES — daily calorie log (AI-estimated, editable)
+// ══════════════════════════════════════════════════
+function todayStr() { return new Date().toISOString().split('T')[0]; }
+
+function formatFoodDate(dateStr) {
+  if (dateStr === todayStr()) return 'Today';
+  if (dateStr === new Date(Date.now() - 86400000).toISOString().split('T')[0]) return 'Yesterday';
+  return new Date(dateStr + 'T00:00:00').toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+}
+
+function renderFood() {
+  const container = document.getElementById('food-list');
+  const empty = document.getElementById('food-empty');
+  const totalCard = document.getElementById('food-today-total');
+  if (!container) return;
+
+  const today = todayStr();
+  const todayEntries = foodEntries.filter(e => e.date === today);
+  const todayTotal = todayEntries.reduce((s, e) => s + e.calories, 0);
+
+  totalCard.innerHTML = `
+    <div class="food-total-card">
+      <div class="food-total-label">Today's calories</div>
+      <div class="food-total-num">${todayTotal.toLocaleString()}</div>
+      <div class="food-total-sub">${todayEntries.length} item${todayEntries.length === 1 ? '' : 's'} logged · kcal</div>
+    </div>`;
+
+  if (foodEntries.length === 0) {
+    container.innerHTML = '';
+    empty.style.display = '';
+    return;
+  }
+  empty.style.display = 'none';
+
+  // Group entries by date, most recent day first.
+  const byDate = {};
+  for (const e of foodEntries) (byDate[e.date] = byDate[e.date] || []).push(e);
+  const dates = Object.keys(byDate).sort((a, b) => b.localeCompare(a));
+
+  container.innerHTML = dates.map(date => {
+    const items = byDate[date];
+    const total = items.reduce((s, e) => s + e.calories, 0);
+    return `
+      <div class="food-day">
+        <span>${esc(formatFoodDate(date))}</span>
+        <span class="food-day-total">${total.toLocaleString()} kcal</span>
+      </div>
+      ${items.map(e => `
+        <div class="food-item">
+          <span class="food-name">${esc(e.food)}</span>
+          <input class="food-cal" type="number" min="0" inputmode="numeric" value="${e.calories}"
+                 onclick="this.select()" onchange="updateFoodCalories('${e.id}', this.value)">
+          <span class="food-unit">kcal</span>
+          <button class="food-del" title="Delete" onclick="deleteFood('${e.id}')">&times;</button>
+        </div>
+      `).join('')}
+    `;
+  }).join('');
+}
+
+// Ask Claude (via the AI worker) for a calorie estimate. Returns a non-negative integer.
+async function estimateCalories(food) {
+  const worker = getWorkerUrl();
+  if (!worker) throw new Error('Connect your AI Worker (open ✨ Claude) to auto-estimate — saved with 0, just type the number.');
+  const res = await fetch(worker, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      max_tokens: 50,
+      system: 'You estimate calories. The user names a food or drink and an amount. Respond with ONLY a single integer — your best estimate of the total kilocalories. No words, no units, no ranges.',
+      messages: [{ role: 'user', content: food }],
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (data.error) throw new Error('AI estimate failed: ' + (data.error.message || 'error'));
+  const text = (data.content || []).map(c => c.text || '').join('');
+  const m = text.match(/-?\d+/);
+  if (!m) throw new Error('Could not read a calorie estimate.');
+  return Math.max(0, parseInt(m[0], 10));
+}
+
+async function addFood() {
+  const input = document.getElementById('food-input');
+  const food = input.value.trim();
+  if (!food) return;
+  const btn = document.getElementById('food-add-btn');
+  input.value = '';
+  btn.disabled = true; btn.textContent = 'Estimating…';
+  let calories = 0;
+  try {
+    calories = await estimateCalories(food);
+  } catch (e) {
+    showError(e.message); // keep going — save with 0 so the entry isn't lost; user can edit
+  }
+  try {
+    await createEvent(P.FOOD, food, 'cal: ' + calories, todayStr());
+    await syncAll();
+  } catch (e) {
+    input.value = food;
+    showError('Failed to add food: ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Add & estimate calories';
+  }
+}
+
+async function updateFoodCalories(id, value) {
+  const entry = foodEntries.find(e => e.id === id);
+  if (!entry) return;
+  const cal = Math.max(0, parseInt(value, 10) || 0);
+  entry.calories = cal; // optimistic — refresh the totals immediately
+  renderFood();
+  try {
+    await updateEvent(id, { description: 'cal: ' + cal });
+  } catch (e) { showError('Failed to update calories: ' + e.message); }
+}
+
+async function deleteFood(id) {
+  try {
+    await deleteEvent(id);
+    foodEntries = foodEntries.filter(e => e.id !== id);
+    renderFood();
+  } catch (e) { showError(e.message); }
+}
+
+// ══════════════════════════════════════════════════
 // LEARNING NOTES — in-vivo course / lecture / meeting docs
 // ══════════════════════════════════════════════════
 const LEARN_TYPES = ['Course', 'Lecture', 'Meeting', 'Other'];
@@ -4087,7 +4282,7 @@ function copyField(id) {
 const VIEW_TITLES = {
   inbox: 'Inbox', tasks: 'Tasks', shopping: 'Shopping',
   'projects-ideas': 'Projects / Ideas', lists: 'Lists',
-  caregiver: 'Caregiver', reflections: 'Reflections', learning: 'Learning Notes',
+  caregiver: 'Caregiver', reflections: 'Reflections', food: 'Food & Calories', learning: 'Learning Notes',
   orders: 'Orders',
 };
 
