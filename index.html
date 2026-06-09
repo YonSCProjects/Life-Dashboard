@@ -1822,6 +1822,7 @@ function parseOrder(event) {
     merchant: data.merchant || dashSplit[0] || 'Unknown',
     product: data.product || dashSplit.slice(1).join(' — ') || summaryText,
     trackingNumber: data.trackingNumber || '',
+    pickupLocation: data.pickupLocation || '',
     status: data.status || 'ordered',
     orderedAt: data.orderedAt || event.start?.date || '',
     expectedAt: data.expectedAt || null,
@@ -3671,13 +3672,14 @@ async function deleteLearningNote(id) {
 // ══════════════════════════════════════════════════
 // ORDERS (online order tracking with shipping status)
 // ══════════════════════════════════════════════════
-const ORDER_STATUSES = ['ordered', 'shipped', 'arrived', 'collected', 'lost'];
+const ORDER_STATUSES = ['ordered', 'shipped', 'arrived', 'awaiting_confirmation', 'collected', 'lost'];
 const ORDER_STATUS_LABEL = {
-  ordered:   { icon: '📋', label: 'Ordered',          tone: 'var(--text2)' },
-  shipped:   { icon: '🚚', label: 'In transit',       tone: 'var(--blue)' },
-  arrived:   { icon: '🔔', label: 'Ready to collect', tone: 'var(--orange)' },
-  collected: { icon: '✅', label: 'Collected',        tone: 'var(--green)' },
-  lost:      { icon: '❌', label: 'Lost / cancelled', tone: 'var(--red)' },
+  ordered:               { icon: '📋', label: 'Ordered',                tone: 'var(--text2)' },
+  shipped:               { icon: '🚚', label: 'In transit',             tone: 'var(--blue)' },
+  arrived:               { icon: '🔔', label: 'Ready to collect',       tone: 'var(--orange)' },
+  awaiting_confirmation: { icon: '⏳', label: 'Awaiting confirmation',  tone: 'var(--yellow)' },
+  collected:             { icon: '✅', label: 'Collected',              tone: 'var(--green)' },
+  lost:                  { icon: '❌', label: 'Lost / cancelled',       tone: 'var(--red)' },
 };
 
 function isOrderActive(o) { return o.status !== 'collected' && o.status !== 'lost'; }
@@ -3696,6 +3698,7 @@ function orderEventBody(o) {
     merchant: o.merchant || '',
     product: o.product || '',
     trackingNumber: o.trackingNumber || '',
+    pickupLocation: o.pickupLocation || '',
     status: o.status || 'ordered',
     orderedAt: o.orderedAt || '',
     expectedAt: o.expectedAt || null,
@@ -3749,6 +3752,7 @@ function renderOrders() {
 
   body.innerHTML = `
     ${sectionFor('arrived', 'Ready to collect')}
+    ${sectionFor('awaiting_confirmation', 'Awaiting confirmation')}
     ${sectionFor('shipped', 'In transit')}
     ${sectionFor('ordered', 'Ordered')}
     ${collectedBlock}
@@ -3761,6 +3765,13 @@ function renderOrderCard(o) {
   const tracking = o.trackingNumber ? `<div style="font-size:11px;color:var(--text3);font-family:'JetBrains Mono',monospace">#${esc(o.trackingNumber)}</div>` : '';
   const expected = o.expectedAt && o.status !== 'arrived' && o.status !== 'collected'
     ? `<div style="font-size:11px;color:var(--text3)">expected ${o.expectedAt}</div>` : '';
+  // Highlight pickup location when the package is actually waiting to be collected;
+  // for in-transit/ordered we still show it (it's where it WILL go) but more quietly.
+  const pickup = o.pickupLocation
+    ? (o.status === 'arrived'
+        ? `<div style="font-size:13px;color:${lbl.tone};font-weight:600;margin-top:4px">📍 ${esc(o.pickupLocation)}</div>`
+        : `<div style="font-size:11px;color:var(--text3);margin-top:2px">📍 ${esc(o.pickupLocation)}</div>`)
+    : '';
   return `
     <div class="card" style="padding:12px;margin-bottom:8px;cursor:pointer;border-left:3px solid ${lbl.tone}"
          onclick="openOrderDetail('${o.id}')">
@@ -3768,6 +3779,7 @@ function renderOrderCard(o) {
         <div style="flex:1;min-width:0">
           <div style="font-weight:600;font-size:14px">${esc(o.merchant || 'Order')}</div>
           ${o.product ? `<div style="font-size:13px;color:var(--text2);margin-top:2px">${esc(o.product)}</div>` : ''}
+          ${pickup}
           ${tracking}
           ${expected}
         </div>
@@ -3862,9 +3874,10 @@ function renderOrderParseReview() {
         ${matched ? '✏️ Updating <b>' + esc(matched.merchant) + (matched.product ? ' — ' + esc(matched.product) : '') + '</b>' : '✨ Creating new order'}
         <span style="margin-left:8px;padding:2px 6px;border-radius:4px;background:rgba(168,132,47,0.15)">${esc(conf)} confidence</span>
       </div>
-      ${renderOrderEditField('Merchant',   'op-merchant',  p.merchant || '')}
-      ${renderOrderEditField('Product',    'op-product',   p.product || '')}
-      ${renderOrderEditField('Tracking #', 'op-tracking',  p.tracking_number || '')}
+      ${renderOrderEditField('Merchant',         'op-merchant',  p.merchant || '')}
+      ${renderOrderEditField('Product',          'op-product',   p.product || '')}
+      ${renderOrderEditField('Tracking #',       'op-tracking',  p.tracking_number || '')}
+      ${renderOrderEditField('Pickup location',  'op-pickup',    p.pickup_location || '')}
       ${renderOrderStatusSelect('op-status', p.status || 'shipped')}
       ${renderOrderEditField('Ordered (YYYY-MM-DD)',  'op-ordered',  p.ordered_at || '')}
       ${renderOrderEditField('Expected (YYYY-MM-DD)', 'op-expected', p.expected_at || '')}
@@ -3899,6 +3912,7 @@ async function saveOrderFromParse() {
   const merchant  = document.getElementById('op-merchant').value.trim();
   const product   = document.getElementById('op-product').value.trim();
   const tracking  = document.getElementById('op-tracking').value.trim();
+  const pickup    = document.getElementById('op-pickup').value.trim();
   const status    = document.getElementById('op-status').value;
   const orderedAt = document.getElementById('op-ordered').value.trim();
   const expectedAt = document.getElementById('op-expected').value.trim() || null;
@@ -3916,6 +3930,7 @@ async function saveOrderFromParse() {
         merchant: merchant || existing.merchant,
         product: product || existing.product,
         trackingNumber: tracking || existing.trackingNumber,
+        pickupLocation: pickup || existing.pickupLocation || '',
         status,
         orderedAt: orderedAt || existing.orderedAt,
         expectedAt: expectedAt || existing.expectedAt,
@@ -3929,11 +3944,11 @@ async function saveOrderFromParse() {
       orderParseDraft = null;
       closeDetail();
       await syncAll();
-      if (prevStatus !== 'arrived' && status === 'arrived') notifyArrivalImmediate(updated);
+      if (prevStatus !== status) notifyStatusChangeImmediate(updated, status);
     } else {
       const ord = {
         merchant: merchant || 'Order',
-        product, trackingNumber: tracking, status,
+        product, trackingNumber: tracking, pickupLocation: pickup, status,
         orderedAt: orderedAt || new Date().toISOString().slice(0, 10),
         expectedAt,
         statusHistory: [{ at: sourceMsg.at, status, note: 'Initial' }],
@@ -3943,9 +3958,9 @@ async function saveOrderFromParse() {
       orderParseDraft = null;
       closeDetail();
       await syncAll();
-      if (status === 'arrived' && ev?.id) {
+      if (ev?.id) {
         const just = orders.find(o => o.id === ev.id);
-        if (just) notifyArrivalImmediate(just);
+        if (just) notifyStatusChangeImmediate(just, status);
       }
     }
   } catch (e) { showError(e.message); }
@@ -3961,9 +3976,10 @@ function openOrderManualForm() {
       <button class="btn btn-sm btn-primary" onclick="saveManualOrder()" id="order-manual-save">Save</button>
     </div>
     <div class="detail-body">
-      ${renderOrderEditField('Merchant',   'om-merchant',  '')}
-      ${renderOrderEditField('Product',    'om-product',   '')}
-      ${renderOrderEditField('Tracking #', 'om-tracking',  '')}
+      ${renderOrderEditField('Merchant',        'om-merchant',  '')}
+      ${renderOrderEditField('Product',         'om-product',   '')}
+      ${renderOrderEditField('Tracking #',      'om-tracking',  '')}
+      ${renderOrderEditField('Pickup location', 'om-pickup',    '')}
       ${renderOrderStatusSelect('om-status', 'ordered')}
       ${renderOrderEditField('Ordered (YYYY-MM-DD)',  'om-ordered',  today)}
       ${renderOrderEditField('Expected (YYYY-MM-DD)', 'om-expected', '')}
@@ -3984,6 +4000,7 @@ async function saveManualOrder() {
     merchant,
     product: document.getElementById('om-product').value.trim(),
     trackingNumber: document.getElementById('om-tracking').value.trim(),
+    pickupLocation: document.getElementById('om-pickup').value.trim(),
     status: document.getElementById('om-status').value,
     orderedAt: document.getElementById('om-ordered').value.trim() || new Date().toISOString().slice(0, 10),
     expectedAt: document.getElementById('om-expected').value.trim() || null,
@@ -3996,9 +4013,9 @@ async function saveManualOrder() {
     const ev = await createEvent(P.ORDER, getOrderSummary(ord), orderEventBody(ord), ord.orderedAt);
     closeDetail();
     await syncAll();
-    if (ord.status === 'arrived' && ev?.id) {
+    if (ev?.id) {
       const just = orders.find(o => o.id === ev.id);
-      if (just) notifyArrivalImmediate(just);
+      if (just) notifyStatusChangeImmediate(just, ord.status);
     }
   } catch (e) {
     showError(e.message);
@@ -4022,12 +4039,13 @@ function openOrderDetail(id) {
         ${lbl.icon} ${lbl.label}
       </div>
 
-      ${renderOrderEditField('Merchant',   'od-merchant',  o.merchant)}
-      ${renderOrderEditField('Product',    'od-product',   o.product)}
-      ${renderOrderEditField('Tracking #', 'od-tracking',  o.trackingNumber)}
+      ${renderOrderEditField('Merchant',        'od-merchant',  o.merchant)}
+      ${renderOrderEditField('Product',         'od-product',   o.product)}
+      ${renderOrderEditField('Tracking #',      'od-tracking',  o.trackingNumber)}
+      ${renderOrderEditField('Pickup location', 'od-pickup',    o.pickupLocation || '')}
       ${renderOrderStatusSelect('od-status', o.status)}
-      ${renderOrderEditField('Ordered',    'od-ordered',   o.orderedAt || '')}
-      ${renderOrderEditField('Expected',   'od-expected',  o.expectedAt || '')}
+      ${renderOrderEditField('Ordered',         'od-ordered',   o.orderedAt || '')}
+      ${renderOrderEditField('Expected',        'od-expected',  o.expectedAt || '')}
       <div style="margin-bottom:8px">
         <label style="font-size:11px;color:var(--text3);display:block;margin-bottom:2px">Notes</label>
         <textarea id="od-notes" rows="3" style="font-size:13px;width:100%">${esc(o.notes || '')}</textarea>
@@ -4070,6 +4088,7 @@ async function saveOrderEdit(id) {
     merchant: document.getElementById('od-merchant').value.trim() || existing.merchant,
     product: document.getElementById('od-product').value.trim(),
     trackingNumber: document.getElementById('od-tracking').value.trim(),
+    pickupLocation: document.getElementById('od-pickup').value.trim(),
     status: newStatus,
     orderedAt: document.getElementById('od-ordered').value.trim() || existing.orderedAt,
     expectedAt: document.getElementById('od-expected').value.trim() || null,
@@ -4085,7 +4104,7 @@ async function saveOrderEdit(id) {
     });
     closeDetail();
     await syncAll();
-    if (prevStatus !== 'arrived' && newStatus === 'arrived') notifyArrivalImmediate(updated);
+    if (prevStatus !== newStatus) notifyStatusChangeImmediate(updated, newStatus);
   } catch (e) { showError(e.message); }
 }
 
@@ -4117,17 +4136,25 @@ async function deleteOrder(id) {
   } catch (e) { showError(e.message); }
 }
 
-// ── Immediate push when an order becomes 'arrived' ──
-async function notifyArrivalImmediate(order) {
+// ── Immediate push when an order changes status (only fires for the statuses
+// that actually need user attention right now) ──
+async function notifyStatusChangeImmediate(order, status) {
   if (!getWorkerUrl() || !sessionId) return;
+  let title, body;
+  const label = (order.merchant || 'Order') + (order.product ? ' — ' + order.product : '');
+  if (status === 'arrived') {
+    title = '📦 Package ready to collect';
+    body = label + (order.pickupLocation ? '\n📍 ' + order.pickupLocation : '');
+  } else if (status === 'awaiting_confirmation') {
+    title = '📦 Confirm package delivery';
+    body = label;
+  } else {
+    return;
+  }
   try {
     await fetch(workerEndpoint('/push/notify-now'), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session_id: sessionId,
-        title: '📦 Package ready to collect',
-        body: (order.merchant || 'Order') + (order.product ? ' — ' + order.product : ''),
-      }),
+      body: JSON.stringify({ session_id: sessionId, title, body }),
     });
   } catch (e) { /* best-effort, non-blocking */ }
 }
@@ -5483,6 +5510,7 @@ async function postPushState(sub) {
         id: o.id,
         merchant: o.merchant || 'Order',
         product: o.product || '',
+        pickupLocation: o.pickupLocation || '',
       })),
     }),
   }).catch(() => {});
