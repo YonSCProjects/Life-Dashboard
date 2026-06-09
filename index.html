@@ -3453,6 +3453,7 @@ async function estimateCalories(food) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 50,
       system: 'You estimate calories. The user names a food or drink and an amount. Respond with ONLY a single integer — your best estimate of the total kilocalories. No words, no units, no ranges.',
       messages: [{ role: 'user', content: food }],
@@ -4498,7 +4499,10 @@ function buildSystemPrompt() {
   const memoryBlock = memory
     ? `\n== YOUR MEMORY (carried over from past conversations) ==\n${memory}\n`
     : `\n== YOUR MEMORY ==\n(empty — nothing has been remembered yet)\n`;
-  return `You are an AI assistant embedded in a personal Life Dashboard app. Today is ${today}. The user's timezone is ${tz}.
+
+  // Split into two blocks so the stable prefix (role + instructions + memory)
+  // gets prompt-cached. The dynamic data block changes every turn and isn't cached.
+  const cachedPrefix = `You are an AI assistant embedded in a personal Life Dashboard app. Today is ${today}. The user's timezone is ${tz}.
 
 You help the user manage their life: find tasks, analyze projects, brainstorm ideas, plan their day, triage their inbox, review their end-of-day reflections, organize their notes, and manage their Google Calendar.
 
@@ -4513,9 +4517,9 @@ When something is worth carrying forward — a decision, ongoing work on an idea
 
 Do not update memory for trivia or for things already represented in tasks/ideas/reflections — only for cross-session insights, decisions, and progress the user would want you to remember next time. Do not announce memory updates in your reply unless the user asks; just do it.${memoryBlock}
 
-Be concise, actionable, and friendly. Use short responses. When suggesting actions, be specific to their actual data.
+Be concise, actionable, and friendly. Use short responses. When suggesting actions, be specific to their actual data.`;
 
-== CURRENT DATA ==
+  const dynamicData = `== CURRENT DATA ==
 
 INBOX (${inboxItems.length} unprocessed):
 ${inboxList}
@@ -4546,6 +4550,11 @@ ${learningList}
 
 RECENT REFLECTIONS (${reflections.length} total, showing latest ${Math.min(10, reflections.length)}):
 ${reflectionList}`;
+
+  return [
+    { type: 'text', text: cachedPrefix, cache_control: { type: 'ephemeral' } },
+    { type: 'text', text: dynamicData },
+  ];
 }
 
 // ── Claude tool use: Google Calendar ──
@@ -5203,7 +5212,8 @@ async function aiSend() {
           model: 'claude-sonnet-4-20250514',
           max_tokens: 2048,
           system,
-          tools: CALENDAR_TOOLS,
+          tools: CALENDAR_TOOLS.map((t, i, arr) =>
+            i === arr.length - 1 ? { ...t, cache_control: { type: 'ephemeral' } } : t),
           messages: aiMessages.filter(m => m.role === 'user' || m.role === 'assistant'),
         }),
       });

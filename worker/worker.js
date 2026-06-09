@@ -463,7 +463,7 @@ You MUST call the parse_shipping_message tool exactly once with your best extrac
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 1024,
       system,
       tools: [ORDER_PARSE_TOOL],
