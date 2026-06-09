@@ -641,8 +641,8 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
     <button class="btn btn-ghost" style="width:100%;margin-bottom:16px;border-style:dashed" onclick="showAddLearningNote()">+ New Note</button>
     <div id="learning-list"></div>
     <div class="empty" id="learning-empty" style="display:none">
-      <div class="icon">🎓</div>
-      <div class="msg">Document courses, lectures and meetings live — Claude can help organize them</div>
+      <div class="icon">📝</div>
+      <div class="msg">Take notes live — classes, meetings, conversations, anything worth keeping. Claude can help organize them.</div>
     </div>
   </div>
 
@@ -680,7 +680,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
       <span class="nav-icon">🍽️</span>Food
     </button>
     <button class="nav-btn" onclick="switchTab('learning', this)" data-tab="learning">
-      <span class="nav-icon">🎓</span>Learn
+      <span class="nav-icon">📝</span>Notes
     </button>
     <button class="nav-btn" onclick="switchTab('orders', this)" data-tab="orders">
       <span class="nav-icon">📦</span>Orders
@@ -3511,7 +3511,7 @@ async function deleteFood(id) {
 // ══════════════════════════════════════════════════
 // LEARNING NOTES — in-vivo course / lecture / meeting docs
 // ══════════════════════════════════════════════════
-const LEARN_TYPES = ['Course', 'Lecture', 'Meeting', 'Other'];
+const LEARN_TYPES = ['Course', 'Lecture', 'Meeting', 'Conversation', 'Other'];
 const LEARN_TYPE_COLORS = { Course: '#5b7fb0', Lecture: '#7b85bf', Meeting: '#3f9aa6', Other: '#8b94a1' };
 let learningSaveTimer = null;
 
@@ -3554,7 +3554,7 @@ function showAddLearningNote() {
     <div class="detail-body">
       <div style="margin-bottom:12px">
         <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">TITLE</label>
-        <input id="new-learning-title" placeholder="e.g. Algorithms — Lecture 4, Team sync">
+        <input id="new-learning-title" placeholder="e.g. Algorithms lecture, Team sync, Chat with Dad">
       </div>
       <div style="display:flex;gap:8px">
         <div style="flex:1">
@@ -4282,7 +4282,7 @@ function copyField(id) {
 const VIEW_TITLES = {
   inbox: 'Inbox', tasks: 'Tasks', shopping: 'Shopping',
   'projects-ideas': 'Projects / Ideas', lists: 'Lists',
-  caregiver: 'Caregiver', reflections: 'Reflections', food: 'Food & Calories', learning: 'Learning Notes',
+  caregiver: 'Caregiver', reflections: 'Reflections', food: 'Food & Calories', learning: 'Notes',
   orders: 'Orders',
 };
 
@@ -4473,11 +4473,11 @@ function buildSystemPrompt() {
     : `\n== YOUR MEMORY ==\n(empty — nothing has been remembered yet)\n`;
   return `You are an AI assistant embedded in a personal Life Dashboard app. Today is ${today}. The user's timezone is ${tz}.
 
-You help the user manage their life: find tasks, analyze projects, brainstorm ideas, plan their day, triage their inbox, review their end-of-day reflections, organize their learning notes, and manage their Google Calendar.
+You help the user manage their life: find tasks, analyze projects, brainstorm ideas, plan their day, triage their inbox, review their end-of-day reflections, organize their notes, and manage their Google Calendar.
 
 You have tools to read, create, edit, and delete real Google Calendar events. Use them whenever the user asks about scheduling, meetings, appointments, or anything calendar-related. Always confirm what you did in plain language after a successful tool call. When the user mentions a relative time ("tomorrow at 3", "next Monday"), resolve it using today's date and the user's timezone, then pass an ISO 8601 datetime to the tool. For all-day events, pass a YYYY-MM-DD date.
 
-You also have tools for the user's learning notes — documentation they type live during courses, lectures, and meetings. Use list_learning_notes to read full note content before analyzing or summarizing. When the user asks you to organize, restructure, clean up, summarize, or expand their notes, use update_learning_note to rewrite the relevant note, or create_learning_note to split content out. Use list_reflections to read their daily reflections when they ask you to look back, find patterns, or summarize how things have been going.
+You also have tools for the user's notes — anything they capture live, including courses, lectures, meetings, conversations, and miscellaneous thoughts worth keeping. Use list_learning_notes to read full note content before analyzing or summarizing. When the user asks you to organize, restructure, clean up, summarize, or expand their notes, use update_learning_note to rewrite the relevant note, or create_learning_note to split content out. Use list_reflections to read their daily reflections when they ask you to look back, find patterns, or summarize how things have been going.
 
 == MEMORY — IMPORTANT ==
 You maintain a small curated memory document that is carried across every conversation. Read it at the start of every chat (it's included below) and use it to pick up where past conversations left off. Treat it as your single source of long-term continuity with the user.
@@ -4514,7 +4514,7 @@ ${shopList}
 CUSTOM LISTS (${customLists.length}):
 ${listsSummary}
 
-LEARNING NOTES (${learningNotes.length} — previews only, use list_learning_notes for full content):
+NOTES (${learningNotes.length} — previews only, use list_learning_notes for full content):
 ${learningList}
 
 RECENT REFLECTIONS (${reflections.length} total, showing latest ${Math.min(10, reflections.length)}):
@@ -4602,7 +4602,7 @@ const CALENDAR_TOOLS = [
   },
   {
     name: 'list_learning_notes',
-    description: "Get the user's learning notes (documentation typed live during courses, lectures, and meetings) including full body text. Use this before analyzing, summarizing, or reorganizing their notes.",
+    description: "Get the user's notes (anything captured live — courses, lectures, meetings, conversations, miscellaneous thoughts) including full body text. Use this before analyzing, summarizing, or reorganizing their notes.",
     input_schema: {
       type: 'object',
       properties: {
@@ -4612,21 +4612,21 @@ const CALENDAR_TOOLS = [
   },
   {
     name: 'create_learning_note',
-    description: 'Create a new learning note. Use when the user asks you to start a fresh note or split existing content into a separate note.',
+    description: 'Create a new note. Use when the user asks you to start a fresh note or split existing content into a separate note.',
     input_schema: {
       type: 'object',
       required: ['title', 'body'],
       properties: {
-        title: { type: 'string', description: 'Short note title, e.g. "Algorithms — Lecture 4".' },
+        title: { type: 'string', description: 'Short note title, e.g. "Algorithms lecture", "Chat with Sam".' },
         body: { type: 'string', description: 'The note content.' },
-        type: { type: 'string', enum: ['Course', 'Lecture', 'Meeting', 'Other'], description: 'Defaults to Other.' },
+        type: { type: 'string', enum: ['Course', 'Lecture', 'Meeting', 'Conversation', 'Other'], description: 'Defaults to Other.' },
         date: { type: 'string', description: 'Session date as YYYY-MM-DD. Defaults to today.' },
       },
     },
   },
   {
     name: 'update_learning_note',
-    description: "Edit an existing learning note — rewrite or reorganize its body, fix its title/type/date. Get note_id from list_learning_notes first. Only the fields you provide are changed.",
+    description: "Edit an existing note — rewrite or reorganize its body, fix its title/type/date. Get note_id from list_learning_notes first. Only the fields you provide are changed.",
     input_schema: {
       type: 'object',
       required: ['note_id'],
@@ -4634,7 +4634,7 @@ const CALENDAR_TOOLS = [
         note_id: { type: 'string' },
         title: { type: 'string' },
         body: { type: 'string', description: 'Replaces the entire note body.' },
-        type: { type: 'string', enum: ['Course', 'Lecture', 'Meeting', 'Other'] },
+        type: { type: 'string', enum: ['Course', 'Lecture', 'Meeting', 'Conversation', 'Other'] },
         date: { type: 'string', description: 'YYYY-MM-DD.' },
       },
     },
@@ -4782,7 +4782,7 @@ async function toolCreateLearningNote({ title, body, type, date }) {
 async function toolUpdateLearningNote({ note_id, title, body, type, date }) {
   if (!note_id) throw new Error('note_id is required');
   const note = learningNotes.find(n => n.id === note_id);
-  if (!note) throw new Error('Learning note not found: ' + note_id);
+  if (!note) throw new Error('Note not found: ' + note_id);
   const newTitle = title != null ? title : note.title;
   const newType = type != null ? type : note.type;
   const newBody = body != null ? body : note.body;
