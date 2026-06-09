@@ -237,7 +237,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 }
 .add-form .row { display: flex; gap: 8px; margin-bottom: 10px; }
 
-/* ── INBOX ── */
+/* ── QUICK-CAPTURE INPUT (shared by reflections + food) ── */
 .inbox-input-wrap { position: relative; margin-bottom: 20px; }
 .inbox-input {
   width: 100%; padding: 16px; padding-right: 52px; border-radius: 14px;
@@ -506,7 +506,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
   <div class="header">
     <div class="header-row">
       <div>
-        <h1 id="view-title">Inbox</h1>
+        <h1 id="view-title">Tasks</h1>
         <p class="date" id="date-display"></p>
       </div>
       <div style="display:flex;gap:6px;align-items:center">
@@ -531,18 +531,8 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 
   <div id="offline-banner" style="display:none"></div>
 
-  <!-- ═══ INBOX VIEW ═══ -->
-  <div class="content active" id="inbox-view">
-    <div class="inbox-input-wrap">
-      <input class="inbox-input" id="inbox-input" placeholder="What's on your mind?"
-             onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();captureInbox()}">
-      <button class="inbox-send" onclick="captureInbox()">+</button>
-    </div>
-    <div id="inbox-list"></div>
-  </div>
-
-  <!-- ═══ TASKS VIEW ═══ -->
-  <div class="content" id="tasks-view">
+  <!-- ═══ TASKS VIEW (home) ═══ -->
+  <div class="content active" id="tasks-view">
     <div class="pills" id="category-pills"></div>
     <button class="btn btn-ghost" style="width:100%;margin-bottom:16px;border-style:dashed" onclick="toggleAddForm()" id="add-btn">+ Add Task</button>
     <div id="add-form-container"></div>
@@ -658,10 +648,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 
   <!-- BOTTOM NAV -->
   <nav class="bottom-nav">
-    <button class="nav-btn active" onclick="switchTab('inbox', this)" data-tab="inbox">
-      <span class="nav-icon">📥</span>Inbox
-    </button>
-    <button class="nav-btn" onclick="switchTab('tasks', this)" data-tab="tasks">
+    <button class="nav-btn active" onclick="switchTab('tasks', this)" data-tab="tasks">
       <span class="nav-icon">✅</span>Tasks
     </button>
     <button class="nav-btn" onclick="switchTab('projects-ideas', this)" data-tab="projects-ideas">
@@ -734,7 +721,7 @@ let tokenExpiresAt = 0;
 let sessionId = null;
 let refreshTimer = null;
 let refreshInFlight = null; // de-dupe concurrent refreshes
-let tasks = [], shopItems = [], inboxItems = [], ideas = [], projects = [], customLists = [];
+let tasks = [], shopItems = [], ideas = [], projects = [], customLists = [];
 let reflections = [];             // [{id, text, date, created}] — end-of-day thoughts
 let foodEntries = [];             // [{id, food, calories, date, created}] — calorie log
 let learningNotes = [];           // [{id, title, type, body, date, created}] — in-vivo course/lecture/meeting docs
@@ -751,7 +738,7 @@ let caregiverPrepays = [];        // [{id, date, amount, note}]
 let caregiverDraft = null;        // unsaved current-month inputs (kept in memory while user types)
 let activeCategory = 'all';
 let showAddFormVisible = false;
-let currentTab = 'inbox';
+let currentTab = 'tasks';
 let showCompletedTasks = false;
 let searchVisible = false;
 
@@ -1127,7 +1114,7 @@ async function fetchEvents(prefix) {
 const IDB_NAME = 'life-dash-offline';
 const IDB_VERSION = 1;
 const CACHE_KEYS = [
-  'tasks','shopItems','inboxItems','ideas','projects','customLists',
+  'tasks','shopItems','ideas','projects','customLists',
   'caregiverConfig','caregiverMonths','caregiverVacation','caregiverHoliday','caregiverSick','caregiverPrepays',
   'reflections','learningNotes','memory','memoryEventId','orders','lastSyncAt',
 ];
@@ -1193,7 +1180,7 @@ async function offlineCacheClear() {
 
 async function saveCacheSnapshot() {
   await offlineCacheSet({
-    tasks, shopItems, inboxItems, ideas, projects, customLists,
+    tasks, shopItems, ideas, projects, customLists,
     caregiverConfig, caregiverMonths, caregiverVacation, caregiverHoliday, caregiverSick, caregiverPrepays,
     reflections, learningNotes, memory, memoryEventId, orders,
     lastSyncAt: Date.now(),
@@ -1204,7 +1191,6 @@ async function loadCacheSnapshot() {
   const c = await offlineCacheGetAll();
   if (c.tasks !== undefined)            tasks = c.tasks;
   if (c.shopItems !== undefined)        shopItems = c.shopItems;
-  if (c.inboxItems !== undefined)       inboxItems = c.inboxItems;
   if (c.ideas !== undefined)            ideas = c.ideas;
   if (c.projects !== undefined)         projects = c.projects;
   if (c.customLists !== undefined)      customLists = c.customLists;
@@ -1268,17 +1254,33 @@ window.addEventListener('offline', () => {
 // ══════════════════════════════════════════════════
 // SYNC ALL
 // ══════════════════════════════════════════════════
+// One-shot: any leftover 📥 inbox events (from before the inbox was removed)
+// are auto-converted to default ✅ tasks so nothing the user captured is lost.
+// Idempotent — once the inbox is empty this fetches an empty list and no-ops.
+async function migrateInboxToTasks() {
+  const events = await fetchEvents(P.INBOX);
+  if (!events.length) return;
+  await Promise.all(events.map(e => {
+    const text = (e.summary || '').replace(P.INBOX, '').trim();
+    const notes = (e.description || '').trim();
+    return updateEvent(e.id, {
+      summary: P.TASK + ' ' + text,
+      description: 'Tasks | Medium priority' + (notes ? '\n' + notes : ''),
+    });
+  }));
+}
+
 async function syncAll() {
   const btn = document.getElementById('sync-btn');
   btn.textContent = '...';
   btn.disabled = true;
   try {
-    const [taskEvts, shopEvts, inboxEvts, ideaEvts, projEvts, listEvts, listItemEvts,
+    await migrateInboxToTasks();
+    const [taskEvts, shopEvts, ideaEvts, projEvts, listEvts, listItemEvts,
            cgCfgEvts, cgMonthEvts, cgVacEvts, cgHolEvts, cgSickEvts, cgPrepayEvts,
            reflectEvts, foodEvts, learnEvts, memEvts, orderEvts] = await Promise.all([
       fetchEvents(P.TASK),
       fetchEvents(P.SHOP),
-      fetchEvents(P.INBOX),
       fetchEvents(P.IDEA),
       fetchEvents(P.PROJECT),
       fetchEvents(P.LIST),
@@ -1300,12 +1302,6 @@ async function syncAll() {
     tasks.sort(compareTasks);
 
     shopItems = shopEvts.filter(e => !(e.summary || '').includes(P.TASK)).map(parseShopEvent);
-
-    inboxItems = inboxEvts.filter(e => {
-      const s = e.summary || '';
-      return !s.includes(P.TASK) && !s.includes(P.IDEA) && !s.includes(P.SHOP);
-    }).map(parseInboxEvent);
-    inboxItems.sort((a, b) => new Date(b.created) - new Date(a.created));
 
     ideas = ideaEvts.map(parseIdeaEvent);
     ideas.sort((a, b) => new Date(b.created) - new Date(a.created));
@@ -1710,12 +1706,6 @@ function parseShopEvent(event) {
   };
 }
 
-function parseInboxEvent(event) {
-  const text = (event.summary || '').replace(P.INBOX, '').trim();
-  const desc = event.description || '';
-  return { id: event.id, text, notes: desc, created: event.created };
-}
-
 function parseIdeaEvent(event) {
   const text = (event.summary || '').replace(P.IDEA, '').trim();
   const desc = event.description || '';
@@ -1838,7 +1828,6 @@ function parseOrder(event) {
 // RENDER ALL
 // ══════════════════════════════════════════════════
 function renderAll() {
-  renderInbox();
   renderPills();
   renderTasks();
   renderShop();
@@ -1873,10 +1862,6 @@ function doSearch(query) {
   const q = query.toLowerCase();
   const results = [];
 
-  inboxItems.forEach(i => {
-    if (i.text.toLowerCase().includes(q))
-      results.push({ type: 'inbox', icon: '📥', text: i.text, id: i.id });
-  });
   tasks.forEach(t => {
     if (t.title.toLowerCase().includes(q) || (t.notes||'').toLowerCase().includes(q))
       results.push({ type: 'task', icon: '✅', text: t.title, id: t.id, done: t.done });
@@ -1925,7 +1910,7 @@ function doSearch(query) {
 
 function goToSearchResult(type, id) {
   toggleSearch();
-  const tabMap = { inbox: 'inbox', task: 'tasks', shop: 'shopping', idea: 'projects-ideas', project: 'projects-ideas', list: 'lists', 'list item': 'lists', reflection: 'reflections', note: 'learning' };
+  const tabMap = { task: 'tasks', shop: 'shopping', idea: 'projects-ideas', project: 'projects-ideas', list: 'lists', 'list item': 'lists', reflection: 'reflections', note: 'learning' };
   const tab = tabMap[type];
   if (tab) switchTab(tab, document.querySelector(`[data-tab="${tab}"]`));
   if (type === 'task') editTask(id);
@@ -1934,81 +1919,6 @@ function goToSearchResult(type, id) {
   else if (type === 'list' || type === 'list item') openList(id);
   else if (type === 'reflection') editReflection(id);
   else if (type === 'note') openLearningNote(id);
-}
-
-// ══════════════════════════════════════════════════
-// INBOX
-// ══════════════════════════════════════════════════
-async function captureInbox() {
-  const input = document.getElementById('inbox-input');
-  const text = input.value.trim();
-  if (!text) return;
-  input.value = '';
-  try {
-    await createEvent(P.INBOX, text, '');
-    await syncAll();
-  } catch (e) {
-    showError('Failed to capture: ' + e.message);
-  }
-}
-
-function renderInbox() {
-  const container = document.getElementById('inbox-list');
-  if (inboxItems.length === 0) {
-    container.innerHTML = '<div class="empty"><div class="icon">📥</div><div class="msg">Your inbox is empty — capture a thought above</div></div>';
-    return;
-  }
-  container.innerHTML = inboxItems.map((item, i) => `
-    <div class="card fade-up" style="animation-delay:${i * 0.03}s">
-      <div style="font-size:14px;line-height:1.5;margin-bottom:10px;word-break:break-word">${esc(item.text)}</div>
-      <div style="font-size:10px;color:var(--text3);margin-bottom:8px">${timeAgo(item.created)}</div>
-      <div style="display:flex;gap:6px;flex-wrap:wrap">
-        <button class="btn btn-sm btn-ghost" onclick="promoteToTask('${item.id}')">Make Task</button>
-        <button class="btn btn-sm btn-ghost" onclick="promoteToIdea('${item.id}')">Save as Idea</button>
-        <button class="btn btn-sm btn-ghost" onclick="promoteToShop('${item.id}')">Add to Shop</button>
-        <button class="btn btn-sm btn-ghost" style="margin-left:auto;color:var(--red);border-color:var(--red)" onclick="deleteInbox('${item.id}')">Dismiss</button>
-      </div>
-    </div>
-  `).join('');
-}
-
-async function promoteToTask(inboxId) {
-  const item = inboxItems.find(i => i.id === inboxId);
-  if (!item) return;
-  try {
-    await createEvent(P.TASK, item.text, 'Tasks | Medium priority');
-    await deleteEvent(inboxId);
-    await syncAll();
-  } catch (e) { showError(e.message); }
-}
-
-async function promoteToIdea(inboxId) {
-  const item = inboxItems.find(i => i.id === inboxId);
-  if (!item) return;
-  try {
-    await createEvent(P.IDEA, item.text, 'status: raw');
-    await deleteEvent(inboxId);
-    await syncAll();
-  } catch (e) { showError(e.message); }
-}
-
-async function promoteToShop(inboxId) {
-  const item = inboxItems.find(i => i.id === inboxId);
-  if (!item) return;
-  try {
-    await createEvent(P.SHOP, item.text, 'qty: 1\nchecked: false\ncat: ');
-    await deleteEvent(inboxId);
-    await syncAll();
-  } catch (e) { showError(e.message); }
-}
-
-async function deleteInbox(id) {
-  try {
-    await deleteEvent(id);
-    inboxItems = inboxItems.filter(i => i.id !== id);
-    renderInbox();
-    updateBadges();
-  } catch (e) { showError(e.message); }
 }
 
 // ══════════════════════════════════════════════════
@@ -2206,7 +2116,6 @@ function editTask(taskId) {
         <div style="display:flex;gap:8px">
           <select id="edit-task-move-dest" style="flex:1">
             <option value="">Choose…</option>
-            <option value="inbox">📥 Inbox</option>
             <option value="shop">🛒 Shopping</option>
             <option value="idea">💡 Idea</option>
             ${customLists.map(l => `<option value="list:${l.id}">${esc(l.icon || '📝')} ${esc(l.name)}</option>`).join('')}
@@ -2231,9 +2140,7 @@ async function moveTaskTo(taskId, dest) {
   if (!t) return;
   const notesSuffix = t.notes ? '\n' + t.notes : '';
   try {
-    if (dest === 'inbox') {
-      await createEvent(P.INBOX, t.title, t.notes || '');
-    } else if (dest === 'shop') {
+    if (dest === 'shop') {
       await createEvent(P.SHOP, t.title, 'qty: 1\nchecked: false\ncat: ' + notesSuffix);
     } else if (dest === 'idea') {
       await createEvent(P.IDEA, t.title, 'status: raw' + notesSuffix);
@@ -4308,7 +4215,7 @@ function copyField(id) {
 }
 
 const VIEW_TITLES = {
-  inbox: 'Inbox', tasks: 'Tasks', shopping: 'Shopping',
+  tasks: 'Tasks', shopping: 'Shopping',
   'projects-ideas': 'Projects / Ideas', lists: 'Lists',
   caregiver: 'Caregiver', reflections: 'Reflections', food: 'Food & Calories', learning: 'Notes',
   orders: 'Orders',
@@ -4350,12 +4257,9 @@ function openShoppingList() {
 }
 
 function updateBadges() {
-  const inboxCount = inboxItems.length;
   const overdueTasks = tasks.filter(t => !t.done && t.due && getDueClass(t.due) === 'overdue').length;
-  const activeTaskCount = tasks.filter(t => !t.done).length;
   const uncheckedShop = shopItems.filter(i => !i.checked).length;
 
-  setBadge('inbox', inboxCount);
   setBadge('tasks', overdueTasks || '');
   setBadge('lists', uncheckedShop || '');
 
@@ -4457,8 +4361,6 @@ function buildSystemPrompt() {
     return s;
   }).join('\n') || '(none)';
 
-  const inboxList = inboxItems.map(i => `- ${i.text} (${timeAgo(i.created)})`).join('\n') || '(none)';
-
   const ideaList = ideas.map(i => {
     let s = `- ${i.text} [${i.status}]`;
     if (i.notes) s += ` — ${i.notes.substring(0, 100)}`;
@@ -4504,7 +4406,7 @@ function buildSystemPrompt() {
   // gets prompt-cached. The dynamic data block changes every turn and isn't cached.
   const cachedPrefix = `You are an AI assistant embedded in a personal Life Dashboard app. Today is ${today}. The user's timezone is ${tz}.
 
-You help the user manage their life: find tasks, analyze projects, brainstorm ideas, plan their day, triage their inbox, review their end-of-day reflections, organize their notes, and manage their Google Calendar.
+You help the user manage their life: find tasks, analyze projects, brainstorm ideas, plan their day, review their end-of-day reflections, organize their notes, and manage their Google Calendar.
 
 You have tools to read, create, edit, and delete real Google Calendar events. Use them whenever the user asks about scheduling, meetings, appointments, or anything calendar-related. Always confirm what you did in plain language after a successful tool call. When the user mentions a relative time ("tomorrow at 3", "next Monday"), resolve it using today's date and the user's timezone, then pass an ISO 8601 datetime to the tool. For all-day events, pass a YYYY-MM-DD date.
 
@@ -4520,9 +4422,6 @@ Do not update memory for trivia or for things already represented in tasks/ideas
 Be concise, actionable, and friendly. Use short responses. When suggesting actions, be specific to their actual data.`;
 
   const dynamicData = `== CURRENT DATA ==
-
-INBOX (${inboxItems.length} unprocessed):
-${inboxList}
 
 ACTIVE TASKS (${activeTasks.length}):
 ${taskList}
@@ -4561,7 +4460,7 @@ ${reflectionList}`;
 const CALENDAR_TOOLS = [
   {
     name: 'list_calendar_events',
-    description: "List the user's real calendar events in a time range. The app stores tasks/inbox/ideas/projects/lists/shopping as prefixed calendar events — those are filtered out so you only see real meetings and appointments.",
+    description: "List the user's real calendar events in a time range. The app stores tasks/ideas/projects/lists/shopping as prefixed calendar events — those are filtered out so you only see real meetings and appointments.",
     input_schema: {
       type: 'object',
       properties: {
