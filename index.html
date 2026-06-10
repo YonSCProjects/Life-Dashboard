@@ -772,6 +772,7 @@ const SHOP_CATS_ICONS = { Produce:'🥬', Dairy:'🥛', Meat:'🥩', Bakery:'�
 const TOKEN_KEY     = 'dash-token';
 const TOKEN_EXP_KEY = 'dash-token-exp';
 const SESSION_KEY   = 'dash-session';
+const INGEST_TOKEN_KEY = 'dash-ingest-token'; // scoped Tasker token; persists across re-auth
 const PKCE_KEY      = 'dash-pkce-verifier';
 const STATE_KEY     = 'dash-oauth-state';
 
@@ -890,6 +891,7 @@ async function handleOAuthCallback() {
     sessionId = data.session_id;
     localStorage.setItem(SESSION_KEY, sessionId);
     persistAccessToken(data.access_token, parseInt(data.expires_in, 10) || 3599);
+    rebindIngestToken(); // keep the Tasker token bound to the fresh session
     showApp();
   } catch (e) {
     showError('Sign-in failed: ' + e.message);
@@ -4102,6 +4104,55 @@ async function notifyStatusChangeImmediate(order, status) {
   } catch (e) { /* best-effort, non-blocking */ }
 }
 
+// ── Tasker ingest token (scoped, durable across re-auth) ──
+function ingestTokenBlockHtml(tokenUrl) {
+  return `
+    <div style="font-size:11px;color:var(--text3);margin-bottom:2px">Tasker POST URL (scoped token — survives re-login)</div>
+    <div style="display:flex;gap:6px;margin-bottom:6px">
+      <input id="ingest-url" value="${esc(tokenUrl)}" readonly style="font-size:11px;flex:1;font-family:'JetBrains Mono',monospace">
+      <button class="btn btn-sm btn-ghost" onclick="copyField('ingest-url')">Copy</button>
+    </div>
+    <button class="btn btn-sm btn-ghost" style="width:100%" onclick="generateIngestToken(this)">↻ Regenerate token</button>`;
+}
+function ingestGenerateHtml() {
+  return `
+    <div style="font-size:12px;color:var(--text3);margin-bottom:8px">
+      Generate a Tasker token — a scoped credential that can only add orders (not access your full account) and keeps working after you sign in again.
+    </div>
+    <button class="btn btn-primary" style="width:100%" onclick="generateIngestToken(this)">🔑 Generate Tasker token</button>`;
+}
+
+async function generateIngestToken(btn) {
+  if (!getWorkerUrl() || !sessionId) { showError('Sign in first.'); return; }
+  const old = btn.textContent; btn.disabled = true; btn.textContent = '…';
+  try {
+    const prev = localStorage.getItem(INGEST_TOKEN_KEY) || undefined;
+    const r = await fetch(workerEndpoint('/orders/ingest-token'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, prev }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || !data.token) throw new Error(data.message || data.error || 'failed to generate');
+    localStorage.setItem(INGEST_TOKEN_KEY, data.token);
+    const area = document.getElementById('ingest-token-area');
+    if (area) area.innerHTML = ingestTokenBlockHtml(workerEndpoint('/orders/ingest-sms') + '?token=' + data.token);
+  } catch (e) {
+    btn.disabled = false; btn.textContent = old;
+    showError('Token: ' + e.message);
+  }
+}
+
+// Best-effort: re-bind an existing Tasker token to the current session's refresh
+// token after sign-in, so the same Tasker URL keeps working across re-auth.
+function rebindIngestToken() {
+  const itok = localStorage.getItem(INGEST_TOKEN_KEY);
+  if (!itok || !sessionId || !getWorkerUrl()) return;
+  fetch(workerEndpoint('/orders/ingest-token'), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sessionId, token: itok }),
+  }).catch(() => {});
+}
+
 // ── Auto-import setup: Gmail polling + Tasker/SMS forwarding ──
 async function openOrderAutoImport() {
   if (!getWorkerUrl() || !sessionId) {
@@ -4109,6 +4160,7 @@ async function openOrderAutoImport() {
     return;
   }
   const ingestUrl = workerEndpoint('/orders/ingest-sms');
+  const tok = localStorage.getItem(INGEST_TOKEN_KEY) || '';
   showDetail(`
     <div class="detail-header">
       <button class="detail-back" onclick="closeDetail()">&larr;</button>
@@ -4132,25 +4184,22 @@ async function openOrderAutoImport() {
 
       <div style="font-size:13px;font-weight:600;margin-bottom:6px">📲 SMS forwarding (Tasker)</div>
       <div style="font-size:12px;color:var(--text3);margin-bottom:8px">
-        Forward shipping SMS to this endpoint with an Android automation app (Tasker, MacroDroid). The worker parses and tracks each one — even when the app is closed.
+        Forward shipping SMS with Tasker. The worker parses and tracks each one — even when the app is closed.
       </div>
-      <div style="font-size:11px;color:var(--text3);margin-bottom:2px">POST URL (session_id is in the query — keep it private)</div>
-      <div style="display:flex;gap:6px;margin-bottom:8px">
-        <input id="ingest-url" value="${esc(ingestUrl)}?session_id=${esc(sessionId)}" readonly style="font-size:11px;flex:1;font-family:'JetBrains Mono',monospace">
-        <button class="btn btn-sm btn-ghost" onclick="copyField('ingest-url')">Copy</button>
-      </div>
+      <div id="ingest-token-area">${tok ? ingestTokenBlockHtml(ingestUrl + '?token=' + tok) : ingestGenerateHtml()}</div>
       <details style="margin-top:10px">
         <summary style="cursor:pointer;font-size:12px;color:var(--green)">Tasker setup steps</summary>
         <ol style="font-size:12px;color:var(--text2);line-height:1.6;padding-left:18px;margin-top:8px">
+          <li>Generate the token above and <b>Copy</b> the POST URL.</li>
           <li>New Profile → <b>Event → Phone → Received Text</b> (leave Sender blank for all, or filter to carriers).</li>
           <li>Add Task → <b>Net → HTTP Request</b>.</li>
-          <li>Method <b>POST</b>, URL = the POST URL above (already includes your session_id).</li>
+          <li>Method <b>POST</b>, URL = the POST URL above (already includes your token).</li>
           <li>Body: just <code>%SMSRB</code> — Tasker's variable for the raw message text. No JSON, no quotes.</li>
           <li>Leave Content-Type as-is (text). Save.</li>
           <li>New shipping SMS now appear in 📦 Orders automatically.</li>
         </ol>
         <div style="font-size:11px;color:var(--text3);margin-top:6px">
-          ⚠️ The URL contains your <code>session_id</code> — it grants order access. Don't share it.
+          🔒 This URL uses a <b>scoped token</b> — it can only add orders (not access your account), and it keeps working after you sign in again. Still, don't share it. Hit <b>Regenerate</b> if it ever leaks.
         </div>
       </details>
     </div>

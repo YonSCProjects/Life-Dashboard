@@ -511,25 +511,38 @@ const ORDER_STATUSES = ['ordered', 'shipped', 'arrived', 'awaiting_confirmation'
 
 // Mint a fresh Google access token for a session from its stored refresh token.
 // Returns null (and prunes a dead session) if the grant is gone.
-async function googleAccessTokenForSession(env, sessionId) {
-  const stored = await env.AUTH_TOKENS.get(`session:${sessionId}`);
-  if (!stored) return null;
-  let refresh_token;
-  try { ({ refresh_token } = JSON.parse(stored)); } catch { return null; }
-  if (!refresh_token) return null;
+// Mint a Google access token from a raw refresh token.
+// Returns { token } on success, or { token: null, dead } where dead=true means
+// the grant is permanently gone (invalid_grant) vs a transient failure.
+async function googleAccessTokenFromRefresh(env, refresh_token) {
+  if (!refresh_token) return { token: null, dead: true };
   const result = await googleTokenRequest({
     client_id: env.GOOGLE_CLIENT_ID,
     client_secret: env.GOOGLE_CLIENT_SECRET,
     refresh_token,
     grant_type: 'refresh_token',
   });
-  if (!result.ok) {
-    if (result.data && result.data.error === 'invalid_grant') {
-      await env.AUTH_TOKENS.delete(`session:${sessionId}`);
-    }
-    return null;
-  }
-  return result.data.access_token;
+  if (!result.ok) return { token: null, dead: !!(result.data && result.data.error === 'invalid_grant') };
+  return { token: result.data.access_token };
+}
+
+async function googleAccessTokenForSession(env, sessionId) {
+  const stored = await env.AUTH_TOKENS.get(`session:${sessionId}`);
+  if (!stored) return null;
+  let refresh_token;
+  try { ({ refresh_token } = JSON.parse(stored)); } catch { return null; }
+  const { token, dead } = await googleAccessTokenFromRefresh(env, refresh_token);
+  if (!token && dead) await env.AUTH_TOKENS.delete(`session:${sessionId}`); // prune a revoked session
+  return token;
+}
+
+// The authenticated account's primary-calendar id (= their email) — a stable
+// identity used to prevent cross-account hijack of an ingest token on re-bind.
+async function primaryCalendarId(accessToken) {
+  try {
+    const data = await calApi(accessToken, '/calendars/primary');
+    return data && data.id ? data.id : null;
+  } catch { return null; }
 }
 
 async function calApi(accessToken, path, opts = {}) {
@@ -732,23 +745,39 @@ async function handleIngestSms(request, env) {
 
   const url = new URL(request.url);
   const ct = request.headers.get('content-type') || '';
-  let sessionId, text;
+  let sessionId, ingestToken, text;
   if (ct.includes('application/json')) {
     let body; try { body = await request.json(); } catch { return json({ error: 'invalid json' }, 400); }
     sessionId = body && body.session_id;
+    ingestToken = body && body.token;
     text = body && body.text;
   } else {
+    ingestToken = url.searchParams.get('token') || request.headers.get('x-ingest-token');
     sessionId = url.searchParams.get('session_id') || request.headers.get('x-session-id');
     text = await request.text();
   }
-
-  if (!sessionId || typeof sessionId !== 'string') return json({ error: 'missing session_id' }, 401);
-  if (!(await env.AUTH_TOKENS.get(`session:${sessionId}`))) return json({ error: 'invalid session' }, 401);
   text = (typeof text === 'string' ? text : '').trim();
   if (!text) return json({ error: 'missing text' }, 400);
 
-  const accessToken = await googleAccessTokenForSession(env, sessionId);
-  if (!accessToken) return json({ error: 'google_auth_failed', message: 'session may need to re-connect Google' }, 401);
+  // Resolve credentials → a Google access token + the session to target for push.
+  // A dedicated ingest token (endpoint-scoped, durable) is preferred; session_id still works.
+  let accessToken = null, pushSession = null;
+  if (ingestToken && typeof ingestToken === 'string') {
+    const raw = await env.AUTH_TOKENS.get(`ingest:${ingestToken}`);
+    if (!raw) return json({ error: 'invalid ingest token' }, 401);
+    let rec; try { rec = JSON.parse(raw); } catch { rec = null; }
+    if (!rec) return json({ error: 'invalid ingest token' }, 401);
+    const r = await googleAccessTokenFromRefresh(env, rec.refresh_token);
+    accessToken = r.token; pushSession = rec.session || null;
+    if (!accessToken) return json({ error: 'google_auth_failed', message: 'ingest token needs re-binding — open the app to refresh it' }, 401);
+  } else if (sessionId && typeof sessionId === 'string') {
+    if (!(await env.AUTH_TOKENS.get(`session:${sessionId}`))) return json({ error: 'invalid session' }, 401);
+    accessToken = await googleAccessTokenForSession(env, sessionId);
+    pushSession = sessionId;
+    if (!accessToken) return json({ error: 'google_auth_failed', message: 'session may need to re-connect Google' }, 401);
+  } else {
+    return json({ error: 'missing credentials (token or session_id)' }, 401);
+  }
 
   let existing;
   try { existing = await fetchActiveOrders(accessToken); }
@@ -763,11 +792,77 @@ async function handleIngestSms(request, env) {
   }
 
   try {
-    const result = await ingestParsedOrder(env, sessionId, accessToken, parsed, text, existing);
+    const result = await ingestParsedOrder(env, pushSession, accessToken, parsed, text, existing);
     return json({ ok: true, action: result.action, order: { id: result.order.id, merchant: result.order.merchant, product: result.order.product, status: result.order.status } });
   } catch (e) {
     return json({ error: 'save_failed', details: e.apiDetails || e.message }, 502);
   }
+}
+
+// ── /orders/ingest-token — mint / re-bind / revoke a Tasker ingest token ──
+// The token is endpoint-scoped (only works on /orders/ingest-sms) and carries its
+// own refresh-token binding, so it survives session_id rotation on re-auth.
+//   POST { session_id }                       → generate a fresh token
+//   POST { session_id, prev }                 → generate, deleting the caller's old token
+//   POST { session_id, token }                → re-bind that token to the current refresh token
+//   POST { session_id, token, action:'revoke'}→ delete it
+async function handleIngestToken(request, env) {
+  const { body, error } = await authedBody(request, env);
+  if (error) return error;
+  const sessionId = body.session_id;
+  const stored = await env.AUTH_TOKENS.get(`session:${sessionId}`);
+  if (!stored) return json({ error: 'invalid session' }, 401);
+
+  let refresh_token;
+  try { ({ refresh_token } = JSON.parse(stored)); } catch {}
+  if (!refresh_token) return json({ error: 'no_refresh_token' }, 400);
+
+  // Resolve the caller's account identity up front — it gates EVERY token mutation
+  // (generate/prev-delete, re-bind, revoke), so none can touch another account's token.
+  const { token: accessToken } = await googleAccessTokenFromRefresh(env, refresh_token);
+  if (!accessToken) return json({ error: 'google_auth_failed' }, 401);
+  const owner = await primaryCalendarId(accessToken);
+  if (!owner) return json({ error: 'owner_lookup_failed' }, 502);
+
+  // Fail-closed ownership gate: a caller may mutate a token only if it doesn't exist
+  // yet (first bind) or its stored owner matches the caller's. A record with a
+  // missing/foreign owner is rejected (never claimable).
+  const mayMutate = async (tok) => {
+    const raw = await env.AUTH_TOKENS.get(`ingest:${tok}`);
+    if (!raw) return { ok: true, rec: null };
+    let rec = null; try { rec = JSON.parse(raw); } catch {}
+    return { ok: !!(rec && rec.owner === owner), rec };
+  };
+
+  // Revoke.
+  if (body.action === 'revoke' && body.token) {
+    const chk = await mayMutate(body.token);
+    if (!chk.ok) return json({ error: 'owner_mismatch' }, 403);
+    await env.AUTH_TOKENS.delete(`ingest:${body.token}`);
+    return json({ ok: true, revoked: true });
+  }
+
+  // Re-bind an existing token to the current refresh token.
+  if (body.token) {
+    const chk = await mayMutate(body.token);
+    if (!chk.ok) return json({ error: 'owner_mismatch' }, 403);
+    await env.AUTH_TOKENS.put(`ingest:${body.token}`, JSON.stringify({
+      refresh_token, owner, session: sessionId,
+      created_at: (chk.rec && chk.rec.created_at) || Date.now(), updated_at: Date.now(),
+    }));
+    return json({ ok: true, token: body.token, rebound: true });
+  }
+
+  // Generate a fresh token; clean up the caller's prior one (only if it's theirs).
+  if (body.prev) {
+    const chk = await mayMutate(body.prev);
+    if (chk.ok) await env.AUTH_TOKENS.delete(`ingest:${body.prev}`);
+  }
+  const token = randomSessionId();
+  await env.AUTH_TOKENS.put(`ingest:${token}`, JSON.stringify({
+    refresh_token, owner, session: sessionId, created_at: Date.now(), updated_at: Date.now(),
+  }));
+  return json({ ok: true, token });
 }
 
 // ══════════════════════════════════════════════════
@@ -1044,6 +1139,7 @@ export default {
       if (url.pathname === '/push/notify-now')  return await handleNotifyNow(request, env);
       if (url.pathname === '/orders/parse')     return await handleOrderParse(request, env);
       if (url.pathname === '/orders/ingest-sms')  return await handleIngestSms(request, env);
+      if (url.pathname === '/orders/ingest-token') return await handleIngestToken(request, env);
       if (url.pathname === '/orders/gmail-config') return await handleGmailConfig(request, env);
       // Default: Claude proxy (preserves existing AI panel behavior, which posts to root).
       return await handleAi(request, env);
