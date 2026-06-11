@@ -5061,6 +5061,9 @@ function openAI() {
           ${aiSupportsSpeech() ? `<button class="ai-mic-btn ${aiListening ? 'listening' : ''}" id="ai-mic-btn" onclick="aiToggleMic()" title="Tap to speak">🎤</button>` : ''}
           <button class="ai-send-btn" id="ai-send-btn" onclick="aiSend()">→</button>
         </div>
+        <div class="ai-settings-row" style="font-size:10px;color:var(--text3)">
+          <span id="ai-usage" title="Estimated from token usage at current Claude prices. Authoritative billing is the Anthropic Console.">💰 …</span>
+        </div>
         <div class="ai-settings-row">
           <span>Worker:</span>
           <input value="${esc(workerUrl)}" style="font-size:10px;padding:4px 8px" onchange="setWorkerUrl(this.value.trim())">
@@ -5073,7 +5076,31 @@ function openAI() {
     const msgs = document.getElementById('ai-messages');
     if (msgs) msgs.scrollTop = msgs.scrollHeight;
     setTimeout(() => document.getElementById('ai-input')?.focus(), 100);
+    loadAiUsage();
   }
+}
+
+// Estimated Claude API cost this month (from the worker's token accounting).
+async function loadAiUsage() {
+  const el = document.getElementById('ai-usage');
+  if (!el || !getWorkerUrl() || !sessionId) return;
+  try {
+    const r = await fetch(workerEndpoint('/usage'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    const data = await r.json().catch(() => ({}));
+    const cur = data.months && data.months[0];
+    if (!cur) return;
+    const calls = (cur.models || []).reduce((s, m) => s + (m.calls || 0), 0);
+    const parts = (cur.models || []).map(m => {
+      const name = m.model.includes('haiku') ? 'Haiku' : m.model.includes('opus') ? 'Opus' : 'Sonnet';
+      return name + ' $' + (m.cost || 0).toFixed(2);
+    });
+    const amount = cur.cost >= 0.01 ? '~$' + cur.cost.toFixed(2) : (calls ? '<$0.01' : '$0.00');
+    const detail = calls ? ` · ${calls} call${calls > 1 ? 's' : ''}${parts.length ? ' · ' + parts.join(' · ') : ''}` : ' · no usage tracked yet';
+    el.textContent = `💰 ${amount} this month${detail} (est.)`;
+  } catch { /* leave placeholder */ }
 }
 
 function closeAI() {

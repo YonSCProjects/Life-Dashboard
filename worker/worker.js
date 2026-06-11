@@ -137,6 +137,51 @@ async function handleRevoke(request, env) {
   return json({ ok: true });
 }
 
+// ══════════════════════════════════════════════════
+// USAGE / COST TRACKING — accumulate Claude token usage in KV (usage:YYYY-MM),
+// compute an estimated $ cost. Authoritative billing is the Anthropic Console;
+// this is a convenience estimate, counted from when tracking was added forward.
+// ══════════════════════════════════════════════════
+// $ per 1M tokens: [input, output]. Cache write ≈ input×1.25, cache read ≈ input×0.10.
+const USAGE_PRICING = {
+  'claude-haiku-4-5': [1.00, 5.00],
+  'claude-3-5-haiku': [1.00, 5.00],
+  'claude-haiku':     [1.00, 5.00],
+  'claude-sonnet-4-6': [3.00, 15.00],
+  'claude-sonnet-4':   [3.00, 15.00],
+  'claude-sonnet':     [3.00, 15.00],
+  'claude-opus':       [5.00, 25.00],
+};
+function usagePrice(model) {
+  for (const k of Object.keys(USAGE_PRICING)) if (model && model.includes(k)) return USAGE_PRICING[k];
+  return [3.00, 15.00]; // unknown model → assume Sonnet-tier
+}
+function usageCost(model, u) {
+  const [pin, pout] = usagePrice(model);
+  return ((u.input_tokens || 0) * pin
+        + (u.output_tokens || 0) * pout
+        + (u.cache_creation_input_tokens || 0) * pin * 1.25
+        + (u.cache_read_input_tokens || 0) * pin * 0.10) / 1e6;
+}
+// Best-effort accumulate (KV has no atomic increment; under heavy concurrency a
+// few updates can race — acceptable for a single-user cost estimate).
+async function recordUsage(env, model, u) {
+  if (!u || !model) return;
+  try {
+    const key = `usage:${new Date().toISOString().slice(0, 7)}`;
+    const raw = await env.AUTH_TOKENS.get(key);
+    let rec; try { rec = raw ? JSON.parse(raw) : {}; } catch { rec = {}; }
+    const m = rec[model] || { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, calls: 0 };
+    m.input += u.input_tokens || 0;
+    m.output += u.output_tokens || 0;
+    m.cacheWrite += u.cache_creation_input_tokens || 0;
+    m.cacheRead += u.cache_read_input_tokens || 0;
+    m.calls += 1;
+    rec[model] = m;
+    await env.AUTH_TOKENS.put(key, JSON.stringify(rec), { expirationTtl: 60 * 60 * 24 * 400 });
+  } catch { /* usage logging never blocks the response */ }
+}
+
 async function handleAi(request, env) {
   const apiKey = env.ANTHROPIC_API_KEY;
   if (!apiKey) return json({ error: 'API key not configured' }, 500);
@@ -162,10 +207,38 @@ async function handleAi(request, env) {
   });
 
   const data = await response.text();
+  if (response.ok) {
+    try { const d = JSON.parse(data); if (d && d.usage) await recordUsage(env, d.model || payload.model, d.usage); } catch {}
+  }
   return new Response(data, {
     status: response.status,
     headers: { ...CORS, 'Content-Type': 'application/json' },
   });
+}
+
+// POST /usage { session_id } → estimated Claude cost for the last 3 months.
+async function handleUsage(request, env) {
+  const { body, error } = await authedBody(request, env);
+  if (error) return error;
+  const now = new Date();
+  const out = [];
+  for (let i = 0; i < 3; i++) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+    const mo = d.toISOString().slice(0, 7);
+    const raw = await env.AUTH_TOKENS.get(`usage:${mo}`);
+    let rec = {}; try { rec = raw ? JSON.parse(raw) : {}; } catch { rec = {}; }
+    let cost = 0; const models = [];
+    for (const [model, m] of Object.entries(rec)) {
+      const c = usageCost(model, {
+        input_tokens: m.input, output_tokens: m.output,
+        cache_creation_input_tokens: m.cacheWrite, cache_read_input_tokens: m.cacheRead,
+      });
+      cost += c;
+      models.push({ model, calls: m.calls || 0, input: m.input || 0, output: m.output || 0, cost: Math.round(c * 10000) / 10000 });
+    }
+    out.push({ month: mo, cost: Math.round(cost * 10000) / 10000, models });
+  }
+  return json({ ok: true, currency: 'USD', months: out });
 }
 
 // ══════════════════════════════════════════════════
@@ -478,6 +551,7 @@ You MUST call the parse_shipping_message tool exactly once with your best extrac
     e.status = r.status;
     throw e;
   }
+  if (data.usage) await recordUsage(env, data.model || 'claude-haiku-4-5-20251001', data.usage);
   const toolUse = (data.content || []).find(b => b.type === 'tool_use' && b.name === 'parse_shipping_message');
   if (!toolUse) throw new Error('Claude did not return parsed fields');
   return toolUse.input;
@@ -1178,6 +1252,7 @@ export default {
       if (url.pathname === '/orders/parse')     return await handleOrderParse(request, env);
       if (url.pathname === '/orders/ingest-sms')   return await handleIngestSms(request, env);
       if (url.pathname === '/orders/ingest-status') return await handleIngestStatus(request, env);
+      if (url.pathname === '/usage')                return await handleUsage(request, env);
       if (url.pathname === '/orders/ingest-token') return await handleIngestToken(request, env);
       if (url.pathname === '/orders/gmail-config') return await handleGmailConfig(request, env);
       // Default: Claude proxy (preserves existing AI panel behavior, which posts to root).
