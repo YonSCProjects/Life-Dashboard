@@ -4163,11 +4163,14 @@ async function fetchIngestStatus() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: sessionId, token }),
     });
-    if (!r.ok) return { error: true };
     const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      const msg = (d && (d.error || (d.error_type) || (d.details && d.details.error && d.details.error.message))) || ('HTTP ' + r.status);
+      return { error: true, message: msg, status: r.status };
+    }
     if (d.none) return { none: true };
     return d;
-  } catch { return { error: true }; }
+  } catch (e) { return { error: true, message: e.message || 'network error' }; }
 }
 
 async function refreshIngestStatus() {
@@ -4186,7 +4189,11 @@ async function refreshIngestStatus() {
   }
   if (s.error) {
     area.style.color = 'var(--red)';
-    area.innerHTML = '⚠️ Could not read ingest status.';
+    const detail = s.message ? ` — ${esc(s.message)}` : '';
+    const hint = (s.status === 404 || s.status === 400 || !s.status)
+      ? ' (most likely the worker needs to be redeployed)'
+      : '';
+    area.innerHTML = `⚠️ Could not read ingest status${detail}${hint}`;
     return;
   }
   let icon = '•', tone = 'var(--text2)';
