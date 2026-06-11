@@ -779,24 +779,62 @@ async function handleIngestSms(request, env) {
     return json({ error: 'missing credentials (token or session_id)' }, 401);
   }
 
-  let existing;
-  try { existing = await fetchActiveOrders(accessToken); }
-  catch (e) { return json({ error: 'calendar_read_failed', details: e.apiDetails || e.message }, 502); }
-
-  let parsed;
-  try { parsed = await parseShippingMessage(env, text, matchContext(existing)); }
-  catch (e) { return json({ error: 'parse_failed', details: e.apiDetails || e.message }, e.status || 502); }
-
-  if (!isIngestableParse(parsed)) {
-    return json({ ok: true, action: 'skipped', reason: 'not a recognizable order/shipping update', parsed });
-  }
-
+  // Run the parse + save and capture the outcome so the user can see it under
+  // "Last SMS received" in the auto-import sheet — useful for diagnosing whether
+  // Tasker is actually reaching the worker.
+  let outcome, response;
   try {
-    const result = await ingestParsedOrder(env, pushSession, accessToken, parsed, text, existing);
-    return json({ ok: true, action: result.action, order: { id: result.order.id, merchant: result.order.merchant, product: result.order.product, status: result.order.status } });
+    const existing = await fetchActiveOrders(accessToken);
+    const parsed = await parseShippingMessage(env, text, matchContext(existing));
+    if (!isIngestableParse(parsed)) {
+      outcome = { ok: true, action: 'skipped', summary: 'not a shipping update' };
+      response = json({ ok: true, action: 'skipped', reason: 'not a recognizable order/shipping update', parsed });
+    } else {
+      const result = await ingestParsedOrder(env, pushSession, accessToken, parsed, text, existing);
+      const o = result.order;
+      const label = (o.merchant || 'Order') + (o.product ? ' — ' + o.product : '');
+      outcome = { ok: true, action: result.action, summary: label.slice(0, 160) };
+      response = json({ ok: true, action: result.action, order: { id: o.id, merchant: o.merchant, product: o.product, status: o.status } });
+    }
   } catch (e) {
-    return json({ error: 'save_failed', details: e.apiDetails || e.message }, 502);
+    const msg = (e && (e.message || String(e))) || 'unknown error';
+    outcome = { ok: false, action: 'error', summary: msg.slice(0, 200) };
+    response = json({ error: 'ingest_failed', details: e.apiDetails || msg }, e.status || 502);
   }
+
+  // Best-effort, non-blocking: record this hit so the app can show it.
+  if (ingestToken) {
+    try {
+      const key = `ingest:stat:${ingestToken}`;
+      const prevRaw = await env.AUTH_TOKENS.get(key);
+      let count = 0;
+      try { count = (JSON.parse(prevRaw || '{}').count || 0); } catch {}
+      await env.AUTH_TOKENS.put(key, JSON.stringify({ ...outcome, at: Date.now(), count: count + 1 }), {
+        expirationTtl: 60 * 60 * 24 * 180, // 180 days — long enough to spot a silence
+      });
+    } catch { /* swallow — never block the response on logging */ }
+  }
+
+  return response;
+}
+
+// ── /orders/ingest-status — frontend asks: "did any SMS reach you lately?" ──
+// Returns the last recorded outcome for the caller's ingest token. Auth: the
+// session_id must own the token (i.e., the token's rec.session === session_id).
+async function handleIngestStatus(request, env) {
+  const { body, error } = await authedBody(request, env);
+  if (error) return error;
+  const token = typeof body.token === 'string' ? body.token : null;
+  if (!token) return json({ error: 'missing token' }, 400);
+
+  const tokRaw = await env.AUTH_TOKENS.get(`ingest:${token}`);
+  if (!tokRaw) return json({ none: true, reason: 'unknown_token' });
+  let rec = null; try { rec = JSON.parse(tokRaw); } catch {}
+  if (!rec || rec.session !== body.session_id) return json({ error: 'owner_mismatch' }, 403);
+
+  const statRaw = await env.AUTH_TOKENS.get(`ingest:stat:${token}`);
+  if (!statRaw) return json({ none: true });
+  try { return json(JSON.parse(statRaw)); } catch { return json({ none: true }); }
 }
 
 // ── /orders/ingest-token — mint / re-bind / revoke a Tasker ingest token ──
@@ -1138,7 +1176,8 @@ export default {
       if (url.pathname === '/push/test')        return await handlePushTest(request, env);
       if (url.pathname === '/push/notify-now')  return await handleNotifyNow(request, env);
       if (url.pathname === '/orders/parse')     return await handleOrderParse(request, env);
-      if (url.pathname === '/orders/ingest-sms')  return await handleIngestSms(request, env);
+      if (url.pathname === '/orders/ingest-sms')   return await handleIngestSms(request, env);
+      if (url.pathname === '/orders/ingest-status') return await handleIngestStatus(request, env);
       if (url.pathname === '/orders/ingest-token') return await handleIngestToken(request, env);
       if (url.pathname === '/orders/gmail-config') return await handleGmailConfig(request, env);
       // Default: Claude proxy (preserves existing AI panel behavior, which posts to root).

@@ -4136,6 +4136,7 @@ async function generateIngestToken(btn) {
     localStorage.setItem(INGEST_TOKEN_KEY, data.token);
     const area = document.getElementById('ingest-token-area');
     if (area) area.innerHTML = ingestTokenBlockHtml(workerEndpoint('/orders/ingest-sms') + '?token=' + data.token);
+    refreshIngestStatus();
   } catch (e) {
     btn.disabled = false; btn.textContent = old;
     showError('Token: ' + e.message);
@@ -4151,6 +4152,51 @@ function rebindIngestToken() {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ session_id: sessionId, token: itok }),
   }).catch(() => {});
+}
+
+// ── Tasker ingest health: did any SMS reach the worker lately? ──
+async function fetchIngestStatus() {
+  const token = localStorage.getItem(INGEST_TOKEN_KEY);
+  if (!token || !sessionId || !getWorkerUrl()) return { configured: false };
+  try {
+    const r = await fetch(workerEndpoint('/orders/ingest-status'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, token }),
+    });
+    if (!r.ok) return { error: true };
+    const d = await r.json().catch(() => ({}));
+    if (d.none) return { none: true };
+    return d;
+  } catch { return { error: true }; }
+}
+
+async function refreshIngestStatus() {
+  const area = document.getElementById('ingest-status-area');
+  if (!area) return;
+  const s = await fetchIngestStatus();
+  if (s.configured === false) {
+    area.style.color = 'var(--text3)';
+    area.innerHTML = 'Generate a token above to start tracking SMS arrivals.';
+    return;
+  }
+  if (s.none) {
+    area.style.color = 'var(--text3)';
+    area.innerHTML = '⏳ No SMS received on this token yet. Send a test SMS from your phone — if nothing shows up here in ~10 seconds, Tasker isn’t reaching the worker.';
+    return;
+  }
+  if (s.error) {
+    area.style.color = 'var(--red)';
+    area.innerHTML = '⚠️ Could not read ingest status.';
+    return;
+  }
+  let icon = '•', tone = 'var(--text2)';
+  if (s.action === 'created' || s.action === 'updated') { icon = '✅'; tone = 'var(--green)'; }
+  else if (s.action === 'skipped')                       { icon = '⏭'; tone = 'var(--yellow)'; }
+  else if (s.action === 'error')                         { icon = '❌'; tone = 'var(--red)'; }
+  area.style.color = tone;
+  const summary = s.summary ? ' — ' + esc(s.summary) : '';
+  const count = typeof s.count === 'number' ? ` <span style="color:var(--text3)">(${s.count} total)</span>` : '';
+  area.innerHTML = `${icon} <b>Last SMS:</b> ${timeAgo(new Date(s.at).toISOString())}${summary}${count}`;
 }
 
 // ── Auto-import setup: Gmail polling + Tasker/SMS forwarding ──
@@ -4187,6 +4233,7 @@ async function openOrderAutoImport() {
         Forward shipping SMS with Tasker. The worker parses and tracks each one — even when the app is closed.
       </div>
       <div id="ingest-token-area">${tok ? ingestTokenBlockHtml(ingestUrl + '?token=' + tok) : ingestGenerateHtml()}</div>
+      <div id="ingest-status-area" style="margin-top:8px;font-size:12px;color:var(--text3)">Checking last SMS…</div>
       <details style="margin-top:10px">
         <summary style="cursor:pointer;font-size:12px;color:var(--green)">Tasker setup steps</summary>
         <ol style="font-size:12px;color:var(--text2);line-height:1.6;padding-left:18px;margin-top:8px">
@@ -4204,6 +4251,7 @@ async function openOrderAutoImport() {
       </details>
     </div>
   `);
+  refreshIngestStatus();
   // Load current Gmail toggle state.
   try {
     const r = await fetch(workerEndpoint('/orders/gmail-config'), {
