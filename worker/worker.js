@@ -1264,6 +1264,14 @@ export default {
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runScheduled(env));
-    ctx.waitUntil(runGmailPoll(env));
+    // Gmail polling is expensive (each tick = up to 8 Claude calls per opted-in
+    // session) and shipping mail isn't urgent. Restrict it to 5 UTC slots/day,
+    // which lands at roughly 09:15 / 13:15 / 16:15 / 19:15 / 22:15 Israel time.
+    // The cron still fires every 15 min for the urgent-task reminders.
+    const GMAIL_POLL_HOURS_UTC = [6, 10, 13, 16, 19];
+    const now = new Date(event.scheduledTime || Date.now());
+    if (GMAIL_POLL_HOURS_UTC.includes(now.getUTCHours()) && now.getUTCMinutes() < 15) {
+      ctx.waitUntil(runGmailPoll(env));
+    }
   },
 };
