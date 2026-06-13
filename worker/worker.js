@@ -410,6 +410,7 @@ async function handlePushTest(request, env) {
   const res = await sendPush(env, subscription, {
     title: '🔔 Test alert',
     body: "Background push is working — you'll be reminded even when the app is closed.",
+    tag: 'push-test',
   });
   return json({ ok: res.ok, status: res.status });
 }

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'life-dash-v41';
+const CACHE_NAME = 'life-dash-v42';
 const ASSETS = [
   '/Life-Dashboard/',
   '/Life-Dashboard/index.html',
@@ -68,7 +68,7 @@ self.addEventListener('push', e => {
   try { if (e.data) data = e.data.json(); } catch {}
   e.waitUntil(self.registration.showNotification(data.title, {
     body: data.body,
-    tag: 'urgent-tasks',
+    tag: data.tag || 'urgent-tasks',
     renotify: true,
     requireInteraction: true,
     vibrate: [500, 200, 500, 200, 500],
