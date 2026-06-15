@@ -1347,6 +1347,9 @@ async function syncAll() {
       if (aActive !== bActive) return aActive ? -1 : 1;
       return (b.lastUpdated || '').localeCompare(a.lastUpdated || '');
     });
+    // Collapse duplicates of the same item (same tracking number) into the
+    // most-advanced stage, so an order never sits in two sections at once.
+    await dedupeOrdersByTracking();
 
     renderAll();
     lastSyncAt = Date.now();
@@ -1850,7 +1853,8 @@ function parseOrder(event) {
     product: data.product || dashSplit.slice(1).join(' — ') || summaryText,
     trackingNumber: data.trackingNumber || '',
     pickupLocation: data.pickupLocation || '',
-    status: data.status || 'ordered',
+    // 'awaiting_confirmation' is retired — fold any legacy orders into 'arrived'.
+    status: (data.status === 'awaiting_confirmation' ? 'arrived' : (data.status || 'ordered')),
     orderedAt: data.orderedAt || event.start?.date || '',
     expectedAt: data.expectedAt || null,
     statusHistory: Array.isArray(data.statusHistory) ? data.statusHistory : [],
@@ -3617,18 +3621,47 @@ async function deleteLearningNote(id) {
 // ══════════════════════════════════════════════════
 // ORDERS (online order tracking with shipping status)
 // ══════════════════════════════════════════════════
-const ORDER_STATUSES = ['ordered', 'shipped', 'arrived', 'awaiting_confirmation', 'collected', 'lost'];
+const ORDER_STATUSES = ['ordered', 'shipped', 'arrived', 'collected', 'lost'];
 const ORDER_STATUS_LABEL = {
   ordered:               { icon: '📋', label: 'Ordered',                tone: 'var(--text2)' },
   shipped:               { icon: '🚚', label: 'In transit',             tone: 'var(--blue)' },
   arrived:               { icon: '🔔', label: 'Ready to collect',       tone: 'var(--orange)' },
-  awaiting_confirmation: { icon: '⏳', label: 'Awaiting confirmation',  tone: 'var(--yellow)' },
   collected:             { icon: '✅', label: 'Collected',              tone: 'var(--green)' },
   lost:                  { icon: '❌', label: 'Lost / cancelled',       tone: 'var(--red)' },
 };
 
+// Stage ranking for de-duplication (higher = more advanced; 'lost' loses to any real progress).
+const ORDER_RANK = { lost: -1, ordered: 0, shipped: 1, arrived: 2, collected: 3 };
+function orderRank(s) { return ORDER_RANK[s] ?? 0; }
+function normTracking(t) { return (t || '').replace(/\s+/g, '').toLowerCase(); }
+
 function isOrderActive(o) { return o.status !== 'collected' && o.status !== 'lost'; }
 function readyToCollect() { return orders.filter(o => o.status === 'arrived'); }
+
+// Merge orders that share a tracking number, keeping the most-advanced stage and
+// deleting the older duplicates' calendar events. Returns true if anything changed.
+async function dedupeOrdersByTracking() {
+  const groups = {};
+  for (const o of orders) {
+    const t = normTracking(o.trackingNumber);
+    if (t.length < 6) continue; // ignore blank/too-short tracking to avoid false merges
+    (groups[t] = groups[t] || []).push(o);
+  }
+  const toDelete = [];
+  for (const t in groups) {
+    const grp = groups[t];
+    if (grp.length < 2) continue;
+    grp.sort((a, b) => orderRank(b.status) - orderRank(a.status)
+      || new Date(b.lastUpdated || 0) - new Date(a.lastUpdated || 0));
+    for (const loser of grp.slice(1)) toDelete.push(loser.id);
+  }
+  if (!toDelete.length) return false;
+  for (const id of toDelete) {
+    try { await deleteEvent(id); } catch {}
+  }
+  orders = orders.filter(o => !toDelete.includes(o.id));
+  return true;
+}
 
 function getOrderSummary(o) {
   const m = (o.merchant || 'Order').trim();
@@ -3697,7 +3730,6 @@ function renderOrders() {
 
   body.innerHTML = `
     ${sectionFor('arrived', 'Ready to collect')}
-    ${sectionFor('awaiting_confirmation', 'Awaiting confirmation')}
     ${sectionFor('shipped', 'In transit')}
     ${sectionFor('ordered', 'Ordered')}
     ${collectedBlock}
@@ -4090,9 +4122,6 @@ async function notifyStatusChangeImmediate(order, status) {
   if (status === 'arrived') {
     title = '📦 Package ready to collect';
     body = label + (order.pickupLocation ? '\n📍 ' + order.pickupLocation : '');
-  } else if (status === 'awaiting_confirmation') {
-    title = '📦 Confirm package delivery';
-    body = label;
   } else {
     return;
   }

@@ -500,7 +500,7 @@ const ORDER_PARSE_TOOL = {
       product: { type: 'string', description: 'Product/item description if mentioned. Empty string if not.' },
       tracking_number: { type: 'string', description: 'Shipment tracking number / package number if present. Empty string if absent.' },
       pickup_location: { type: 'string', description: 'WHERE the package can be collected — post-office branch, locker/Boxit/Yango unit address, kiosk, depot, store, neighbor, etc. Include the full identifying address or branch name as written in the message (street + city, locker code, branch name). For door-delivery messages this is empty. This is one of the most important fields — extract it whenever the message mentions a collection point.' },
-      status: { type: 'string', enum: ['ordered', 'shipped', 'arrived', 'awaiting_confirmation', 'collected', 'lost', 'unknown'], description: '"ordered" = paid, not yet shipped. "shipped" = in transit. "arrived" = reached its pickup point and is waiting to be physically collected (post office, Boxit/Yango locker, kiosk). "awaiting_confirmation" = the carrier or merchant says the package was DELIVERED and is asking the recipient to confirm receipt — typical phrases: "please confirm delivery", "tap to confirm receipt", "marked as delivered – confirm", "אנא אשר/אשרי קבלה", "אישור מסירה". "collected" = explicitly picked up. "lost" = lost/cancelled. Use "unknown" if status is unclear.' },
+      status: { type: 'string', enum: ['ordered', 'shipped', 'arrived', 'collected', 'lost', 'unknown'], description: '"ordered" = paid, not yet shipped. "shipped" = in transit. "arrived" = reached its pickup point and is waiting to be physically collected (post office, Boxit/Yango locker, kiosk), OR was delivered and the recipient is asked to confirm receipt (treat "please confirm delivery"/"אנא אשר קבלה"/"אישור מסירה" as "arrived" — it still needs the user\'s attention). "collected" = explicitly picked up/confirmed. "lost" = lost/cancelled. Use "unknown" if status is unclear.' },
       ordered_at: { type: 'string', description: 'YYYY-MM-DD if mentioned, else empty string.' },
       expected_at: { type: 'string', description: 'YYYY-MM-DD expected delivery/pickup-by date if mentioned, else empty string.' },
       matched_order_id: { type: 'string', description: 'If this message clearly updates one of the existing orders provided in context (matched by tracking number, merchant, or product), the matching order id. Otherwise empty string.' },
@@ -524,7 +524,7 @@ Common Israeli context: packages often go to דואר ישראל (Israel Post) b
 
 PICKUP LOCATION is one of the most important fields. Whenever a message mentions a place where the package can be collected — a post-office branch name/address, a Boxit/Yango locker address or code, a 24/7 kiosk, a depot, a store counter, or even a neighbor's apartment — copy that full identifying string into pickup_location. Keep it verbatim where possible so the user can navigate to it (e.g., "Boxit – יהודה הלוי 12, רמת גן" or "סניף דואר פתח תקווה, ז'בוטינסקי 50"). For door-delivery messages leave it empty.
 
-AWAITING CONFIRMATION: if the message says the package was DELIVERED and asks the recipient to confirm receipt (English: "please confirm delivery", "tap to confirm receipt", "your package was delivered – confirm"; Hebrew: "אנא אשר קבלה", "אישור מסירה", "החבילה נמסרה – אשר/י"), set status to "awaiting_confirmation", not "collected" (the user has not actually confirmed yet) and not "arrived" (it is not waiting at a pickup point).
+DELIVERED / CONFIRM RECEIPT: if the message says the package was DELIVERED and asks the recipient to confirm receipt (English: "please confirm delivery", "tap to confirm receipt", "your package was delivered – confirm"; Hebrew: "אנא אשר קבלה", "אישור מסירה", "החבילה נמסרה – אשר/י"), set status to "arrived" (it still needs the user's attention) — not "collected", since the user has not actually confirmed yet.
 
 Today's date: ${new Date().toISOString().slice(0, 10)}.
 You MUST call the parse_shipping_message tool exactly once with your best extraction. Use empty strings for unknown fields rather than guessing.`;
@@ -582,7 +582,9 @@ async function handleOrderParse(request, env) {
 // worker writes look identical to ones the app writes.
 // ══════════════════════════════════════════════════
 const ORDER_PREFIX = '📦';
-const ORDER_STATUSES = ['ordered', 'shipped', 'arrived', 'awaiting_confirmation', 'collected', 'lost'];
+const ORDER_STATUSES = ['ordered', 'shipped', 'arrived', 'collected', 'lost'];
+// 'awaiting_confirmation' is retired — normalize legacy/old-model values to 'arrived'.
+function normalizeOrderStatus(s) { return s === 'awaiting_confirmation' ? 'arrived' : s; }
 
 // Mint a fresh Google access token for a session from its stored refresh token.
 // Returns null (and prunes a dead session) if the grant is gone.
@@ -647,7 +649,7 @@ function parseOrderEvent(event) {
     product: data.product || dashSplit.slice(1).join(' — ') || summaryText,
     trackingNumber: data.trackingNumber || '',
     pickupLocation: data.pickupLocation || '',
-    status: data.status || 'ordered',
+    status: normalizeOrderStatus(data.status || 'ordered'),
     orderedAt: data.orderedAt || (event.start && event.start.date) || '',
     expectedAt: data.expectedAt || null,
     statusHistory: Array.isArray(data.statusHistory) ? data.statusHistory : [],
@@ -742,8 +744,9 @@ function isIngestableParse(parsed) {
 async function ingestParsedOrder(env, sessionId, accessToken, parsed, originalText, existing) {
   const sourceMsg = { at: new Date().toISOString(), text: (originalText || '').slice(0, 2000) };
   const matched = parsed.matched_order_id ? existing.find(o => o.id === parsed.matched_order_id) : null;
-  const status = ORDER_STATUSES.includes(parsed.status)
-    ? parsed.status
+  const parsedStatus = normalizeOrderStatus(parsed.status);
+  const status = ORDER_STATUSES.includes(parsedStatus)
+    ? parsedStatus
     : (matched ? matched.status : 'shipped');
 
   if (matched) {
@@ -791,14 +794,12 @@ async function ingestParsedOrder(env, sessionId, accessToken, parsed, originalTe
   return { action: 'created', order: ord };
 }
 
-// One-shot push when an order enters 'arrived' or 'awaiting_confirmation'.
-// For arrived we surface the pickup location too, since that's the actionable bit.
+// One-shot push when an order enters 'arrived'.
+// We surface the pickup location too, since that's the actionable bit.
 async function pushForStatusChange(env, sessionId, order, status) {
   if (status === 'arrived') {
     const where = order.pickupLocation ? ' — ' + order.pickupLocation : '';
     await pushToSession(env, sessionId, '📦 Package ready to collect', orderSummary(order) + where);
-  } else if (status === 'awaiting_confirmation') {
-    await pushToSession(env, sessionId, '📦 Confirm package delivery', orderSummary(order));
   }
 }
 
