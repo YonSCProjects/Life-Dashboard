@@ -1300,7 +1300,12 @@ async function syncAll() {
       fetchEvents(P.ORDER),
     ]);
 
-    tasks = taskEvts.map(parseTask);
+    // Tasks share the 📋 prefix family with lists (📋L) and list items (📋I),
+    // so the 📋 fetch also returns those. Exclude them — otherwise a list shows
+    // up as a phantom task and deleting that phantom deletes the real list.
+    tasks = taskEvts
+      .filter(e => { const s = e.summary || ''; return !s.includes(P.LIST) && !s.includes(P.LIST_ITEM); })
+      .map(parseTask);
     tasks.sort(compareTasks);
 
     shopItems = shopEvts.filter(e => !(e.summary || '').includes(P.TASK)).map(parseShopEvent);
