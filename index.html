@@ -1315,7 +1315,7 @@ async function syncAll() {
 
     projects = projEvts.map(parseProjectEvent);
 
-    customLists = listEvts.map(e => parseListEvent(e, listItemEvts));
+    customLists = listEvts.map(e => parseListEvent(e, listItemEvts)).sort(cmpOrder);
 
     // Caregiver data
     caregiverConfig = cgCfgEvts.length ? parseCaregiverConfig(cgCfgEvts[0]) : null;
@@ -1512,6 +1512,20 @@ async function commitShopOrder(visibleIds) {
     .filter(it => it && before.get(it.id) !== it.order);
   try {
     await Promise.all(changed.map(it => persistOrder(it.id, it.order)));
+  } catch (e) { showError(e.message); await syncAll(); }
+}
+
+async function commitCustomListOrder(visibleIds) {
+  const before = new Map(customLists.map(l => [l.id, l.order]));
+  visibleIds.forEach((id, i) => {
+    const list = customLists.find(l => l.id === id);
+    if (list) list.order = i;
+  });
+  customLists.sort(cmpOrder);
+  const changed = visibleIds.map(id => customLists.find(l => l.id === id))
+    .filter(l => l && before.get(l.id) !== l.order);
+  try {
+    await Promise.all(changed.map(l => persistOrder(l.id, l.order)));
   } catch (e) { showError(e.message); await syncAll(); }
 }
 
@@ -1798,6 +1812,7 @@ function parseListEvent(event, listItemEvts) {
     id: listId, name,
     icon: iconMatch ? iconMatch[1].trim() : '📝',
     items,
+    order: getEventOrder(event),
   };
 }
 
@@ -2685,16 +2700,19 @@ function renderLists() {
   container.innerHTML = shopCard + customLists.map((list, i) => {
     const unchecked = list.items.filter(i => !i.checked).length;
     return `
-      <div class="card list-card fade-up" style="animation-delay:${(i + 1) * 0.03}s" onclick="openList('${list.id}')">
+      <div class="card list-card fade-up" data-drag-id="${list.id}" style="animation-delay:${(i + 1) * 0.03}s" onclick="openList('${list.id}')">
         <div style="display:flex;align-items:center;gap:10px">
           <span style="font-size:24px">${list.icon}</span>
-          <div>
+          <div style="flex:1;min-width:0">
             <div class="list-name">${esc(list.name)}</div>
             <div class="list-count">${list.items.length} items${unchecked > 0 ? ` (${unchecked} remaining)` : ''}</div>
           </div>
+          ${DRAG_HANDLE_HTML}
         </div>
       </div>`;
   }).join('');
+
+  enableDragReorder(container, commitCustomListOrder);
 }
 
 function showAddList() {
