@@ -80,9 +80,16 @@ async function handleExchange(request, env) {
     }, result.status || 400);
   }
 
+  // Stamp the underlying Google account identity on the session so per-account
+  // opt-ins (Gmail auto-import, Tasker ingest tokens, …) can be re-associated
+  // to the fresh session_id after re-auth without the user having to redo them.
+  let owner = null;
+  try { owner = await primaryCalendarId(result.data.access_token); } catch {}
+
   const sessionId = randomSessionId();
   await env.AUTH_TOKENS.put(`session:${sessionId}`, JSON.stringify({
     refresh_token: result.data.refresh_token,
+    owner,
     created_at: Date.now(),
   }));
 
@@ -1182,6 +1189,43 @@ async function runGmailPoll(env) {
 // POST { session_id }                      → { enabled, lastPolledAt, backfill }
 // POST { session_id, enabled: true|false } → set (enabling verifies gmail scope)
 // POST { session_id, backfill: true }      → enable + kick off a one-time 30-day import
+// If the current session has no Gmail opt-in but the same Google account has
+// one attached to a prior (rotated) session, move it onto the new session_id.
+// Returns the migrated cfg or null.
+async function migrateOrphanedGmailPoll(env, newSessionId) {
+  const owner = await sessionOwner(env, newSessionId);
+  if (!owner) return null;
+  const list = await env.AUTH_TOKENS.list({ prefix: 'gmailpoll:' });
+  for (const k of list.keys) {
+    if (k.name === `gmailpoll:${newSessionId}`) continue;
+    const raw = await env.AUTH_TOKENS.get(k.name);
+    if (!raw) continue;
+    let cfg; try { cfg = JSON.parse(raw); } catch { continue; }
+    let cfgOwner = cfg.owner || null;
+    // Legacy entry with no owner stamped — resolve via its linked session.
+    if (!cfgOwner && cfg.sessionId) cfgOwner = await sessionOwner(env, cfg.sessionId);
+    if (!cfgOwner || cfgOwner !== owner) continue;
+    const migrated = { ...cfg, owner, sessionId: newSessionId };
+    await env.AUTH_TOKENS.put(`gmailpoll:${newSessionId}`, JSON.stringify(migrated));
+    await env.AUTH_TOKENS.delete(k.name);
+    return migrated;
+  }
+  return null;
+}
+
+// Cheap owner lookup: prefer the value stamped on the session record; fall back
+// to minting an access token and asking Google Calendar. Never throws.
+async function sessionOwner(env, sessionId) {
+  const raw = await env.AUTH_TOKENS.get(`session:${sessionId}`);
+  if (!raw) return null;
+  let sess; try { sess = JSON.parse(raw); } catch { return null; }
+  if (sess && sess.owner) return sess.owner;
+  if (!sess || !sess.refresh_token) return null;
+  const { token } = await googleAccessTokenFromRefresh(env, sess.refresh_token);
+  if (!token) return null;
+  return await primaryCalendarId(token);
+}
+
 async function handleGmailConfig(request, env) {
   const { body, error } = await authedBody(request, env);
   if (error) return error;
@@ -1189,7 +1233,11 @@ async function handleGmailConfig(request, env) {
 
   // Status read.
   if (body.enabled === undefined && !body.backfill) {
-    const raw = await env.AUTH_TOKENS.get(key);
+    let raw = await env.AUTH_TOKENS.get(key);
+    if (!raw) {
+      const migrated = await migrateOrphanedGmailPoll(env, body.session_id);
+      if (migrated) raw = JSON.stringify(migrated);
+    }
     const cfg = raw ? (JSON.parse(raw) || {}) : {};
     return json({ ok: true, enabled: !!cfg.enabled, lastPolledAt: cfg.lastPolledAt || 0, backfill: !!cfg.backfill });
   }
@@ -1209,11 +1257,18 @@ async function handleGmailConfig(request, env) {
   if (test.status === 403) return json({ error: 'insufficient_scope', message: 'Re-connect Google to grant Gmail read access' }, 403);
   if (!test.ok) return json({ error: 'gmail_check_failed', status: test.status }, 502);
 
-  const existing = await env.AUTH_TOKENS.get(key);
+  // If the caller has no local entry yet, try to inherit one from a rotated
+  // session on the same account before creating a fresh one.
+  let existing = await env.AUTH_TOKENS.get(key);
+  if (!existing) {
+    const migrated = await migrateOrphanedGmailPoll(env, body.session_id);
+    if (migrated) existing = JSON.stringify(migrated);
+  }
   const prev = existing ? (JSON.parse(existing) || {}) : {};
   const next = {
     enabled: true,
     sessionId: body.session_id,
+    owner: prev.owner || await sessionOwner(env, body.session_id),
     processedIds: prev.processedIds || [],
     lastPolledAt: prev.lastPolledAt || 0,
     createdAt: prev.createdAt || Date.now(),
