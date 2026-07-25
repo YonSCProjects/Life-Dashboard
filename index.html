@@ -2923,9 +2923,16 @@ function unsettledPrepaysFor(ym) {
   return caregiverPrepays.filter(p => !settledIds.has(p.id) && p.date <= cutoff);
 }
 
+// Pocket money is a weekly fee that we bill as a flat monthly average, so it
+// doesn't shift between 4-week and 5-week months. e.g. 100/wk → 100 × 52 / 12
+// ≈ 433/mo (rounded to whole shekels).
+function averagedMonthlyPocket(weeklyRate) {
+  return Math.round((Number(weeklyRate) || 0) * 52 / 12);
+}
+
 function calcMonthSalary(rates, inputs) {
   const sat   = (rates.satRate || 0) * (inputs.satCount || 0);
-  const pock  = (rates.weeklyPocket || 0) * (inputs.weeksCount || 0);
+  const pock  = averagedMonthlyPocket(rates.weeklyPocket);
   const food  = inputs.foodOn   ? (rates.foodMonthly   || 0) : 0;
   const fath  = inputs.fatherOn ? (rates.fatherMonthly || 0) : 0;
   const bonus = inputs.bonusAmt || 0;
@@ -2974,7 +2981,6 @@ function renderCaregiver() {
       </div>
 
       ${cgInputRow('Saturdays worked', 'satCount', inputs.satCount, `(${countSaturdaysInMonth(ym)} in month)`)}
-      ${cgInputRow('Weeks of pocket money', 'weeksCount', inputs.weeksCount)}
       ${cgRateToggleRow('Food allowance', 'foodOn', inputs.foodOn, 'foodMonthly')}
       ${cgRateToggleRow('Helping father', 'fatherOn', inputs.fatherOn, 'fatherMonthly')}
       ${cgInputRow('Bonus', 'bonusAmt', inputs.bonusAmt, CURRENCY)}
@@ -2986,7 +2992,7 @@ function renderCaregiver() {
       <div style="border-top:1px solid var(--border);margin-top:12px;padding-top:12px;font-size:13px">
         ${cgBreakdownRow('Base salary', breakdown.base)}
         ${cgBreakdownRow(`Saturdays (${inputs.satCount} × ${fmtMoney(caregiverConfig.satRate)})`, breakdown.sat)}
-        ${cgBreakdownRow(`Pocket money (${inputs.weeksCount} × ${fmtMoney(caregiverConfig.weeklyPocket)})`, breakdown.pock)}
+        ${cgBreakdownRow(`Pocket money (${fmtMoney(caregiverConfig.weeklyPocket)}/wk × 52 ÷ 12)`, breakdown.pock)}
         ${inputs.foodOn ? cgBreakdownRow('Food', breakdown.food) : ''}
         ${inputs.fatherOn ? cgBreakdownRow('Helping father', breakdown.fath) : ''}
         ${breakdown.bonus ? cgBreakdownRow('Bonus' + (inputs.bonusNote ? ` (${esc(inputs.bonusNote)})` : ''), breakdown.bonus) : ''}
@@ -3150,7 +3156,12 @@ function openCaregiverRates() {
       <div style="font-size:11px;color:var(--text3);margin-bottom:14px">All amounts in ${CURRENCY}. Edit anytime.</div>
       ${cgRatesField('Base salary (monthly)', 'rate-base', c.baseSalary)}
       ${cgRatesField('Saturday rate (per Saturday worked)', 'rate-sat', c.satRate)}
-      ${cgRatesField('Weekly pocket money (per week)', 'rate-pocket', c.weeklyPocket)}
+      <div style="margin-bottom:14px">
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">WEEKLY POCKET MONEY (PER WEEK)</label>
+        <input id="rate-pocket" type="number" min="0" step="0.01" value="${c.weeklyPocket}" style="font-size:14px"
+               oninput="document.getElementById('rate-pocket-hint').textContent = '≈ ' + averagedMonthlyPocket(this.value) + ' ${CURRENCY}/month (× 52 weeks ÷ 12 months, rounded)'">
+        <div id="rate-pocket-hint" style="font-size:11px;color:var(--text3);margin-top:4px">≈ ${averagedMonthlyPocket(c.weeklyPocket)} ${CURRENCY}/month (× 52 weeks ÷ 12 months, rounded)</div>
+      </div>
       ${cgRatesField('Food allowance (monthly)', 'rate-food', c.foodMonthly)}
       ${cgRatesField('Helping father (monthly)', 'rate-father', c.fatherMonthly)}
     </div>
