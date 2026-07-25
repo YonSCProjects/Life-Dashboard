@@ -5850,7 +5850,19 @@ function fireTestReminder() {
 
 // ── PWA / Service Worker ──
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js').catch(() => {});
+  // updateViaCache: 'none' bypasses the HTTP cache when the browser checks
+  // sw.js for updates, so new versions land within a page load instead of
+  // hours later. Then we explicitly poke for an update on every load and
+  // whenever the tab regains focus, so a background PWA picks up new
+  // deploys as soon as the user opens it.
+  navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' })
+    .then(reg => {
+      reg.update().catch(() => {});
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') reg.update().catch(() => {});
+      });
+    })
+    .catch(() => {});
 }
 
 // ── Bootstrap ──
