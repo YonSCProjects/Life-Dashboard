@@ -2980,14 +2980,31 @@ function cgMonthContext(ym, rates) {
 }
 
 function calcMonthSalary(rates, inputs, ctx) {
-  ctx = ctx || { holiday: { paid: 0, inMonth: 0 }, vacation: { paid: 0, inMonth: 0 } };
+  ctx = ctx || {
+    holiday:  { paid: 0, over: 0, inMonth: 0 },
+    vacation: { paid: 0, over: 0, inMonth: 0 },
+  };
   const sat   = (rates.satRate || 0) * (inputs.satCount || 0);
   const pock  = averagedMonthlyPocket(rates.weeklyPocket);
   const food  = inputs.foodOn   ? (rates.foodMonthly   || 0) : 0;
   const fath  = inputs.fatherOn ? (rates.fatherMonthly || 0) : 0;
   const bonus = inputs.bonusAmt || 0;
-  const holidayPay  = ctx.holiday.paid  * (rates.holidayDailyRate  || 0);
-  const vacationPay = ctx.vacation.paid * (rates.vacationDailyRate || 0);
+
+  // Vacation/leave semantics — base salary already covers a day of leave
+  // within the yearly quota, so those days add nothing. Days OVER the yearly
+  // quota subtract a full yearly-leave day rate each (she took time off she
+  // hadn't earned). Religious holidays within their own quota pay only the
+  // DIFFERENTIAL between the holiday rate and the leave rate (the "base leave"
+  // is already implied by base salary); once over their quota they're treated
+  // like over-quota leave and subtract the leave rate per over-day.
+  const leaveRate = rates.vacationDailyRate || 0;
+  const holRate   = rates.holidayDailyRate  || 0;
+  const holDelta  = holRate - leaveRate;
+
+  const vacationPay = -1 * (ctx.vacation.over || 0) * leaveRate;
+  const holidayPay  = (ctx.holiday.paid || 0) * holDelta
+                    - (ctx.holiday.over || 0) * leaveRate;
+
   const gross = (rates.baseSalary || 0) + sat + pock + food + fath + bonus + holidayPay + vacationPay;
   return {
     base: rates.baseSalary || 0,
@@ -3061,8 +3078,8 @@ function renderCaregiver() {
         ${cgBreakdownRow(`Pocket money (${fmtMoney(caregiverConfig.weeklyPocket)}/wk × 52 ÷ 12)`, breakdown.pock)}
         ${inputs.foodOn ? cgBreakdownRow('Food', breakdown.food) : ''}
         ${inputs.fatherOn ? cgBreakdownRow('Helping father', breakdown.fath) : ''}
-        ${cgQuotaBreakdownRow('🎊 Religious holidays', ctx.holiday, caregiverConfig.holidayDailyRate, breakdown.holidayPay)}
-        ${cgQuotaBreakdownRow('🌴 Yearly leave', ctx.vacation, caregiverConfig.vacationDailyRate, breakdown.vacationPay)}
+        ${cgHolidayBreakdownRow(ctx.holiday, caregiverConfig.holidayDailyRate, caregiverConfig.vacationDailyRate, breakdown.holidayPay)}
+        ${cgVacationBreakdownRow(ctx.vacation, caregiverConfig.vacationDailyRate, breakdown.vacationPay)}
         ${breakdown.bonus ? cgBreakdownRow('Bonus' + (inputs.bonusNote ? ` (${esc(inputs.bonusNote)})` : ''), breakdown.bonus) : ''}
         <div style="display:flex;justify-content:space-between;font-weight:600;margin-top:6px;padding-top:6px;border-top:1px solid var(--border)">
           <span>Gross total</span><span>${fmtMoney(breakdown.gross)}</span>
@@ -3154,24 +3171,53 @@ function cgBreakdownRow(label, amount) {
   </div>`;
 }
 
-// Render a breakdown line for a quota-bound day type (holidays or leave).
-// Emits nothing if nothing was taken this month AND the type isn't configured.
-function cgQuotaBreakdownRow(label, slice, dailyRate, pay) {
-  if (!slice.inMonth && !slice.yearlyMax && !dailyRate) return '';
-  const rate = dailyRate || 0;
+// Small helper — YTD usage line used in the vacation/holiday subtitles.
+function cgYtdSuffix(slice) {
+  const used = slice.before + slice.inMonth;
+  const total = slice.yearlyMax || 0;
+  const left = Math.max(0, total - used);
+  return `${used}/${total} used YTD${left ? ` (${left} left)` : ''}`;
+}
+
+// Yearly-leave row. Within quota → 0 (base salary already covers the day).
+// Over quota → deduct leaveRate per over-day.
+function cgVacationBreakdownRow(slice, leaveRate, pay) {
+  if (!slice.inMonth && !slice.yearlyMax && !leaveRate) return '';
   let subtitle;
   if (!slice.inMonth) {
-    subtitle = 'none this month';
+    subtitle = `none this month · ${cgYtdSuffix(slice)}`;
   } else if (slice.over) {
-    subtitle = `${slice.paid} paid, ${slice.over} over quota — ${slice.before + slice.paid}/${slice.yearlyMax} used YTD`;
+    subtitle = `${slice.paid} within quota (covered by base) · ${slice.over} over × −${fmtMoney(leaveRate)} — ${cgYtdSuffix(slice)}`;
   } else {
-    const remainingAfter = Math.max(0, slice.yearlyMax - slice.before - slice.paid);
-    subtitle = `${slice.paid} × ${fmtMoney(rate)} — ${slice.before + slice.paid}/${slice.yearlyMax} used YTD (${remainingAfter} left)`;
+    subtitle = `${slice.inMonth} within quota (covered by base) — ${cgYtdSuffix(slice)}`;
   }
   return `
     <div style="display:flex;justify-content:space-between;color:var(--text2);margin-bottom:3px">
       <div style="flex:1;min-width:0">
-        <div>${label}</div>
+        <div>🌴 Yearly leave</div>
+        <div style="font-size:11px;color:var(--text3)">${subtitle}</div>
+      </div>
+      <span>${fmtMoney(pay)}</span>
+    </div>`;
+}
+
+// Religious-holiday row. Within quota → paid × (holRate − leaveRate) bonus.
+// Over quota → same differential on within-quota days, minus leaveRate × over.
+function cgHolidayBreakdownRow(slice, holRate, leaveRate, pay) {
+  if (!slice.inMonth && !slice.yearlyMax && !holRate) return '';
+  const delta = holRate - leaveRate;
+  let subtitle;
+  if (!slice.inMonth) {
+    subtitle = `none this month · ${cgYtdSuffix(slice)}`;
+  } else if (slice.over) {
+    subtitle = `${slice.paid} within quota × Δ${fmtMoney(delta)} bonus · ${slice.over} over × −${fmtMoney(leaveRate)} — ${cgYtdSuffix(slice)}`;
+  } else {
+    subtitle = `${slice.paid} × Δ${fmtMoney(delta)} bonus over a regular leave day — ${cgYtdSuffix(slice)}`;
+  }
+  return `
+    <div style="display:flex;justify-content:space-between;color:var(--text2);margin-bottom:3px">
+      <div style="flex:1;min-width:0">
+        <div>🎊 Religious holidays</div>
         <div style="font-size:11px;color:var(--text3)">${subtitle}</div>
       </div>
       <span>${fmtMoney(pay)}</span>
