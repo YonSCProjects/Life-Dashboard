@@ -736,6 +736,7 @@ let caregiverHoliday = [];        // [{id, date}]  — holiday vacation days
 let caregiverSick = [];           // [{id, date}]
 let caregiverPrepays = [];        // [{id, date, amount, note}]
 let caregiverDraft = null;        // unsaved current-month inputs (kept in memory while user types)
+let caregiverViewYm = null;       // null = today's YM; 'YYYY-MM' when browsing a different month
 let activeCategory = 'all';
 let showAddFormVisible = false;
 let currentTab = 'tasks';
@@ -2883,6 +2884,27 @@ function parseCaregiverConfig(event) {
     weeklyPocket: Number(cfg.weeklyPocket) || 0,
     foodMonthly: Number(cfg.foodMonthly) || 0,
     fatherMonthly: Number(cfg.fatherMonthly) || 0,
+    // Religious holidays (חגים) — paid per day up to a yearly quota
+    holidayDailyRate: Number(cfg.holidayDailyRate) || 0,
+    holidayYearlyMax: Number(cfg.holidayYearlyMax) || 0,
+    // Yearly leave (חופש) — paid per day up to a yearly quota
+    vacationDailyRate: Number(cfg.vacationDailyRate) || 0,
+    vacationYearlyMax: Number(cfg.vacationYearlyMax) || 0,
+  };
+}
+
+// Helper to serialise the config record consistently everywhere it's written.
+function serialiseCaregiverConfig(c) {
+  return {
+    baseSalary: c.baseSalary || 0,
+    satRate: c.satRate || 0,
+    weeklyPocket: c.weeklyPocket || 0,
+    foodMonthly: c.foodMonthly || 0,
+    fatherMonthly: c.fatherMonthly || 0,
+    holidayDailyRate: c.holidayDailyRate || 0,
+    holidayYearlyMax: c.holidayYearlyMax || 0,
+    vacationDailyRate: c.vacationDailyRate || 0,
+    vacationYearlyMax: c.vacationYearlyMax || 0,
   };
 }
 
@@ -2930,14 +2952,49 @@ function averagedMonthlyPocket(weeklyRate) {
   return Math.ceil((Number(weeklyRate) || 0) * 52 / 12);
 }
 
-function calcMonthSalary(rates, inputs) {
+// For a list of dated days (each {date:'YYYY-MM-DD'}), report how many fall in
+// this month, how many were used earlier in the same year, and how many of the
+// month's days actually get paid given the yearly quota. Earlier days in the
+// year consume quota first, so a mid-year month can partially clip.
+function cgQuotaSlice(days, ym, yearlyMax) {
+  const year = ym.slice(0, 4);
+  let inMonth = 0, before = 0;
+  for (const d of days) {
+    const date = d && d.date;
+    if (!date || !date.startsWith(year)) continue;
+    const dYm = date.slice(0, 7);
+    if (dYm === ym) inMonth++;
+    else if (dYm < ym) before++;
+  }
+  const remaining = Math.max(0, (yearlyMax || 0) - before);
+  const paid = Math.min(inMonth, remaining);
+  return { inMonth, before, paid, over: inMonth - paid, yearlyMax: yearlyMax || 0 };
+}
+
+// Build the per-month vacation context using the current global day lists.
+function cgMonthContext(ym, rates) {
+  return {
+    holiday:  cgQuotaSlice(caregiverHoliday,  ym, rates.holidayYearlyMax),
+    vacation: cgQuotaSlice(caregiverVacation, ym, rates.vacationYearlyMax),
+  };
+}
+
+function calcMonthSalary(rates, inputs, ctx) {
+  ctx = ctx || { holiday: { paid: 0, inMonth: 0 }, vacation: { paid: 0, inMonth: 0 } };
   const sat   = (rates.satRate || 0) * (inputs.satCount || 0);
   const pock  = averagedMonthlyPocket(rates.weeklyPocket);
   const food  = inputs.foodOn   ? (rates.foodMonthly   || 0) : 0;
   const fath  = inputs.fatherOn ? (rates.fatherMonthly || 0) : 0;
   const bonus = inputs.bonusAmt || 0;
-  const gross = (rates.baseSalary || 0) + sat + pock + food + fath + bonus;
-  return { base: rates.baseSalary || 0, sat, pock, food, fath, bonus, gross };
+  const holidayPay  = ctx.holiday.paid  * (rates.holidayDailyRate  || 0);
+  const vacationPay = ctx.vacation.paid * (rates.vacationDailyRate || 0);
+  const gross = (rates.baseSalary || 0) + sat + pock + food + fath + bonus + holidayPay + vacationPay;
+  return {
+    base: rates.baseSalary || 0,
+    sat, pock, food, fath, bonus,
+    holidayPay, vacationPay, ctx,
+    gross,
+  };
 }
 
 function renderCaregiver() {
@@ -2955,7 +3012,8 @@ function renderCaregiver() {
     return;
   }
 
-  const ym = getYM();
+  const ym = currentCgYm();
+  const todayYm = getYM();
   const draft = caregiverDraft && caregiverDraft.ym === ym ? caregiverDraft : null;
   const savedThisMonth = caregiverMonths.find(m => m.ym === ym);
   const inputs = draft || savedThisMonth || {
@@ -2967,7 +3025,8 @@ function renderCaregiver() {
     bonusAmt: 0,
     bonusNote: '',
   };
-  const breakdown = calcMonthSalary(caregiverConfig, inputs);
+  const ctx = cgMonthContext(ym, caregiverConfig);
+  const breakdown = calcMonthSalary(caregiverConfig, inputs, ctx);
   const unsettled = unsettledPrepaysFor(ym);
   const prePaySum = unsettled.reduce((s, p) => s + p.amount, 0);
   const netDue = Math.max(0, breakdown.gross - prePaySum);
@@ -2975,8 +3034,15 @@ function renderCaregiver() {
   body.innerHTML = `
     <!-- Calculator -->
     <div class="card" style="padding:16px;margin-bottom:16px">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <div style="font-weight:600;font-size:15px">${getMonthLabel(ym)}</div>
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:12px">
+        <button class="btn btn-ghost btn-sm" onclick="cgShiftYm(-1)" title="Previous month">◀</button>
+        <input type="month" value="${ym}" onchange="cgSetYm(this.value)"
+               style="flex:1;text-align:center;font-weight:600;font-size:14px;padding:6px 4px">
+        <button class="btn btn-ghost btn-sm" onclick="cgShiftYm(1)" title="Next month">▶</button>
+        ${ym !== todayYm ? `<button class="btn btn-ghost btn-sm" onclick="cgSetYm(null)" title="Jump to current month">Today</button>` : ''}
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <div style="font-size:12px;color:var(--text3)">${getMonthLabel(ym)}${savedThisMonth ? ' · saved' : ''}</div>
         <button class="btn btn-ghost btn-sm" onclick="openCaregiverRates()">Edit rates</button>
       </div>
 
@@ -2995,6 +3061,8 @@ function renderCaregiver() {
         ${cgBreakdownRow(`Pocket money (${fmtMoney(caregiverConfig.weeklyPocket)}/wk × 52 ÷ 12)`, breakdown.pock)}
         ${inputs.foodOn ? cgBreakdownRow('Food', breakdown.food) : ''}
         ${inputs.fatherOn ? cgBreakdownRow('Helping father', breakdown.fath) : ''}
+        ${cgQuotaBreakdownRow('🎊 Religious holidays', ctx.holiday, caregiverConfig.holidayDailyRate, breakdown.holidayPay)}
+        ${cgQuotaBreakdownRow('🌴 Yearly leave', ctx.vacation, caregiverConfig.vacationDailyRate, breakdown.vacationPay)}
         ${breakdown.bonus ? cgBreakdownRow('Bonus' + (inputs.bonusNote ? ` (${esc(inputs.bonusNote)})` : ''), breakdown.bonus) : ''}
         <div style="display:flex;justify-content:space-between;font-weight:600;margin-top:6px;padding-top:6px;border-top:1px solid var(--border)">
           <span>Gross total</span><span>${fmtMoney(breakdown.gross)}</span>
@@ -3033,8 +3101,8 @@ function renderCaregiver() {
       <div class="card" style="padding:14px;margin-bottom:14px">
         <div style="font-weight:600;font-size:14px;margin-bottom:10px">History</div>
         ${caregiverMonths.slice(0, 12).map(m => `
-          <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px">
-            <span>${getMonthLabel(m.ym)}</span>
+          <div onclick="cgSetYm('${m.ym}')" style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px;cursor:pointer">
+            <span>${getMonthLabel(m.ym)}${m.ym === currentCgYm() ? ' · viewing' : ''}</span>
             <span style="font-weight:600">${fmtMoney(m.total)}</span>
           </div>
         `).join('')}
@@ -3069,13 +3137,7 @@ async function cgUpdateRate(rateKey, value) {
   if (!caregiverConfig) { showError('Set up caregiver rates first'); return; }
   caregiverConfig[rateKey] = value;
   renderCaregiver();
-  const cfg = {
-    baseSalary:    caregiverConfig.baseSalary    || 0,
-    satRate:       caregiverConfig.satRate       || 0,
-    weeklyPocket:  caregiverConfig.weeklyPocket  || 0,
-    foodMonthly:   caregiverConfig.foodMonthly   || 0,
-    fatherMonthly: caregiverConfig.fatherMonthly || 0,
-  };
+  const cfg = serialiseCaregiverConfig(caregiverConfig);
   try {
     if (caregiverConfig.id) {
       await updateEvent(caregiverConfig.id, { description: JSON.stringify(cfg) });
@@ -3092,19 +3154,69 @@ function cgBreakdownRow(label, amount) {
   </div>`;
 }
 
-function cgListSection(title, items, addFn, delFn, showAmount) {
-  const today = new Date().toISOString().split('T')[0];
+// Render a breakdown line for a quota-bound day type (holidays or leave).
+// Emits nothing if nothing was taken this month AND the type isn't configured.
+function cgQuotaBreakdownRow(label, slice, dailyRate, pay) {
+  if (!slice.inMonth && !slice.yearlyMax && !dailyRate) return '';
+  const rate = dailyRate || 0;
+  let subtitle;
+  if (!slice.inMonth) {
+    subtitle = 'none this month';
+  } else if (slice.over) {
+    subtitle = `${slice.paid} paid, ${slice.over} over quota — ${slice.before + slice.paid}/${slice.yearlyMax} used YTD`;
+  } else {
+    const remainingAfter = Math.max(0, slice.yearlyMax - slice.before - slice.paid);
+    subtitle = `${slice.paid} × ${fmtMoney(rate)} — ${slice.before + slice.paid}/${slice.yearlyMax} used YTD (${remainingAfter} left)`;
+  }
   return `
-    <div style="font-weight:600;font-size:14px;margin-bottom:10px">${title} <span style="color:var(--text3);font-weight:400">(${items.length})</span></div>
+    <div style="display:flex;justify-content:space-between;color:var(--text2);margin-bottom:3px">
+      <div style="flex:1;min-width:0">
+        <div>${label}</div>
+        <div style="font-size:11px;color:var(--text3)">${subtitle}</div>
+      </div>
+      <span>${fmtMoney(pay)}</span>
+    </div>`;
+}
+
+// ── Month navigation for the salary calculator ──
+function currentCgYm() { return caregiverViewYm || getYM(); }
+function cgSetYm(ym) {
+  caregiverViewYm = ym || null;
+  caregiverDraft = null; // drop any unsaved edits from the previous month
+  renderCaregiver();
+}
+function cgShiftYm(delta) {
+  const [y, m] = currentCgYm().split('-').map(Number);
+  cgSetYm(getYM(new Date(y, m - 1 + delta, 1)));
+}
+
+function cgListSection(title, items, addFn, delFn, showAmount) {
+  // Default the picker to the viewed month rather than "today", so a user
+  // editing March 2026 can add a vacation day without re-picking the year/month.
+  const viewYm = currentCgYm();
+  const todayYm = getYM();
+  const defaultDate = viewYm === todayYm
+    ? new Date().toISOString().split('T')[0]
+    : viewYm + '-01';
+  const inMonth = items.filter(it => (it.date || '').slice(0, 7) === viewYm).length;
+  const inYear = items.filter(it => (it.date || '').startsWith(viewYm.slice(0, 4))).length;
+  return `
+    <div style="display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px">
+      <div style="font-weight:600;font-size:14px">${title} <span style="color:var(--text3);font-weight:400">(${items.length} total)</span></div>
+      <div style="font-size:11px;color:var(--text3)">${inMonth} this month · ${inYear} this year</div>
+    </div>
     <div style="display:flex;gap:6px;margin-bottom:10px">
-      <input type="date" id="cg-${addFn}-date" value="${today}" style="flex:1;font-size:12px">
+      <input type="date" id="cg-${addFn}-date" value="${defaultDate}" style="flex:1;font-size:12px">
       <button class="btn btn-primary btn-sm" onclick="${addFn}()">+ Add</button>
     </div>
-    ${items.length ? items.slice(0, 20).map(it => `
-      <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;font-size:13px;border-bottom:1px solid var(--border)">
+    ${items.length ? items.slice(0, 20).map(it => {
+      const highlight = (it.date || '').slice(0, 7) === viewYm;
+      return `
+      <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;font-size:13px;border-bottom:1px solid var(--border);${highlight ? 'font-weight:600' : ''}">
         <span>${it.date}</span>
         <button style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:14px;padding:4px" onclick="${delFn}('${it.id}')">×</button>
-      </div>`).join('') : '<div style="color:var(--text3);font-size:12px">None recorded</div>'}`;
+      </div>`;
+    }).join('') : '<div style="color:var(--text3);font-size:12px">None recorded</div>'}`;
 }
 
 function cgPrepaysSection() {
@@ -3131,7 +3243,7 @@ function cgPrepaysSection() {
 }
 
 function cgUpdateDraft(key, value) {
-  const ym = getYM();
+  const ym = currentCgYm();
   const savedThisMonth = caregiverMonths.find(m => m.ym === ym);
   if (!caregiverDraft || caregiverDraft.ym !== ym) {
     caregiverDraft = savedThisMonth ? { ...savedThisMonth, ym } : {
@@ -3145,7 +3257,10 @@ function cgUpdateDraft(key, value) {
 
 // ── Rates editor ──
 function openCaregiverRates() {
-  const c = caregiverConfig || { baseSalary: 0, satRate: 0, weeklyPocket: 0, foodMonthly: 0, fatherMonthly: 0 };
+  const c = caregiverConfig || {
+    baseSalary: 0, satRate: 0, weeklyPocket: 0, foodMonthly: 0, fatherMonthly: 0,
+    holidayDailyRate: 0, holidayYearlyMax: 0, vacationDailyRate: 0, vacationYearlyMax: 0,
+  };
   showDetail(`
     <div class="detail-header">
       <button class="detail-back" onclick="closeDetail()">&larr;</button>
@@ -3164,6 +3279,24 @@ function openCaregiverRates() {
       </div>
       ${cgRatesField('Food allowance (monthly)', 'rate-food', c.foodMonthly)}
       ${cgRatesField('Helping father (monthly)', 'rate-father', c.fatherMonthly)}
+
+      <div style="border-top:1px solid var(--border);margin-top:18px;padding-top:14px">
+        <div style="font-weight:600;font-size:13px;margin-bottom:4px">🎊 Religious holidays</div>
+        <div style="font-size:11px;color:var(--text3);margin-bottom:10px">Paid per day, capped at the yearly quota. Days beyond the quota show up in the breakdown as "over quota" and aren't paid.</div>
+        <div style="display:flex;gap:10px">
+          <div style="flex:1">${cgRatesField('Rate per day', 'rate-holiday-daily', c.holidayDailyRate)}</div>
+          <div style="flex:1">${cgRatesField('Yearly max (days)', 'rate-holiday-max', c.holidayYearlyMax)}</div>
+        </div>
+      </div>
+
+      <div style="border-top:1px solid var(--border);margin-top:6px;padding-top:14px">
+        <div style="font-weight:600;font-size:13px;margin-bottom:4px">🌴 Yearly leave</div>
+        <div style="font-size:11px;color:var(--text3);margin-bottom:10px">Paid per day, capped at the yearly quota. Earlier-in-year days consume the quota first.</div>
+        <div style="display:flex;gap:10px">
+          <div style="flex:1">${cgRatesField('Rate per day', 'rate-vacation-daily', c.vacationDailyRate)}</div>
+          <div style="flex:1">${cgRatesField('Yearly max (days)', 'rate-vacation-max', c.vacationYearlyMax)}</div>
+        </div>
+      </div>
     </div>
   `);
 }
@@ -3175,13 +3308,17 @@ function cgRatesField(label, id, value) {
     </div>`;
 }
 async function saveCaregiverRates() {
-  const cfg = {
-    baseSalary:    Number(document.getElementById('rate-base').value)   || 0,
-    satRate:       Number(document.getElementById('rate-sat').value)    || 0,
-    weeklyPocket:  Number(document.getElementById('rate-pocket').value) || 0,
-    foodMonthly:   Number(document.getElementById('rate-food').value)   || 0,
-    fatherMonthly: Number(document.getElementById('rate-father').value) || 0,
-  };
+  const cfg = serialiseCaregiverConfig({
+    baseSalary:        Number(document.getElementById('rate-base').value)          || 0,
+    satRate:           Number(document.getElementById('rate-sat').value)           || 0,
+    weeklyPocket:      Number(document.getElementById('rate-pocket').value)        || 0,
+    foodMonthly:       Number(document.getElementById('rate-food').value)          || 0,
+    fatherMonthly:     Number(document.getElementById('rate-father').value)        || 0,
+    holidayDailyRate:  Number(document.getElementById('rate-holiday-daily').value) || 0,
+    holidayYearlyMax:  Number(document.getElementById('rate-holiday-max').value)   || 0,
+    vacationDailyRate: Number(document.getElementById('rate-vacation-daily').value)|| 0,
+    vacationYearlyMax: Number(document.getElementById('rate-vacation-max').value)  || 0,
+  });
   const btn = document.getElementById('save-rates-btn');
   btn.textContent = '...'; btn.disabled = true;
   try {
@@ -3201,13 +3338,14 @@ async function saveCaregiverRates() {
 // ── Save monthly salary ──
 async function saveCaregiverMonth() {
   if (!caregiverConfig) return;
-  const ym = getYM();
+  const ym = currentCgYm();
   const inputs = caregiverDraft && caregiverDraft.ym === ym ? caregiverDraft :
     (caregiverMonths.find(m => m.ym === ym) || {
       ym, satCount: 0, weeksCount: countSaturdaysInMonth(ym),
       foodOn: true, fatherOn: true, bonusAmt: 0, bonusNote: '',
     });
-  const breakdown = calcMonthSalary(caregiverConfig, inputs);
+  const ctx = cgMonthContext(ym, caregiverConfig);
+  const breakdown = calcMonthSalary(caregiverConfig, inputs, ctx);
   const unsettled = unsettledPrepaysFor(ym);
   const prePaySum = unsettled.reduce((s, p) => s + p.amount, 0);
   const netDue = Math.max(0, breakdown.gross - prePaySum);
