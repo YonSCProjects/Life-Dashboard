@@ -774,6 +774,23 @@ const TOKEN_KEY     = 'dash-token';
 const TOKEN_EXP_KEY = 'dash-token-exp';
 const SESSION_KEY   = 'dash-session';
 const INGEST_TOKEN_KEY = 'dash-ingest-token'; // scoped Tasker token; persists across re-auth
+
+// ── AI model choice (per-feature) ──
+// Menu order is cheap → capable so the price signal reads at a glance.
+const AI_MODEL_OPTIONS = [
+  { id: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5 — cheapest, fast, $1/$5 per M' },
+  { id: 'claude-sonnet-5',           label: 'Sonnet 5 — balanced, $3/$15 per M' },
+  { id: 'claude-opus-5',             label: 'Opus 5 — most capable, $5/$25 per M' },
+];
+const CHAT_MODEL_KEY  = 'dash-model-chat';
+const FOOD_MODEL_KEY  = 'dash-model-food';
+const ORDER_MODEL_KEY = 'dash-model-order-parse'; // local hint; source of truth is the worker
+const DEFAULT_CHAT_MODEL  = 'claude-sonnet-5';
+const DEFAULT_FOOD_MODEL  = 'claude-haiku-4-5-20251001';
+const DEFAULT_ORDER_MODEL = 'claude-haiku-4-5-20251001';
+function getChatModel()  { return localStorage.getItem(CHAT_MODEL_KEY)  || DEFAULT_CHAT_MODEL;  }
+function getFoodModel()  { return localStorage.getItem(FOOD_MODEL_KEY)  || DEFAULT_FOOD_MODEL;  }
+function getOrderModel() { return localStorage.getItem(ORDER_MODEL_KEY) || DEFAULT_ORDER_MODEL; }
 const PKCE_KEY      = 'dash-pkce-verifier';
 const STATE_KEY     = 'dash-oauth-state';
 
@@ -3619,7 +3636,7 @@ async function estimateCalories(food) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
+      model: getFoodModel(),
       max_tokens: 50,
       system: 'You estimate calories. The user names a food or drink and an amount. Respond with ONLY a single integer — your best estimate of the total kilocalories. No words, no units, no ranges.',
       messages: [{ role: 'user', content: food }],
@@ -4029,7 +4046,7 @@ async function parseOrderMessage() {
 
     const r = await fetch(workerEndpoint('/orders/parse'), {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId, text, existing_orders: existing }),
+      body: JSON.stringify({ session_id: sessionId, text, existing_orders: existing, model: getOrderModel() }),
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok || !data.parsed) {
@@ -5239,6 +5256,92 @@ async function saveMemory() {
   }
 }
 
+// ── Per-feature model selector ──
+function modelSelectHtml(id, current) {
+  const opts = AI_MODEL_OPTIONS.map(o =>
+    `<option value="${o.id}" ${o.id === current ? 'selected' : ''}>${esc(o.label)}</option>`).join('');
+  return `<select id="${id}" style="width:100%;font-size:13px;padding:8px">${opts}</select>`;
+}
+
+async function openAiModelSettings() {
+  const chatCur  = getChatModel();
+  const foodCur  = getFoodModel();
+  let orderCur   = getOrderModel();
+
+  // Pull the authoritative order-parse model from the worker (survives re-auth).
+  if (getWorkerUrl() && sessionId) {
+    try {
+      const r = await fetch(workerEndpoint('/config/models'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && d.orderParseModel) {
+        orderCur = d.orderParseModel;
+        localStorage.setItem(ORDER_MODEL_KEY, orderCur);
+      }
+    } catch { /* offline — fall back to local hint */ }
+  }
+
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">🤖 AI models</span>
+      <button class="btn btn-sm btn-primary" id="save-models-btn" onclick="saveAiModelSettings()">Save</button>
+    </div>
+    <div class="detail-body">
+      <div style="font-size:12px;color:var(--text3);line-height:1.5;margin-bottom:14px">
+        Pick which Claude model each AI feature uses. Prices shown are Anthropic list prices per million tokens (input / output).
+      </div>
+
+      <div style="margin-bottom:16px">
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">💬 CHAT PANEL</label>
+        ${modelSelectHtml('model-chat', chatCur)}
+        <div style="font-size:11px;color:var(--text3);margin-top:4px">Reasoning + multi-turn tool use. Sonnet 5 is the sensible default.</div>
+      </div>
+
+      <div style="margin-bottom:16px">
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">📦 ORDER PARSING (SMS, Gmail, manual paste)</label>
+        ${modelSelectHtml('model-order', orderCur)}
+        <div style="font-size:11px;color:var(--text3);margin-top:4px">Extracts merchant / tracking # / pickup location from shipping messages. Haiku 4.5 is plenty for this and ~12× cheaper.</div>
+      </div>
+
+      <div style="margin-bottom:16px">
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">🍽️ FOOD CALORIE ESTIMATE</label>
+        ${modelSelectHtml('model-food', foodCur)}
+        <div style="font-size:11px;color:var(--text3);margin-top:4px">Single integer out. Haiku 4.5 recommended.</div>
+      </div>
+
+      <div style="font-size:11px;color:var(--text3);line-height:1.5;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+        Chat &amp; food are per-device (stored on this device only). Order parsing follows your Google account (stored on the worker) so Gmail auto-import and Tasker SMS use the same choice.
+      </div>
+    </div>
+  `);
+}
+
+async function saveAiModelSettings() {
+  const chat  = document.getElementById('model-chat').value;
+  const food  = document.getElementById('model-food').value;
+  const order = document.getElementById('model-order').value;
+  const btn = document.getElementById('save-models-btn');
+  btn.disabled = true; btn.textContent = '...';
+  localStorage.setItem(CHAT_MODEL_KEY, chat);
+  localStorage.setItem(FOOD_MODEL_KEY, food);
+  localStorage.setItem(ORDER_MODEL_KEY, order);
+  try {
+    if (getWorkerUrl() && sessionId) {
+      await fetch(workerEndpoint('/config/models'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId, orderParseModel: order }),
+      });
+    }
+    closeDetail();
+  } catch (e) {
+    showError('Order parser model save failed: ' + e.message + ' (chat and food saved locally)');
+    btn.disabled = false; btn.textContent = 'Save';
+  }
+}
+
 async function clearMemory() {
   if (!confirm("Clear Claude's memory? Everything it has remembered across past chats will be erased.")) return;
   if (!memoryEventId) {
@@ -5269,6 +5372,7 @@ function openAI() {
         </div>
         <button class="ai-voice-toggle ${aiVoiceMode ? 'on' : ''}" id="ai-voice-toggle" onclick="aiToggleVoiceMode()" title="Speak replies & hands-free mode">${aiVoiceMode ? '🔊' : '🔇'}</button>
         <button class="btn btn-ghost btn-sm" onclick="openMemoryView()" title="View what Claude remembers across chats">🧠</button>
+        <button class="btn btn-ghost btn-sm" onclick="openAiModelSettings()" title="Choose which Claude model each AI feature uses">🤖</button>
         <button class="btn btn-ghost btn-sm" onclick="aiClear()">Clear</button>
       </div>
       ${!workerUrl ? `
@@ -5521,7 +5625,7 @@ async function aiSend() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'claude-sonnet-5',
+          model: getChatModel(),
           max_tokens: 2048,
           system,
           tools: CALENDAR_TOOLS.map((t, i, arr) =>

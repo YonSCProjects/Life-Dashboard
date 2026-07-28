@@ -154,9 +154,11 @@ const USAGE_PRICING = {
   'claude-haiku-4-5': [1.00, 5.00],
   'claude-3-5-haiku': [1.00, 5.00],
   'claude-haiku':     [1.00, 5.00],
+  'claude-sonnet-5':   [3.00, 15.00],
   'claude-sonnet-4-6': [3.00, 15.00],
   'claude-sonnet-4':   [3.00, 15.00],
   'claude-sonnet':     [3.00, 15.00],
+  'claude-opus-5':     [5.00, 25.00],
   'claude-opus':       [5.00, 25.00],
 };
 function usagePrice(model) {
@@ -521,7 +523,21 @@ const ORDER_PARSE_TOOL = {
 // Calls Claude with the forced parse tool. Returns the parsed input object.
 // `existing` is an array of compact { id, merchant, product, tracking_number, status } records for matching.
 // Throws on API/transport errors so callers can decide how to surface them.
-async function parseShippingMessage(env, text, existing) {
+const DEFAULT_PARSE_MODEL = 'claude-haiku-4-5-20251001';
+
+// Per-Google-account choice for which model runs the shipping-message parser.
+// Keyed by owner (primary calendar email) so it survives session rotation.
+async function getParseModelForOwner(env, owner) {
+  if (!owner) return DEFAULT_PARSE_MODEL;
+  try {
+    const raw = await env.AUTH_TOKENS.get(`parsecfg:${owner}`);
+    if (!raw) return DEFAULT_PARSE_MODEL;
+    const cfg = JSON.parse(raw);
+    return (cfg && cfg.orderParseModel) || DEFAULT_PARSE_MODEL;
+  } catch { return DEFAULT_PARSE_MODEL; }
+}
+
+async function parseShippingMessage(env, text, existing, modelOverride) {
   const apiKey = env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('Claude API key not configured on worker');
   const ctx = Array.isArray(existing) ? existing.slice(0, 30) : [];
@@ -544,7 +560,7 @@ You MUST call the parse_shipping_message tool exactly once with your best extrac
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
     body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
+      model: modelOverride || DEFAULT_PARSE_MODEL,
       max_tokens: 1024,
       system,
       tools: [ORDER_PARSE_TOOL],
@@ -559,7 +575,7 @@ You MUST call the parse_shipping_message tool exactly once with your best extrac
     e.status = r.status;
     throw e;
   }
-  if (data.usage) await recordUsage(env, data.model || 'claude-haiku-4-5-20251001', data.usage);
+  if (data.usage) await recordUsage(env, data.model || modelOverride || DEFAULT_PARSE_MODEL, data.usage);
   const toolUse = (data.content || []).find(b => b.type === 'tool_use' && b.name === 'parse_shipping_message');
   if (!toolUse) throw new Error('Claude did not return parsed fields');
   return toolUse.input;
@@ -574,13 +590,36 @@ async function handleOrderParse(request, env) {
   if (!text) return json({ error: 'missing text' }, 400);
   const existing = Array.isArray(body.existing_orders) ? body.existing_orders : [];
 
+  // Prefer an explicit model from the caller (user just picked it in the app),
+  // otherwise fall back to the account's stored default.
+  const owner = await sessionOwner(env, body.session_id);
+  const model = body.model || await getParseModelForOwner(env, owner);
+
   try {
-    const parsed = await parseShippingMessage(env, text, existing);
+    const parsed = await parseShippingMessage(env, text, existing, model);
     return json({ parsed });
   } catch (e) {
-    // API errors carry apiDetails; other failures (e.g. no tool_use) surface their own message.
     return json({ error: e.apiDetails ? 'Claude API error' : e.message, details: e.apiDetails }, e.status || 502);
   }
+}
+
+// ── /config/models — read/write the user's per-account model choices ──
+// GET-style read: POST { session_id }               → { orderParseModel }
+// Write:          POST { session_id, orderParseModel } → { ok: true }
+async function handleConfigModels(request, env) {
+  const { body, error } = await authedBody(request, env);
+  if (error) return error;
+  const owner = await sessionOwner(env, body.session_id);
+  if (!owner) return json({ error: 'owner_lookup_failed' }, 502);
+  const key = `parsecfg:${owner}`;
+  if (body.orderParseModel === undefined) {
+    const raw = await env.AUTH_TOKENS.get(key);
+    const cfg = raw ? (JSON.parse(raw) || {}) : {};
+    return json({ orderParseModel: cfg.orderParseModel || DEFAULT_PARSE_MODEL });
+  }
+  const model = String(body.orderParseModel || '').trim() || DEFAULT_PARSE_MODEL;
+  await env.AUTH_TOKENS.put(key, JSON.stringify({ orderParseModel: model, updated_at: Date.now() }));
+  return json({ ok: true, orderParseModel: model });
 }
 
 // ══════════════════════════════════════════════════
@@ -844,19 +883,20 @@ async function handleIngestSms(request, env) {
 
   // Resolve credentials → a Google access token + the session to target for push.
   // A dedicated ingest token (endpoint-scoped, durable) is preferred; session_id still works.
-  let accessToken = null, pushSession = null;
+  let accessToken = null, pushSession = null, owner = null;
   if (ingestToken && typeof ingestToken === 'string') {
     const raw = await env.AUTH_TOKENS.get(`ingest:${ingestToken}`);
     if (!raw) return json({ error: 'invalid ingest token' }, 401);
     let rec; try { rec = JSON.parse(raw); } catch { rec = null; }
     if (!rec) return json({ error: 'invalid ingest token' }, 401);
     const r = await googleAccessTokenFromRefresh(env, rec.refresh_token);
-    accessToken = r.token; pushSession = rec.session || null;
+    accessToken = r.token; pushSession = rec.session || null; owner = rec.owner || null;
     if (!accessToken) return json({ error: 'google_auth_failed', message: 'ingest token needs re-binding — open the app to refresh it' }, 401);
   } else if (sessionId && typeof sessionId === 'string') {
     if (!(await env.AUTH_TOKENS.get(`session:${sessionId}`))) return json({ error: 'invalid session' }, 401);
     accessToken = await googleAccessTokenForSession(env, sessionId);
     pushSession = sessionId;
+    owner = await sessionOwner(env, sessionId);
     if (!accessToken) return json({ error: 'google_auth_failed', message: 'session may need to re-connect Google' }, 401);
   } else {
     return json({ error: 'missing credentials (token or session_id)' }, 401);
@@ -868,7 +908,8 @@ async function handleIngestSms(request, env) {
   let outcome, response;
   try {
     const existing = await fetchActiveOrders(accessToken);
-    const parsed = await parseShippingMessage(env, text, matchContext(existing));
+    const parseModel = await getParseModelForOwner(env, owner);
+    const parsed = await parseShippingMessage(env, text, matchContext(existing), parseModel);
     if (!isIngestableParse(parsed)) {
       outcome = { ok: true, action: 'skipped', summary: 'not a shipping update' };
       response = json({ ok: true, action: 'skipped', reason: 'not a recognizable order/shipping update', parsed });
@@ -1095,7 +1136,7 @@ async function processGmailMessages(env, sessionId, accessToken, msgs, processed
     if (!text) continue;             // permanently empty → skip, don't count as retryable
     handled++;
     let parsed;
-    try { parsed = await parseShippingMessage(env, text, matchContext(existing)); }
+    try { parsed = await parseShippingMessage(env, text, matchContext(existing), parseModel); }
     catch { transient++; continue; } // Claude hiccup → retry
     processed.add(m.id);             // evaluated → don't re-process in the other batch this tick
     if (!isIngestableParse(parsed)) { sink.push(m.id); continue; } // junk → mark seen, don't re-Claude
@@ -1115,6 +1156,8 @@ async function processGmailMessages(env, sessionId, accessToken, msgs, processed
 }
 
 async function pollGmailForSession(env, sessionId, accessToken, cfg, kvKey) {
+  // Resolve the account's preferred parse model once per tick.
+  const parseModel = await getParseModelForOwner(env, cfg.owner || await sessionOwner(env, sessionId));
   // Seed same-tick dedup from BOTH the steady ring buffer and the backfill's own
   // seen-set, but persist them to separate stores below so the high-churn backfill
   // can never evict a steady id inside its 2-day re-list window.
@@ -1312,6 +1355,7 @@ export default {
       if (url.pathname === '/usage')                return await handleUsage(request, env);
       if (url.pathname === '/orders/ingest-token') return await handleIngestToken(request, env);
       if (url.pathname === '/orders/gmail-config') return await handleGmailConfig(request, env);
+      if (url.pathname === '/config/models')       return await handleConfigModels(request, env);
       // Default: Claude proxy (preserves existing AI panel behavior, which posts to root).
       return await handleAi(request, env);
     } catch (e) {
