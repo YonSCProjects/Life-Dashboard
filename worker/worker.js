@@ -195,7 +195,7 @@ async function handleAi(request, env) {
 
   const body = await request.json();
   const payload = {
-    model: body.model || 'claude-sonnet-4-20250514',
+    model: body.model || 'claude-sonnet-5',
     max_tokens: body.max_tokens || 2048,
     system: body.system || '',
     messages: body.messages || [],
