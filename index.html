@@ -183,6 +183,15 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 }
 .task-pin:hover { transform: scale(1.15); }
 .task-pin.active { color: #cf5147; }
+.task-today {
+  background: none; border: none; cursor: pointer;
+  font-size: 16px; padding: 4px 6px; line-height: 1;
+  color: var(--text3); opacity: 0.4;
+  transition: opacity 0.15s, color 0.15s, transform 0.15s;
+  flex-shrink: 0; align-self: flex-start; margin-top: 1px;
+}
+.task-today:hover { opacity: 0.85; transform: scale(1.15); }
+.task-today.active { opacity: 1; color: var(--yellow); }
 .task-check {
   width: 24px; height: 24px; border-radius: 7px; border: 2px solid;
   background: transparent; cursor: pointer; flex-shrink: 0; margin-top: 1px;
@@ -2138,11 +2147,12 @@ function renderTasks() {
   const filtered = activeCategory === 'all' ? active : active.filter(t => t.category === activeCategory);
 
   renderTodayPane();
+  const todaySet = new Set(loadTodayIds());
 
   if (filtered.length === 0) {
     container.innerHTML = `<div class="empty"><div class="icon">📝</div><div class="msg">${tasks.length === 0 ? 'No tasks yet' : 'No tasks in this category'}</div></div>`;
   } else {
-    container.innerHTML = filtered.map((t, i) => renderTaskItem(t, i)).join('');
+    container.innerHTML = filtered.map((t, i) => renderTaskItem(t, i, todaySet)).join('');
     const todayEl = document.getElementById('today-pane');
     enableDragReorder(container, commitTaskOrder, todayEl ? [{ el: todayEl, onDrop: (id) => addToToday(id) }] : null);
   }
@@ -2170,10 +2180,11 @@ function renderTasks() {
   `;
 }
 
-function renderTaskItem(t, i) {
+function renderTaskItem(t, i, todaySet) {
   const cat = CATS[t.category] || CATS.Tasks;
   const pri = PRIS[t.priority] || PRIS.Medium;
   const isUrgent = t.priority === 'Urgent';
+  const inToday = todaySet && todaySet.has(t.id);
   const dueHtml = t.due ? `<span class="task-due ${getDueClass(t.due)}">${formatDue(t.due)}</span>` : '';
   const remHtml = t.reminder
     ? `<span style="font-size:10px;color:var(--text3)" title="Reminder: ${esc(reminderToHumanString(t.reminder))}">🔔</span>`
@@ -2192,6 +2203,7 @@ function renderTaskItem(t, i) {
         </div>
         ${t.notes ? `<div class="task-notes">${esc(t.notes)}</div>` : ''}
       </div>
+      <button class="task-today${inToday ? ' active' : ''}" onclick="event.stopPropagation();toggleToday('${t.id}')" title="${inToday ? 'Remove from Today' : 'Add to Today'}">☀</button>
       <button class="task-pin${isUrgent ? ' active' : ''}" onclick="event.stopPropagation();toggleTopPriority('${t.id}')" title="${isUrgent ? 'Unpin from top' : 'Mark as highest priority'}">${isUrgent ? '★' : '☆'}</button>
       ${DRAG_HANDLE_HTML}
     </div>`;
@@ -2270,6 +2282,12 @@ async function uncompleteTask(id) {
     t.done = false;
     renderAll();
   } catch (e) { showError(e.message); }
+}
+
+function toggleToday(id) {
+  const ids = loadTodayIds();
+  if (ids.includes(id)) removeFromToday(id);
+  else addToToday(id);
 }
 
 async function toggleTopPriority(id) {
