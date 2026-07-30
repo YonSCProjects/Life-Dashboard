@@ -777,6 +777,7 @@ const P = {
   LEARN: '🎓',        // learning note (course / lecture / meeting documentation)
   FOOD: '🍽️',         // food / calorie log entry (one per item eaten)
   MEM: '🧠',          // Claude's curated memory document (singleton)
+  CATS_CFG: '🏷️',     // user-added task categories (singleton, JSON array)
   ORDER: '📦',        // tracked online order (AliExpress, etc.) with shipping status
 };
 
@@ -812,7 +813,9 @@ let searchVisible = false;
 // ══════════════════════════════════════════════════
 // CATEGORIES & PRIORITIES
 // ══════════════════════════════════════════════════
-const CATS = {
+// Locked baseline — parseTask matches these by substring, so their names must
+// stay stable to keep historical tasks parsing correctly.
+const DEFAULT_CATS = {
   'Parents Care': { icon: '💜', color: '#c25d86' },
   'School': { icon: '🏫', color: '#4f7cb3' },
   'Personal': { icon: '🔧', color: '#8268bc' },
@@ -821,6 +824,18 @@ const CATS = {
   'Habits': { icon: '🏃', color: '#c4744a' },
   'Work': { icon: '💼', color: '#3a8b9c' },
 };
+// Effective category map = defaults + user-added, kept in sync by rebuildCats().
+let CATS = { ...DEFAULT_CATS };
+let customCats = []; // [{name, icon, color}] — user-added, persisted server-side
+let customCatsEventId = null;
+function rebuildCats() {
+  CATS = { ...DEFAULT_CATS };
+  for (const c of customCats) {
+    if (c && c.name && !CATS[c.name]) {
+      CATS[c.name] = { icon: c.icon || '🏷️', color: c.color || '#8268bc' };
+    }
+  }
+}
 const PRIS = {
   'Urgent': { color: '#cf5147', order: 0 },
   'High': { color: '#c4744a', order: 1 },
@@ -1226,7 +1241,7 @@ const IDB_VERSION = 1;
 const CACHE_KEYS = [
   'tasks','shopItems','ideas','projects','customLists',
   'caregiverConfig','caregiverMonths','caregiverVacation','caregiverHoliday','caregiverSick','caregiverPrepays',
-  'reflections','learningNotes','memory','memoryEventId','orders','lastSyncAt',
+  'reflections','learningNotes','memory','memoryEventId','orders','customCats','customCatsEventId','lastSyncAt',
 ];
 
 let isOffline = !navigator.onLine;
@@ -1293,6 +1308,7 @@ async function saveCacheSnapshot() {
     tasks, shopItems, ideas, projects, customLists,
     caregiverConfig, caregiverMonths, caregiverVacation, caregiverHoliday, caregiverSick, caregiverPrepays,
     reflections, learningNotes, memory, memoryEventId, orders,
+    customCats, customCatsEventId,
     lastSyncAt: Date.now(),
   });
 }
@@ -1315,6 +1331,8 @@ async function loadCacheSnapshot() {
   if (c.memory !== undefined)           memory = c.memory;
   if (c.memoryEventId !== undefined)    memoryEventId = c.memoryEventId;
   if (c.orders !== undefined)           orders = c.orders;
+  if (c.customCats !== undefined)       { customCats = c.customCats; rebuildCats(); }
+  if (c.customCatsEventId !== undefined) customCatsEventId = c.customCatsEventId;
   if (c.lastSyncAt !== undefined)       lastSyncAt = c.lastSyncAt;
   return c.lastSyncAt !== undefined;
 }
@@ -1388,7 +1406,7 @@ async function syncAll() {
     await migrateInboxToTasks();
     const [taskEvts, shopEvts, ideaEvts, projEvts, listEvts, listItemEvts,
            cgCfgEvts, cgMonthEvts, cgVacEvts, cgHolEvts, cgSickEvts, cgPrepayEvts,
-           reflectEvts, foodEvts, learnEvts, memEvts, orderEvts] = await Promise.all([
+           reflectEvts, foodEvts, learnEvts, memEvts, orderEvts, catsCfgEvts] = await Promise.all([
       fetchEvents(P.TASK),
       fetchEvents(P.SHOP),
       fetchEvents(P.IDEA),
@@ -1406,6 +1424,7 @@ async function syncAll() {
       fetchEvents(P.LEARN),
       fetchEvents(P.MEM),
       fetchEvents(P.ORDER),
+      fetchEvents(P.CATS_CFG),
     ]);
 
     // Tasks share the 📋 prefix family with lists (📋L) and list items (📋I),
@@ -1427,6 +1446,18 @@ async function syncAll() {
 
     // Caregiver data
     caregiverConfig = cgCfgEvts.length ? parseCaregiverConfig(cgCfgEvts[0]) : null;
+
+    // Custom categories — singleton event, JSON array of {name, icon, color}.
+    if (catsCfgEvts.length) {
+      const raw = catsCfgEvts[0];
+      customCatsEventId = raw.id;
+      const arr = safeJsonParse(raw.description);
+      customCats = Array.isArray(arr) ? arr.filter(c => c && c.name) : [];
+    } else {
+      customCatsEventId = null;
+      customCats = [];
+    }
+    rebuildCats();
     caregiverMonths = cgMonthEvts.map(parseCaregiverMonth).sort((a, b) => b.ym.localeCompare(a.ym));
     caregiverVacation = cgVacEvts.map(e => ({ id: e.id, date: e.start?.date || (e.start?.dateTime || '').split('T')[0] }))
       .sort((a, b) => b.date.localeCompare(a.date));
@@ -2136,6 +2167,7 @@ function renderPills() {
     const isActive = activeCategory === name;
     html += `<button class="pill" style="${isActive ? `border-color:${info.color};background:${info.color}12;color:${info.color}` : ''}" onclick="setCategory('${name}')">${info.icon} ${name} (${count})</button>`;
   }
+  html += `<button class="pill" style="color:var(--text3)" onclick="openCategoriesManager()" title="Add or remove categories">⚙</button>`;
   container.innerHTML = html;
 }
 
@@ -2228,14 +2260,22 @@ function renderTodayPane() {
     ${items.length === 0
       ? `<div class="today-empty">Drag a task's ⠿ handle here to plan your day.</div>`
       : [...active, ...done].map(t => `
-        <div class="today-item${t.done ? ' done' : ''}">
+        <div class="today-item${t.done ? ' done' : ''}" data-drag-id="${t.id}">
           <button class="today-item-check${t.done ? ' done' : ''}"
                   onclick="${t.done ? `uncompleteTask('${t.id}')` : `completeTask('${t.id}')`}"
                   title="${t.done ? 'Mark not done' : 'Mark done'}">${t.done ? '✓' : ''}</button>
           <span class="today-item-title" onclick="editTask('${t.id}')">${esc(t.title)}</span>
+          <span class="drag-handle" title="Drag to reorder" onclick="event.stopPropagation()" style="font-size:12px;padding:2px 4px">⠿</span>
           <button class="today-item-remove" onclick="removeFromToday('${t.id}')" title="Remove from Today">×</button>
         </div>`).join('')}
   `;
+  if (items.length) enableDragReorder(el, commitTodayOrder);
+}
+
+// Persist the Today pane's ordering after an in-pane drag. DOM order already
+// reflects the user's drop; just mirror it into storage.
+function commitTodayOrder(ids) {
+  saveTodayIds(ids);
 }
 
 function getDueClass(due) {
@@ -2288,6 +2328,112 @@ function toggleToday(id) {
   const ids = loadTodayIds();
   if (ids.includes(id)) removeFromToday(id);
   else addToToday(id);
+}
+
+// ── Custom category management ──
+async function saveCustomCats() {
+  const desc = JSON.stringify(customCats);
+  if (customCatsEventId) {
+    await updateEvent(customCatsEventId, { description: desc });
+  } else {
+    const ev = await createEvent(P.CATS_CFG, 'Custom categories', desc, new Date().toISOString().slice(0, 10));
+    customCatsEventId = ev.id;
+  }
+}
+
+function openCategoriesManager() {
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail()">&larr;</button>
+      <span class="detail-title">🏷️ Categories</span>
+      <span></span>
+    </div>
+    <div class="detail-body">
+      <div style="font-size:12px;color:var(--text3);line-height:1.5;margin-bottom:14px">
+        Built-in categories are locked (they're referenced by historical tasks). Add your own below — they show up in the filter pills and the task-edit dropdown.
+      </div>
+      <div id="cats-list"></div>
+      <div style="border-top:1px solid var(--border);margin-top:16px;padding-top:14px">
+        <div style="font-weight:600;font-size:13px;margin-bottom:8px">Add a category</div>
+        <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+          <input id="new-cat-icon" placeholder="🏷️" maxlength="4"
+                 style="width:52px;text-align:center;font-size:18px">
+          <input id="new-cat-name" placeholder="Category name" style="flex:1;min-width:120px">
+          <input id="new-cat-color" type="color" value="#8268bc"
+                 style="width:48px;height:38px;padding:0;border:1px solid var(--border);cursor:pointer" title="Pick a color">
+          <button class="btn btn-sm btn-primary" onclick="addCategory()">Add</button>
+        </div>
+        <div style="font-size:11px;color:var(--text3)">Icon can be any emoji or short character. Color shows up on the pill and tag.</div>
+      </div>
+    </div>
+  `);
+  renderCatsManagerList();
+}
+
+function renderCatsManagerList() {
+  const el = document.getElementById('cats-list');
+  if (!el) return;
+  const row = (icon, color, name, right) => `
+    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+      <span style="display:inline-flex;width:28px;height:28px;border-radius:14px;background:${color}20;color:${color};align-items:center;justify-content:center;font-size:15px">${icon}</span>
+      <span style="flex:1;min-width:0">${esc(name)}</span>
+      ${right}
+    </div>`;
+  const rows = [];
+  for (const [name, info] of Object.entries(DEFAULT_CATS)) {
+    rows.push(row(info.icon, info.color, name, '<span style="font-size:11px;color:var(--text3)">built-in</span>'));
+  }
+  for (const c of customCats) {
+    const inUse = tasks.filter(t => t.category === c.name).length;
+    const rightHtml = `
+      ${inUse ? `<span style="font-size:11px;color:var(--text3);margin-right:8px">${inUse} task${inUse > 1 ? 's' : ''}</span>` : ''}
+      <button style="background:none;border:none;color:var(--red);cursor:pointer;font-size:12px;padding:4px 6px" onclick="deleteCategory(${JSON.stringify(c.name).replace(/"/g, '&quot;')})">Delete</button>`;
+    rows.push(row(c.icon || '🏷️', c.color || '#8268bc', c.name, rightHtml));
+  }
+  el.innerHTML = rows.join('') || '<div style="font-size:12px;color:var(--text3)">No categories yet.</div>';
+}
+
+async function addCategory() {
+  const name = document.getElementById('new-cat-name').value.trim();
+  const icon = document.getElementById('new-cat-icon').value.trim() || '🏷️';
+  const color = document.getElementById('new-cat-color').value || '#8268bc';
+  if (!name) { showError('Category name is required'); return; }
+  if (CATS[name]) { showError('A category with that name already exists'); return; }
+  customCats.push({ name, icon, color });
+  rebuildCats();
+  document.getElementById('new-cat-name').value = '';
+  document.getElementById('new-cat-icon').value = '';
+  try {
+    await saveCustomCats();
+    renderCatsManagerList();
+    renderPills();
+    renderTasks();
+  } catch (e) {
+    showError('Save failed: ' + e.message);
+    // Roll back local state so UI stays in sync with server.
+    customCats = customCats.filter(c => c.name !== name);
+    rebuildCats();
+    renderCatsManagerList();
+  }
+}
+
+async function deleteCategory(name) {
+  const inUse = tasks.filter(t => t.category === name).length;
+  if (inUse && !confirm(`${inUse} task${inUse > 1 ? 's' : ''} currently use "${name}". Delete anyway? Those tasks keep the name but the pill and dropdown entry disappear.`)) return;
+  const backup = customCats.slice();
+  customCats = customCats.filter(c => c.name !== name);
+  rebuildCats();
+  try {
+    await saveCustomCats();
+    renderCatsManagerList();
+    renderPills();
+    renderTasks();
+  } catch (e) {
+    showError('Delete failed: ' + e.message);
+    customCats = backup;
+    rebuildCats();
+    renderCatsManagerList();
+  }
 }
 
 async function toggleTopPriority(id) {
