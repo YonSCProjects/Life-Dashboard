@@ -203,6 +203,58 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
   background: var(--bg3); border-radius: 8px;
   box-shadow: 0 4px 16px rgba(44,51,61,0.18);
 }
+.drag-drop-hover {
+  outline: 2px dashed var(--green);
+  outline-offset: -2px;
+  background: color-mix(in srgb, var(--green) 8%, transparent);
+}
+
+/* ── TASKS SPLIT (main list + Today pane) ── */
+.tasks-split { display: flex; gap: 10px; align-items: flex-start; }
+.tasks-split-main { flex: 2; min-width: 0; }
+.tasks-split-today {
+  flex: 1; min-width: 140px; max-width: 200px;
+  position: sticky; top: 8px;
+  padding: 10px; border-radius: 10px;
+  background: var(--bg2); border: 1px solid var(--border);
+  min-height: 120px;
+}
+.today-header {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 13px; font-weight: 600; margin-bottom: 8px;
+}
+.today-empty {
+  font-size: 11px; color: var(--text3); line-height: 1.4;
+  padding: 12px 4px; text-align: center;
+}
+.today-item {
+  display: flex; align-items: flex-start; gap: 6px;
+  padding: 6px 4px; border-bottom: 1px solid var(--border);
+  font-size: 12px; line-height: 1.3;
+}
+.today-item:last-child { border-bottom: none; }
+.today-item.done { opacity: 0.55; }
+.today-item.done .today-item-title { text-decoration: line-through; }
+.today-item-title { flex: 1; min-width: 0; word-break: break-word; cursor: pointer; }
+.today-item-check {
+  width: 16px; height: 16px; border-radius: 50%; border: 1.5px solid var(--text3);
+  background: transparent; cursor: pointer; flex-shrink: 0; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; color: white; margin-top: 1px;
+}
+.today-item-check.done { background: var(--green); border-color: var(--green); }
+.today-item-remove {
+  background: none; border: none; color: var(--text3);
+  cursor: pointer; font-size: 12px; padding: 0 2px; line-height: 1;
+}
+/* On narrow phones, stack vertically so the main list has real estate. */
+@media (max-width: 520px) {
+  .tasks-split { flex-direction: column; }
+  .tasks-split-today {
+    position: static; width: 100%; max-width: none;
+    order: -1; margin-bottom: 10px;
+  }
+}
 .task-check.done { background: var(--green); border-color: var(--green); }
 .task-title { font-size: 13px; font-weight: 500; color: var(--text); line-height: 1.4; word-break: break-word; }
 .task-title.done { color: var(--text3); text-decoration: line-through; }
@@ -536,8 +588,13 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
     <div class="pills" id="category-pills"></div>
     <button class="btn btn-ghost" style="width:100%;margin-bottom:16px;border-style:dashed" onclick="toggleAddForm()" id="add-btn">+ Add Task</button>
     <div id="add-form-container"></div>
-    <div id="tasks-list"></div>
-    <div id="completed-section"></div>
+    <div class="tasks-split">
+      <div class="tasks-split-main">
+        <div id="tasks-list"></div>
+        <div id="completed-section"></div>
+      </div>
+      <aside class="tasks-split-today" id="today-pane"></aside>
+    </div>
   </div>
 
   <!-- ═══ SHOPPING VIEW (opens from the Lists tab) ═══ -->
@@ -773,6 +830,30 @@ const SHOP_CATS_ICONS = { Produce:'🥬', Dairy:'🥛', Meat:'🥩', Bakery:'�
 const TOKEN_KEY     = 'dash-token';
 const TOKEN_EXP_KEY = 'dash-token-exp';
 const SESSION_KEY   = 'dash-session';
+const TODAY_KEY     = 'dash-today-tasks'; // per-device list of task IDs pinned to the Today pane
+function loadTodayIds() {
+  try { const v = JSON.parse(localStorage.getItem(TODAY_KEY) || '[]'); return Array.isArray(v) ? v : []; }
+  catch { return []; }
+}
+function saveTodayIds(ids) {
+  localStorage.setItem(TODAY_KEY, JSON.stringify(Array.from(new Set(ids))));
+}
+function addToToday(id) {
+  const ids = loadTodayIds();
+  if (ids.includes(id)) { renderTasks(); return; } // already there
+  ids.push(id);
+  saveTodayIds(ids);
+  renderTasks();
+}
+function removeFromToday(id) {
+  saveTodayIds(loadTodayIds().filter(x => x !== id));
+  renderTasks();
+}
+function clearTodayDone() {
+  const doneIds = new Set(tasks.filter(t => t.done).map(t => t.id));
+  saveTodayIds(loadTodayIds().filter(id => !doneIds.has(id)));
+  renderTasks();
+}
 const INGEST_TOKEN_KEY = 'dash-ingest-token'; // scoped Tasker token; persists across re-auth
 
 // ── AI model choice (per-feature) ──
@@ -1422,7 +1503,11 @@ async function persistOrder(id, order) {
 // Attaches pointer-based drag handling to a container. Rows must carry a
 // [data-drag-id] attribute and contain a .drag-handle element. onCommit is
 // called with the new id order only when the order actually changed.
-function enableDragReorder(container, onCommit) {
+// crossZones (optional): [{ el, onDrop(dragId) }]. If pointerup happens while
+// the pointer is inside one of these elements, that zone's onDrop is called
+// and the normal reorder-commit is skipped. Zones highlight during hover via
+// the .drag-drop-hover class.
+function enableDragReorder(container, onCommit, crossZones) {
   if (!container) return;
   container.onpointerdown = (e) => {
     const handle = e.target.closest('.drag-handle');
@@ -1434,6 +1519,10 @@ function enableDragReorder(container, onCommit) {
     const startIds = [...container.querySelectorAll('[data-drag-id]')].map(r => r.dataset.dragId);
     row.classList.add('drag-row-active');
     document.body.style.userSelect = 'none';
+    const zones = (crossZones || []).filter(z => z && z.el);
+    // Ignore a zone if the row itself lives inside it (dragging within the same
+    // zone should keep behaving as a reorder, not a drop).
+    const activeZones = zones.filter(z => !z.el.contains(row));
 
     // Find the nearest scrollable ancestor (so dragging inside the list-detail
     // drawer scrolls the drawer, not the page underneath). null = use window.
@@ -1478,11 +1567,30 @@ function enableDragReorder(container, onCommit) {
       rafId = requestAnimationFrame(tick);
     };
 
+    let lastClientX = e.clientX;
+    let hoverZone = null;
+    const hitTestZone = (x, y) => {
+      if (!activeZones.length) return null;
+      for (const z of activeZones) {
+        const r = z.el.getBoundingClientRect();
+        if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return z;
+      }
+      return null;
+    };
+    const setHoverZone = (z) => {
+      if (hoverZone === z) return;
+      if (hoverZone) hoverZone.el.classList.remove('drag-drop-hover');
+      hoverZone = z;
+      if (hoverZone) hoverZone.el.classList.add('drag-drop-hover');
+    };
+
     const onMove = (ev) => {
       lastClientY = ev.clientY;
+      lastClientX = ev.clientX;
+      setHoverZone(hitTestZone(ev.clientX, ev.clientY));
       place(lastClientY);
     };
-    const onUp = () => {
+    const onUp = (ev) => {
       cancelAnimationFrame(rafId);
       document.removeEventListener('pointermove', onMove);
       document.removeEventListener('pointerup', onUp);
@@ -1490,6 +1598,12 @@ function enableDragReorder(container, onCommit) {
       document.body.style.userSelect = '';
       row.classList.remove('drag-row-active');
       row.style.transform = '';
+      setHoverZone(null);
+      const dropZone = hitTestZone(ev ? ev.clientX : lastClientX, ev ? ev.clientY : lastClientY);
+      if (dropZone) {
+        dropZone.onDrop(row.dataset.dragId);
+        return; // caller's renderer will fix any DOM mutation from the reorder placement
+      }
       const endIds = [...container.querySelectorAll('[data-drag-id]')].map(r => r.dataset.dragId);
       if (endIds.length === startIds.length && endIds.some((id, i) => id !== startIds[i])) {
         onCommit(endIds);
@@ -2023,11 +2137,14 @@ function renderTasks() {
   const completed = tasks.filter(t => t.done);
   const filtered = activeCategory === 'all' ? active : active.filter(t => t.category === activeCategory);
 
+  renderTodayPane();
+
   if (filtered.length === 0) {
     container.innerHTML = `<div class="empty"><div class="icon">📝</div><div class="msg">${tasks.length === 0 ? 'No tasks yet' : 'No tasks in this category'}</div></div>`;
   } else {
     container.innerHTML = filtered.map((t, i) => renderTaskItem(t, i)).join('');
-    enableDragReorder(container, commitTaskOrder);
+    const todayEl = document.getElementById('today-pane');
+    enableDragReorder(container, commitTaskOrder, todayEl ? [{ el: todayEl, onDrop: (id) => addToToday(id) }] : null);
   }
 
   // Completed section
@@ -2078,6 +2195,35 @@ function renderTaskItem(t, i) {
       <button class="task-pin${isUrgent ? ' active' : ''}" onclick="event.stopPropagation();toggleTopPriority('${t.id}')" title="${isUrgent ? 'Unpin from top' : 'Mark as highest priority'}">${isUrgent ? '★' : '☆'}</button>
       ${DRAG_HANDLE_HTML}
     </div>`;
+}
+
+function renderTodayPane() {
+  const el = document.getElementById('today-pane');
+  if (!el) return;
+  const ids = loadTodayIds();
+  // Preserve user's chosen order, but drop IDs whose tasks are gone (deleted).
+  const items = ids.map(id => tasks.find(t => t.id === id)).filter(Boolean);
+  // Prune deleted refs from storage silently so future loads stay clean.
+  if (items.length !== ids.length) saveTodayIds(items.map(t => t.id));
+  const active = items.filter(t => !t.done);
+  const done = items.filter(t => t.done);
+  const hasDone = done.length > 0;
+  el.innerHTML = `
+    <div class="today-header">
+      <span>☀️ Today <span style="color:var(--text3);font-weight:400">${items.length ? '(' + active.length + '/' + items.length + ')' : ''}</span></span>
+      ${hasDone ? `<button style="background:none;border:none;color:var(--text3);font-size:11px;cursor:pointer;padding:2px 4px" onclick="clearTodayDone()" title="Remove finished items from Today">Clear done</button>` : ''}
+    </div>
+    ${items.length === 0
+      ? `<div class="today-empty">Drag a task's ⠿ handle here to plan your day.</div>`
+      : [...active, ...done].map(t => `
+        <div class="today-item${t.done ? ' done' : ''}">
+          <button class="today-item-check${t.done ? ' done' : ''}"
+                  onclick="${t.done ? `uncompleteTask('${t.id}')` : `completeTask('${t.id}')`}"
+                  title="${t.done ? 'Mark not done' : 'Mark done'}">${t.done ? '✓' : ''}</button>
+          <span class="today-item-title" onclick="editTask('${t.id}')">${esc(t.title)}</span>
+          <button class="today-item-remove" onclick="removeFromToday('${t.id}')" title="Remove from Today">×</button>
+        </div>`).join('')}
+  `;
 }
 
 function getDueClass(due) {
