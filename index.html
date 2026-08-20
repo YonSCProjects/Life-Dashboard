@@ -191,7 +191,6 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
   flex-shrink: 0; align-self: flex-start; margin-top: 1px;
 }
 .task-today:hover { opacity: 0.85; transform: scale(1.15); }
-.task-today.active { opacity: 1; color: var(--yellow); }
 .task-check {
   width: 24px; height: 24px; border-radius: 7px; border: 2px solid;
   background: transparent; cursor: pointer; flex-shrink: 0; margin-top: 1px;
@@ -862,21 +861,24 @@ function loadTodayIds() {
 function saveTodayIds(ids) {
   localStorage.setItem(TODAY_KEY, JSON.stringify(Array.from(new Set(ids))));
 }
+// Moving a task in/out of Today changes which tasks the main list shows, so the
+// category pill counts have to be redrawn alongside it.
+function refreshTaskViews() { renderPills(); renderTasks(); }
 function addToToday(id) {
   const ids = loadTodayIds();
-  if (ids.includes(id)) { renderTasks(); return; } // already there
+  if (ids.includes(id)) { refreshTaskViews(); return; } // already there
   ids.push(id);
   saveTodayIds(ids);
-  renderTasks();
+  refreshTaskViews();
 }
 function removeFromToday(id) {
   saveTodayIds(loadTodayIds().filter(x => x !== id));
-  renderTasks();
+  refreshTaskViews();
 }
 function clearTodayDone() {
   const doneIds = new Set(tasks.filter(t => t.done).map(t => t.id));
   saveTodayIds(loadTodayIds().filter(id => !doneIds.has(id)));
-  renderTasks();
+  refreshTaskViews();
 }
 const INGEST_TOKEN_KEY = 'dash-ingest-token'; // scoped Tasker token; persists across re-auth
 
@@ -2159,7 +2161,10 @@ function goToSearchResult(type, id) {
 // ══════════════════════════════════════════════════
 function renderPills() {
   const container = document.getElementById('category-pills');
-  const active = tasks.filter(t => !t.done);
+  // Counts mirror what's actually visible in the list below, so Today-pinned
+  // tasks are excluded here too.
+  const todaySet = new Set(loadTodayIds());
+  const active = tasks.filter(t => !t.done && !todaySet.has(t.id));
   let html = `<button class="pill ${activeCategory==='all'?'active':''}" onclick="setCategory('all')">All (${active.length})</button>`;
   for (const [name, info] of Object.entries(CATS)) {
     const count = active.filter(t => t.category === name).length;
@@ -2174,17 +2179,24 @@ function renderPills() {
 function renderTasks() {
   const container = document.getElementById('tasks-list');
   tasks.sort(compareTasks);
-  const active = tasks.filter(t => !t.done);
   const completed = tasks.filter(t => t.done);
-  const filtered = activeCategory === 'all' ? active : active.filter(t => t.category === activeCategory);
 
   renderTodayPane();
   const todaySet = new Set(loadTodayIds());
 
+  // A task pulled into Today leaves the main list — the Today pane is where you
+  // work it. Removing it from Today (× in the pane) puts it straight back here.
+  const allActive = tasks.filter(t => !t.done);
+  const active = allActive.filter(t => !todaySet.has(t.id));
+  const filtered = activeCategory === 'all' ? active : active.filter(t => t.category === activeCategory);
+
   if (filtered.length === 0) {
-    container.innerHTML = `<div class="empty"><div class="icon">📝</div><div class="msg">${tasks.length === 0 ? 'No tasks yet' : 'No tasks in this category'}</div></div>`;
+    const msg = tasks.length === 0 ? 'No tasks yet'
+      : (allActive.length && active.length === 0) ? 'Everything is in Today ☀️'
+      : 'No tasks in this category';
+    container.innerHTML = `<div class="empty"><div class="icon">📝</div><div class="msg">${msg}</div></div>`;
   } else {
-    container.innerHTML = filtered.map((t, i) => renderTaskItem(t, i, todaySet)).join('');
+    container.innerHTML = filtered.map((t, i) => renderTaskItem(t, i)).join('');
     const todayEl = document.getElementById('today-pane');
     enableDragReorder(container, commitTaskOrder, todayEl ? [{ el: todayEl, onDrop: (id) => addToToday(id) }] : null);
   }
@@ -2212,11 +2224,10 @@ function renderTasks() {
   `;
 }
 
-function renderTaskItem(t, i, todaySet) {
+function renderTaskItem(t, i) {
   const cat = CATS[t.category] || CATS.Tasks;
   const pri = PRIS[t.priority] || PRIS.Medium;
   const isUrgent = t.priority === 'Urgent';
-  const inToday = todaySet && todaySet.has(t.id);
   const dueHtml = t.due ? `<span class="task-due ${getDueClass(t.due)}">${formatDue(t.due)}</span>` : '';
   const remHtml = t.reminder
     ? `<span style="font-size:10px;color:var(--text3)" title="Reminder: ${esc(reminderToHumanString(t.reminder))}">🔔</span>`
@@ -2235,7 +2246,7 @@ function renderTaskItem(t, i, todaySet) {
         </div>
         ${t.notes ? `<div class="task-notes">${esc(t.notes)}</div>` : ''}
       </div>
-      <button class="task-today${inToday ? ' active' : ''}" onclick="event.stopPropagation();toggleToday('${t.id}')" title="${inToday ? 'Remove from Today' : 'Add to Today'}">☀</button>
+      <button class="task-today" onclick="event.stopPropagation();addToToday('${t.id}')" title="Move to Today">☀</button>
       <button class="task-pin${isUrgent ? ' active' : ''}" onclick="event.stopPropagation();toggleTopPriority('${t.id}')" title="${isUrgent ? 'Unpin from top' : 'Mark as highest priority'}">${isUrgent ? '★' : '☆'}</button>
       ${DRAG_HANDLE_HTML}
     </div>`;
@@ -2322,12 +2333,6 @@ async function uncompleteTask(id) {
     t.done = false;
     renderAll();
   } catch (e) { showError(e.message); }
-}
-
-function toggleToday(id) {
-  const ids = loadTodayIds();
-  if (ids.includes(id)) removeFromToday(id);
-  else addToToday(id);
 }
 
 // ── Custom category management ──
