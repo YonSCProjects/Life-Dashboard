@@ -2732,6 +2732,58 @@ function nagHourOptions(selected) {
   return html;
 }
 
+// The Day / First alert / Last alert / How often fields, shared between the
+// edit sheet (prefix 'nag') and the add form (prefix 'add-nag') — distinct
+// ids because the add form stays in the DOM behind the detail overlay.
+function nagFormFieldsHtml(prefix) {
+  const j = nagJerusalemNow();
+  const nextHour = Math.min(23, Math.max(5, j.hh + 1));
+  return `
+      <div style="display:flex;gap:8px;margin-bottom:8px">
+        <div style="flex:1">
+          <label style="font-size:10px;color:var(--text3);display:block;margin-bottom:2px">DAY</label>
+          <select id="${prefix}-day" style="width:100%;font-size:12px">
+            <option value="0" selected>Today</option>
+            <option value="1">Tomorrow</option>
+            <option value="2">In 2 days</option>
+          </select>
+        </div>
+        <div style="flex:1">
+          <label style="font-size:10px;color:var(--text3);display:block;margin-bottom:2px">FIRST ALERT</label>
+          <select id="${prefix}-first" style="width:100%;font-size:12px">${nagHourOptions(nextHour)}</select>
+        </div>
+        <div style="flex:1">
+          <label style="font-size:10px;color:var(--text3);display:block;margin-bottom:2px">LAST ALERT</label>
+          <select id="${prefix}-last" style="width:100%;font-size:12px">${nagHourOptions(21)}</select>
+        </div>
+      </div>
+      <div style="margin-bottom:8px">
+        <label style="font-size:10px;color:var(--text3);display:block;margin-bottom:2px">HOW OFTEN</label>
+        <select id="${prefix}-every" style="width:100%;font-size:12px">
+          <option value="60" selected>Every hour</option>
+          <option value="30">Every half hour</option>
+          <option value="120">Every two hours</option>
+        </select>
+      </div>
+      <div style="font-size:10px;color:var(--text3);margin-bottom:8px">Alerts stop by themselves after 48 hours, or when you mark the task done.</div>`;
+}
+
+// Read + validate the nag window from a form. Returns {slots, every} or null
+// after surfacing the problem. Runs BEFORE anything is created.
+function readNagOptsFromForm(prefix) {
+  const dayOffset = Number(document.getElementById(prefix + '-day').value);
+  const firstHour = Number(document.getElementById(prefix + '-first').value);
+  const lastHour  = Number(document.getElementById(prefix + '-last').value);
+  const every     = Number(document.getElementById(prefix + '-every').value);
+  if (lastHour < firstHour) { showError('Last alert must be at or after the first alert.'); return null; }
+  const slots = nagBuildSlots(dayOffset, firstHour, lastHour, every);
+  if (!slots.length) {
+    showError('All of those alert times are already in the past — pick a later hour or another day.');
+    return null;
+  }
+  return { slots, every };
+}
+
 function nagSectionHtml(t) {
   const label = `<label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">NAG</label>`;
   if (t.nag && t.nag.ids && t.nag.ids.length) {
@@ -2744,39 +2796,11 @@ function nagSectionHtml(t) {
         <button class="btn btn-sm btn-ghost" id="nag-stop-btn" onclick="stopNagFromForm('${t.id}')">Stop nag</button>
       </div>`;
   }
-  const j = nagJerusalemNow();
-  const nextHour = Math.min(23, Math.max(5, j.hh + 1));
   return `${label}
     <button class="btn btn-sm btn-ghost" id="nag-open-btn"
             onclick="document.getElementById('nag-form').style.display='';this.style.display='none'">📣 Nag me</button>
     <div id="nag-form" style="display:none;border:1px solid var(--border);border-radius:10px;padding:10px;margin-top:6px">
-      <div style="display:flex;gap:8px;margin-bottom:8px">
-        <div style="flex:1">
-          <label style="font-size:10px;color:var(--text3);display:block;margin-bottom:2px">DAY</label>
-          <select id="nag-day" style="width:100%;font-size:12px">
-            <option value="0" selected>Today</option>
-            <option value="1">Tomorrow</option>
-            <option value="2">In 2 days</option>
-          </select>
-        </div>
-        <div style="flex:1">
-          <label style="font-size:10px;color:var(--text3);display:block;margin-bottom:2px">FIRST ALERT</label>
-          <select id="nag-first" style="width:100%;font-size:12px">${nagHourOptions(nextHour)}</select>
-        </div>
-        <div style="flex:1">
-          <label style="font-size:10px;color:var(--text3);display:block;margin-bottom:2px">LAST ALERT</label>
-          <select id="nag-last" style="width:100%;font-size:12px">${nagHourOptions(21)}</select>
-        </div>
-      </div>
-      <div style="margin-bottom:8px">
-        <label style="font-size:10px;color:var(--text3);display:block;margin-bottom:2px">HOW OFTEN</label>
-        <select id="nag-every" style="width:100%;font-size:12px">
-          <option value="60" selected>Every hour</option>
-          <option value="30">Every half hour</option>
-          <option value="120">Every two hours</option>
-        </select>
-      </div>
-      <div style="font-size:10px;color:var(--text3);margin-bottom:8px">Alerts stop by themselves after 48 hours, or when you mark the task done.</div>
+      ${nagFormFieldsHtml('nag')}
       <button class="btn btn-sm btn-primary" style="width:100%" id="nag-start-btn" onclick="startNagFromForm('${t.id}')">Start nagging</button>
       <div id="nag-progress" style="font-size:11px;color:var(--text3);margin-top:6px;text-align:center"></div>
     </div>`;
@@ -2786,21 +2810,13 @@ async function startNagFromForm(taskId) {
   const t = tasks.find(x => x.id === taskId);
   if (!t) return;
   if (!t.title || !t.title.trim()) { showError('The task needs a title before it can nag.'); return; }
-  const dayOffset = Number(document.getElementById('nag-day').value);
-  const firstHour = Number(document.getElementById('nag-first').value);
-  const lastHour  = Number(document.getElementById('nag-last').value);
-  const every     = Number(document.getElementById('nag-every').value);
-  if (lastHour < firstHour) { showError('Last alert must be at or after the first alert.'); return; }
-  const slots = nagBuildSlots(dayOffset, firstHour, lastHour, every);
-  if (!slots.length) {
-    showError('All of those alert times are already in the past — pick a later hour or another day.');
-    return;
-  }
+  const opts = readNagOptsFromForm('nag');
+  if (!opts) return;
   const btn = document.getElementById('nag-start-btn');
   const prog = document.getElementById('nag-progress');
   btn.disabled = true; btn.textContent = 'Starting…';
 
-  const { nag, failed } = await createNagEvents(t, slots, every,
+  const { nag, failed } = await createNagEvents(t, opts.slots, opts.every,
     (i, n) => { if (prog) prog.textContent = `Creating alert ${i} of ${n}…`; });
 
   // Record whatever was created, even on partial failure — never leave
@@ -2951,6 +2967,16 @@ async function saveTask(taskId) {
   }
 }
 
+// Toggle the nag block in the add form. Nag is wanted at submit iff the
+// block is visible.
+function toggleAddNag(btn) {
+  const f = document.getElementById('add-nag-form');
+  if (!f) return;
+  const show = f.style.display === 'none';
+  f.style.display = show ? '' : 'none';
+  btn.textContent = show ? '📣 Will nag after adding — tap to cancel' : '📣 Nag me';
+}
+
 async function addTask() {
   const title = document.getElementById('add-title').value.trim();
   const cat = 'Tasks'; // category UI removed — every new task gets the neutral default
@@ -2965,6 +2991,16 @@ async function addTask() {
     return;
   }
 
+  // Validate the nag window BEFORE creating anything, so a bad window
+  // (all-past, last < first) refuses cleanly with no task created.
+  const nagForm = document.getElementById('add-nag-form');
+  const nagWanted = nagForm && nagForm.style.display !== 'none';
+  let nagOpts = null;
+  if (nagWanted) {
+    nagOpts = readNagOptsFromForm('add-nag');
+    if (!nagOpts) return;
+  }
+
   const addBtn = document.querySelector('#add-form-container .btn-primary');
   if (addBtn) { addBtn.textContent = 'Adding...'; addBtn.disabled = true; }
 
@@ -2973,7 +3009,24 @@ async function addTask() {
     if (due) metaParts.push('due: ' + due);
     if (reminder) metaParts.push(serializeReminder(reminder));
     const desc = metaParts.join(' | ') + (notes ? '\n' + notes : '');
-    await createTaskEvent(title, desc, due, reminder);
+    const created = await createTaskEvent(title, desc, due, reminder);
+
+    // Task exists — now attach the nag to its real id, with progress on the
+    // Add button. Same partial-failure contract as the edit sheet: whatever
+    // was created is persisted on the task, never dropped.
+    if (nagOpts && created && created.id) {
+      const newTask = { id: created.id, title, category: cat, priority: pri, due, project: null, notes, reminder, done: false, nag: null };
+      const { nag, failed } = await createNagEvents(newTask, nagOpts.slots, nagOpts.every,
+        (i, n) => { if (addBtn) addBtn.textContent = `Creating alert ${i} of ${n}…`; });
+      if (nag) {
+        try { await persistTaskNag(newTask, nag); }
+        catch (e) { showError('Task added and alerts created, but saving them to the task failed: ' + e.message); }
+      }
+      if (failed) {
+        showError(`Task added, but only ${failed.created} of ${failed.total} nag alerts were created: ${failed.error.message}. Open the task and use "Stop nag", then start it again.`);
+      }
+    }
+
     toggleAddForm();
     await syncAll();
   } catch (e) {
@@ -2999,6 +3052,13 @@ function toggleAddForm() {
           <input type="date" id="add-due">
         </div>
         ${reminderPickerHtml('add', null, '')}
+        <div style="margin-bottom:10px">
+          <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">NAG</label>
+          <button class="btn btn-sm btn-ghost" id="add-nag-toggle" onclick="toggleAddNag(this)">📣 Nag me</button>
+          <div id="add-nag-form" style="display:none;border:1px solid var(--border);border-radius:10px;padding:10px;margin-top:6px">
+            ${nagFormFieldsHtml('add-nag')}
+          </div>
+        </div>
         <textarea id="add-notes" placeholder="Notes (optional)" style="margin-bottom:10px" rows="2"></textarea>
         <div class="row">
           <button class="btn btn-primary" style="flex:1" onclick="addTask()">Add Task</button>
