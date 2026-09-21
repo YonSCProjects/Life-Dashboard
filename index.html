@@ -2414,20 +2414,11 @@ function goToSearchResult(type, id) {
 // TASKS
 // ══════════════════════════════════════════════════
 function renderPills() {
+  // Category labels are hidden — only urgency matters now. Category data
+  // still round-trips inside each task's description (parse/serialize are
+  // untouched), so restoring this UI later loses nothing.
   const container = document.getElementById('category-pills');
-  // Counts mirror what's actually visible in the list below, so Today-pinned
-  // tasks are excluded here too.
-  const todaySet = new Set(loadTodayIds());
-  const active = tasks.filter(t => !t.done && !todaySet.has(t.id));
-  let html = `<button class="pill ${activeCategory==='all'?'active':''}" onclick="setCategory('all')">All (${active.length})</button>`;
-  for (const [name, info] of Object.entries(CATS)) {
-    const count = active.filter(t => t.category === name).length;
-    if (count === 0) continue;
-    const isActive = activeCategory === name;
-    html += `<button class="pill" style="${isActive ? `border-color:${info.color};background:${info.color}12;color:${info.color}` : ''}" onclick="setCategory('${name}')">${info.icon} ${name} (${count})</button>`;
-  }
-  html += `<button class="pill" style="color:var(--text3)" onclick="openCategoriesManager()" title="Add or remove categories">⚙</button>`;
-  container.innerHTML = html;
+  if (container) { container.innerHTML = ''; container.style.display = 'none'; }
 }
 
 function renderTasks() {
@@ -2479,7 +2470,6 @@ function renderTasks() {
 }
 
 function renderTaskItem(t, i) {
-  const cat = CATS[t.category] || CATS.Tasks;
   const pri = PRIS[t.priority] || PRIS.Medium;
   const isUrgent = t.priority === 'Urgent';
   const dueHtml = t.due ? `<span class="task-due ${getDueClass(t.due)}">${formatDue(t.due)}</span>` : '';
@@ -2495,7 +2485,6 @@ function renderTaskItem(t, i) {
       <div style="flex:1;min-width:0">
         <div class="task-title">${esc(t.title)}</div>
         <div class="task-meta">
-          <span class="tag" style="background:${cat.color}15;color:${cat.color}">${cat.icon} ${t.category}</span>
           <span class="tag" style="background:${pri.color}15;color:${pri.color}">${t.priority}</span>
           ${t.project ? `<span class="tag" style="background:var(--cyan)15;color:var(--cyan)">🎯 ${esc(t.project)}</span>` : ''}
           ${dueHtml}
@@ -2858,15 +2847,9 @@ function editTask(taskId) {
         <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">TITLE</label>
         <input id="edit-task-title" value="${esc(t.title)}">
       </div>
-      <div style="display:flex;gap:8px;margin-bottom:12px">
-        <div style="flex:1">
-          <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">CATEGORY</label>
-          <select id="edit-task-cat">${Object.keys(CATS).map(c => `<option value="${c}" ${t.category === c ? 'selected' : ''}>${c}</option>`).join('')}</select>
-        </div>
-        <div style="flex:1">
-          <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">PRIORITY</label>
-          <select id="edit-task-pri">${Object.keys(PRIS).map(p => `<option value="${p}" ${t.priority === p ? 'selected' : ''}>${p}</option>`).join('')}</select>
-        </div>
+      <div style="margin-bottom:12px">
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">PRIORITY</label>
+        <select id="edit-task-pri">${Object.keys(PRIS).map(p => `<option value="${p}" ${t.priority === p ? 'selected' : ''}>${p}</option>`).join('')}</select>
       </div>
       <div style="margin-bottom:12px">
         <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">DUE DATE</label>
@@ -2934,7 +2917,6 @@ async function moveTaskTo(taskId, dest) {
 
 async function saveTask(taskId) {
   const title = document.getElementById('edit-task-title').value.trim();
-  const cat = document.getElementById('edit-task-cat').value;
   const pri = document.getElementById('edit-task-pri').value;
   const due = document.getElementById('edit-task-due').value;
   const proj = document.getElementById('edit-task-proj').value;
@@ -2952,7 +2934,10 @@ async function saveTask(taskId) {
   const t = tasks.find(t => t.id === taskId);
   const desc = serializeTaskDesc({
     done: !!(t && t.done),
-    category: cat, priority: pri, due, project: proj, notes, reminder,
+    // Category UI is gone but the stored value is preserved verbatim, so
+    // nothing is lost if the labels ever come back.
+    category: (t && t.category) || 'Tasks',
+    priority: pri, due, project: proj, notes, reminder,
     nag: t && t.nag, // editing a task must not drop its nag record
   });
 
@@ -2968,7 +2953,7 @@ async function saveTask(taskId) {
 
 async function addTask() {
   const title = document.getElementById('add-title').value.trim();
-  const cat = document.getElementById('add-cat').value;
+  const cat = 'Tasks'; // category UI removed — every new task gets the neutral default
   const pri = document.getElementById('add-pri').value;
   const due = document.getElementById('add-due')?.value || '';
   const notes = document.getElementById('add-notes')?.value.trim() || '';
@@ -3007,7 +2992,6 @@ function toggleAddForm() {
       <div class="add-form">
         <input id="add-title" placeholder="What needs to be done?" style="margin-bottom:10px" onkeydown="if(event.key==='Enter')addTask()">
         <div class="row">
-          <select id="add-cat" style="flex:1">${Object.keys(CATS).map(c => `<option value="${c}">${c}</option>`).join('')}</select>
           <select id="add-pri" style="flex:1">${Object.keys(PRIS).map(p => `<option value="${p}"${p === 'Medium' ? ' selected' : ''}>${p}</option>`).join('')}</select>
         </div>
         <div style="margin-bottom:10px">
