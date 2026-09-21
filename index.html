@@ -1196,7 +1196,11 @@ async function calFetch(url, opts = {}) {
       throw new Error('Session expired. Please sign in again.');
     }
   }
-  if (!r.ok) throw new Error('API error: ' + r.status);
+  if (!r.ok) {
+    const err = new Error('API error: ' + r.status);
+    err.status = r.status; // lets callers distinguish 404/410 (gone) from real failures
+    throw err;
+  }
   if (r.status === 204) return null;
   return r.json();
 }
@@ -1504,6 +1508,9 @@ async function syncAll() {
     saveCacheSnapshot();
     // Keep server-side push state (urgent tasks + ready-to-collect orders) in sync
     refreshPushState && refreshPushState();
+    // Clear nags that expired or were stopped from outside (Nag Control /
+    // Claude); also stops any nag still live on a task that got done.
+    reconcileNags();
   } catch (e) {
     // Network failed → fall back to cached snapshot if we have one
     const hadCache = await loadCacheSnapshot();
@@ -1761,6 +1768,9 @@ function serializeTaskDesc(t) {
   if (t.due) metaParts.push('due: ' + t.due);
   if (t.project) metaParts.push('project: ' + t.project);
   if (t.reminder) metaParts.push(serializeReminder(t.reminder));
+  // Nag goes last: flat JSON, no pipes/newlines, so it can't confuse the
+  // other meta matchers (parseTask also strips it before matching).
+  if (t.nag && t.nag.ids && t.nag.ids.length) metaParts.push('nag: ' + JSON.stringify(t.nag));
   return metaParts.join(' | ') + (t.notes ? '\n' + t.notes : '');
 }
 
@@ -1806,6 +1816,240 @@ function reminderToHumanString(rem) {
     return d.toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
   }
   return '';
+}
+
+// ══════════════════════════════════════════════════
+// NAG SERVICE — persistent repeating calendar alerts
+// ══════════════════════════════════════════════════
+// A nag fires a Google Calendar popup alert every N minutes inside a daily
+// window until the task is done, the user stops it, or it self-expires 48h
+// after its first alert. Delivery is calendar alerts on the primary calendar —
+// the only channel that produces persistent full-screen pages on the phone.
+// The API rejects FREQ=HOURLY, so a nag is one FREQ=DAILY event per time
+// slot, each with its own 48-hour UNTIL. Every event's summary starts with
+// the literal "NAG: " prefix — a shared contract with the external Nag
+// Control artifact and Claude-in-chat, either of which may delete our events
+// (reconcileNags tolerates that). All calendar-facing nag logic lives in this
+// section; the task-sheet UI calls only createNagEvents / stopNagForTask /
+// reconcileNags, so a future "all nags" view can reuse the same functions.
+const NAG_TZ = 'Asia/Jerusalem';
+const NAG_PREFIX = 'NAG: ';
+const NAG_LIFETIME_MS = 48 * 3600e3;
+
+// "+03:00" (IDT) or "+02:00" (IST) for a given instant — computed per date,
+// never hard-coded, so nags near the DST switches carry the right offset.
+function nagOffsetFor(date) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: NAG_TZ, timeZoneName: 'longOffset' }).formatToParts(date);
+    const raw = (parts.find(p => p.type === 'timeZoneName') || {}).value || '';
+    const m = raw.match(/GMT([+-]\d{2}:\d{2})/);
+    if (m) return m[1];
+  } catch {}
+  return '+02:00'; // IST fallback if longOffset is unsupported
+}
+function nagOffsetMinutes(off) {
+  const m = off.match(/([+-])(\d{2}):(\d{2})/);
+  if (!m) return 120;
+  return (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3]));
+}
+
+// Current wall clock in Jerusalem, independent of the device's timezone.
+function nagJerusalemNow() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: NAG_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(new Date());
+  const get = t => Number((parts.find(p => p.type === t) || {}).value);
+  const hh = get('hour');
+  return { y: get('year'), m: get('month'), d: get('day'), hh: hh === 24 ? 0 : hh, mm: get('minute') };
+}
+
+// Y/M/D of "today + dayOffset" in Jerusalem wall-calendar terms. Pure
+// calendar arithmetic (Date.UTC handles month rollover), immune to DST.
+function nagTargetDay(dayOffset) {
+  const j = nagJerusalemNow();
+  const t = new Date(Date.UTC(j.y, j.m - 1, j.d + dayOffset));
+  return { y: t.getUTCFullYear(), m: t.getUTCMonth() + 1, d: t.getUTCDate() };
+}
+
+// Epoch ms of a Jerusalem wall-clock time. The offset is guessed from midday
+// of that date and refined once, which settles dates on either side of a
+// DST transition (transitions happen at 02:00, our slots are 05:00+).
+function nagWallToEpoch(y, m, d, hh, mm) {
+  let off = nagOffsetFor(new Date(Date.UTC(y, m - 1, d, 12)));
+  let epoch = Date.UTC(y, m - 1, d, hh, mm) - nagOffsetMinutes(off) * 60000;
+  const off2 = nagOffsetFor(new Date(epoch));
+  if (off2 !== off) epoch = Date.UTC(y, m - 1, d, hh, mm) - nagOffsetMinutes(off2) * 60000;
+  return epoch;
+}
+
+// Epoch → "2026-09-22T11:00:00+03:00" (Jerusalem wall clock, explicit offset).
+// Built from epoch arithmetic, so a 23:50 slot's +10min end rolls the date
+// correctly instead of producing minute 60.
+function nagFmtWall(epoch) {
+  const off = nagOffsetFor(new Date(epoch));
+  const w = new Date(epoch + nagOffsetMinutes(off) * 60000);
+  const p = n => String(n).padStart(2, '0');
+  return `${w.getUTCFullYear()}-${p(w.getUTCMonth() + 1)}-${p(w.getUTCDate())}T${p(w.getUTCHours())}:${p(w.getUTCMinutes())}:00${off}`;
+}
+function nagWallHHMM(epoch) {
+  const off = nagOffsetFor(new Date(epoch));
+  const w = new Date(epoch + nagOffsetMinutes(off) * 60000);
+  const p = n => String(n).padStart(2, '0');
+  return `${p(w.getUTCHours())}:${p(w.getUTCMinutes())}`;
+}
+// Epoch → RRULE UNTIL format, always UTC: "20260924T075900Z".
+function nagFmtUntil(epoch) {
+  const d = new Date(epoch);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}T${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}Z`;
+}
+
+// All slot start-epochs for the window, skipping slots already in the past
+// (a nag created at 14:20 for "Today from 11:00" starts at 15:00 — no
+// backfill). Empty array = nothing left to schedule; caller must refuse.
+function nagBuildSlots(dayOffset, firstHour, lastHour, everyMinutes) {
+  const { y, m, d } = nagTargetDay(dayOffset);
+  const now = Date.now();
+  const slots = [];
+  for (let mins = firstHour * 60; mins <= lastHour * 60; mins += everyMinutes) {
+    const epoch = nagWallToEpoch(y, m, d, Math.floor(mins / 60), mins % 60);
+    if (epoch > now) slots.push(epoch);
+  }
+  return slots;
+}
+
+// Create the nag events sequentially (11–14 inserts; sequential avoids
+// rate-limit noise). Returns { nag, failed }: nag holds whatever was created
+// (null if nothing), failed describes a partial failure for the UI. Never
+// silently discards created ids — the caller persists them either way.
+async function createNagEvents(task, slots, everyMinutes, onProgress) {
+  const ids = [];
+  let failed = null;
+  for (let i = 0; i < slots.length; i++) {
+    if (onProgress) onProgress(i + 1, slots.length);
+    const startEpoch = slots[i];
+    const body = {
+      summary: NAG_PREFIX + task.title,
+      start: { dateTime: nagFmtWall(startEpoch), timeZone: NAG_TZ },
+      end:   { dateTime: nagFmtWall(startEpoch + 10 * 60000), timeZone: NAG_TZ },
+      recurrence: ['RRULE:FREQ=DAILY;UNTIL=' + nagFmtUntil(startEpoch + NAG_LIFETIME_MS - 60000)],
+      reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 0 }] },
+      transparency: 'transparent',
+      description: `Nag reminder for task ${task.id}. Stops by itself after 48 hours, or when the task is marked done.`,
+    };
+    try {
+      const ev = await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events`, {
+        method: 'POST', body: JSON.stringify(body),
+      });
+      ids.push(ev.id);
+    } catch (e) {
+      failed = { error: e, created: ids.length, total: slots.length };
+      break;
+    }
+  }
+  const nag = ids.length ? {
+    ids,
+    first: nagWallHHMM(slots[0]),
+    last: nagWallHHMM(slots[ids.length - 1]),
+    every: everyMinutes,
+    until: new Date(slots[0] + NAG_LIFETIME_MS).toISOString(),
+    created: new Date().toISOString(),
+  } : null;
+  return { nag, failed };
+}
+
+// Delete every stored master id, sendUpdates=none. 404/410 means the event
+// was already stopped elsewhere (Nag Control, Claude) — that's success.
+// Returns ids that still exist after real failures, so a retry finishes the job.
+async function deleteNagEvents(ids) {
+  const remaining = [];
+  let error = null;
+  for (const id of ids) {
+    const masterId = String(id).split('_')[0]; // instance id → series master id
+    try {
+      await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${encodeURIComponent(masterId)}?sendUpdates=none`, { method: 'DELETE' });
+    } catch (e) {
+      if (e.status === 404 || e.status === 410) continue;
+      remaining.push(id);
+      error = e;
+    }
+  }
+  return { remaining, error };
+}
+
+// Write the task's nag field (or clear it with null) back to its calendar event.
+async function persistTaskNag(t, nag) {
+  t.nag = (nag && nag.ids && nag.ids.length) ? nag : null;
+  await updateEvent(t.id, { description: serializeTaskDesc(t) });
+}
+
+// Stop a task's nag: delete the events FIRST, then clear task.nag (spec §5
+// order). On partial failure the surviving ids stay on the task so the next
+// attempt deletes just what's left. persist:false skips the description
+// write for a task that's about to be deleted anyway.
+async function stopNagForTask(t, opts) {
+  const persist = !opts || opts.persist !== false;
+  if (!t.nag || !t.nag.ids || !t.nag.ids.length) { t.nag = null; return true; }
+  const { remaining, error } = await deleteNagEvents(t.nag.ids);
+  if (remaining.length) {
+    t.nag = { ...t.nag, ids: remaining };
+    if (persist) { try { await persistTaskNag(t, t.nag); } catch {} }
+    showError(`Couldn't remove ${remaining.length} nag alert${remaining.length > 1 ? 's' : ''} (${(error && error.message) || 'error'}). Try again — it will delete just the rest.`);
+    return false;
+  }
+  if (persist) {
+    try { await persistTaskNag(t, null); }
+    catch { t.nag = null; } // events are gone; a stale nag field self-heals via reconcile
+  } else {
+    t.nag = null;
+  }
+  return true;
+}
+
+// Does this nag event still exist? cancelled/404/410 = gone. Network errors
+// rethrow — "unknown" must not be treated as "stopped".
+async function nagEventExists(id) {
+  try {
+    const ev = await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${encodeURIComponent(String(id).split('_')[0])}`);
+    return !!ev && ev.status !== 'cancelled';
+  } catch (e) {
+    if (e.status === 404 || e.status === 410) return false;
+    throw e;
+  }
+}
+
+// Reconcile stored nags with reality after each sync:
+//  - nag expired (48h passed)            → clear the field, nothing to delete
+//  - events gone (stopped from Nag Control or by Claude) → clear the field
+//  - task done but nag events still live (e.g. app was closed mid-stop) → stop
+// Transient errors leave the nag untouched; next sync retries.
+async function reconcileNags() {
+  let changed = false;
+  for (const t of tasks) {
+    if (!t.nag || !t.nag.ids || !t.nag.ids.length) continue;
+    try {
+      if (t.done) {
+        if (await stopNagForTask(t)) changed = true;
+        continue;
+      }
+      if (t.nag.until && new Date(t.nag.until).getTime() < Date.now()) {
+        await persistTaskNag(t, null);
+        changed = true;
+        continue;
+      }
+      const checks = await Promise.all(t.nag.ids.map(nagEventExists));
+      const alive = t.nag.ids.filter((_, i) => checks[i]);
+      if (alive.length === 0) {
+        await persistTaskNag(t, null); // stopped elsewhere — fine, not an error
+        changed = true;
+      } else if (alive.length !== t.nag.ids.length) {
+        await persistTaskNag(t, { ...t.nag, ids: alive });
+        changed = true;
+      }
+    } catch { /* transient (offline etc.) — leave as-is, retry next sync */ }
+  }
+  if (changed) renderAll();
 }
 
 function addMinutesToLocalIso(iso, mins) {
@@ -1904,21 +2148,31 @@ function parseTask(event) {
   const lines = desc.split('\n');
   const meta = lines[0] || '';
   const notes = lines.slice(1).join('\n').trim();
+
+  // The nag field is a JSON blob inside the meta line. Pull it out first and
+  // match everything else against the stripped line, so event ids inside the
+  // JSON can never false-trigger the category/priority substring matchers.
+  let nag = null;
+  const nagMatch = meta.match(/nag:\s*(\{.*\})/i);
+  if (nagMatch) { try { nag = JSON.parse(nagMatch[1]); } catch { nag = null; } }
+  const metaClean = nagMatch ? meta.replace(/\s*\|?\s*nag:\s*\{.*\}/i, '') : meta;
+
   let category = 'Tasks', priority = 'Medium', due = null;
   for (const cat of Object.keys(CATS)) {
-    if (meta.toLowerCase().includes(cat.toLowerCase())) { category = cat; break; }
+    if (metaClean.toLowerCase().includes(cat.toLowerCase())) { category = cat; break; }
   }
   for (const p of Object.keys(PRIS)) {
-    if (meta.toLowerCase().includes(p.toLowerCase())) { priority = p; break; }
+    if (metaClean.toLowerCase().includes(p.toLowerCase())) { priority = p; break; }
   }
-  const dueMatch = meta.match(/due:\s*(\d{4}-\d{2}-\d{2})/i);
+  const dueMatch = metaClean.match(/due:\s*(\d{4}-\d{2}-\d{2})/i);
   if (dueMatch) due = dueMatch[1];
-  const projectMatch = meta.match(/project:\s*(.+?)(?:\||$)/i);
+  const projectMatch = metaClean.match(/project:\s*(.+?)(?:\||$)/i);
   return {
     id: event.id, title, category, priority, notes, due,
-    done: meta.includes('[DONE]'),
+    done: metaClean.includes('[DONE]'),
     project: projectMatch ? projectMatch[1].trim() : null,
-    reminder: parseReminder(meta),
+    reminder: parseReminder(metaClean),
+    nag,
     created: event.created,
     order: getEventOrder(event),
   };
@@ -2232,6 +2486,9 @@ function renderTaskItem(t, i) {
   const remHtml = t.reminder
     ? `<span style="font-size:10px;color:var(--text3)" title="Reminder: ${esc(reminderToHumanString(t.reminder))}">🔔</span>`
     : '';
+  const nagHtml = (t.nag && t.nag.ids && t.nag.ids.length)
+    ? `<span style="font-size:10px" title="Nagging ${t.nag.first}–${t.nag.last}">📣</span>`
+    : '';
   return `
     <div class="task-item fade-up${isUrgent ? ' urgent' : ''}" data-task="${t.id}" data-drag-id="${t.id}" style="animation-delay:${i * 0.03}s" onclick="editTask('${t.id}')">
       <button class="task-check" style="border-color:${pri.color}40" onclick="event.stopPropagation();completeTask('${t.id}')" title="Complete"></button>
@@ -2243,6 +2500,7 @@ function renderTaskItem(t, i) {
           ${t.project ? `<span class="tag" style="background:var(--cyan)15;color:var(--cyan)">🎯 ${esc(t.project)}</span>` : ''}
           ${dueHtml}
           ${remHtml}
+          ${nagHtml}
         </div>
         ${t.notes ? `<div class="task-notes">${esc(t.notes)}</div>` : ''}
       </div>
@@ -2319,6 +2577,11 @@ async function completeTask(id) {
     await updateEvent(id, { description: serializeTaskDesc({ ...t, done: true }) });
     t.done = true;
     renderAll();
+    // A done task must never keep nagging. Runs after the done-flip so the UI
+    // stays snappy; reconcileNags is the safety net if this is interrupted.
+    if (t.nag && t.nag.ids && t.nag.ids.length) {
+      stopNagForTask(t).then(() => renderAll()).catch(() => {});
+    }
   } catch (e) {
     showError('Failed to complete: ' + e.message);
     if (el) el.style.opacity = '1';
@@ -2453,11 +2716,127 @@ async function toggleTopPriority(id) {
 }
 
 async function permanentDeleteTask(id) {
+  const t = tasks.find(x => x.id === id);
   try {
+    // Stop the nag BEFORE deleting the task — otherwise a failed stop would
+    // orphan the nag events with no record of their ids. If some deletes
+    // fail, keep the task (ids stay on it) so pressing Delete again retries.
+    if (t && t.nag && t.nag.ids && t.nag.ids.length) {
+      const ok = await stopNagForTask(t, { persist: false });
+      if (!ok) {
+        try { await persistTaskNag(t, t.nag); } catch {}
+        return; // stopNagForTask already surfaced the error
+      }
+    }
     await deleteEvent(id);
     tasks = tasks.filter(t => t.id !== id);
     renderAll();
   } catch (e) { showError(e.message); }
+}
+
+// ── Nag UI (thin layer over the nag service) ──
+function nagHourOptions(selected) {
+  let html = '';
+  for (let h = 5; h <= 23; h++) {
+    html += `<option value="${h}" ${h === selected ? 'selected' : ''}>${String(h).padStart(2, '0')}:00</option>`;
+  }
+  return html;
+}
+
+function nagSectionHtml(t) {
+  const label = `<label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">NAG</label>`;
+  if (t.nag && t.nag.ids && t.nag.ids.length) {
+    const untilD = new Date(t.nag.until);
+    const expires = isNaN(untilD) ? '' : untilD.toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+    const everyLabel = t.nag.every === 30 ? 'every half hour' : t.nag.every === 120 ? 'every two hours' : 'every hour';
+    return `${label}
+      <div style="display:flex;align-items:center;gap:8px;font-size:12px">
+        <span style="flex:1;min-width:0">📣 Nagging · ${t.nag.first}–${t.nag.last} ${everyLabel}${expires ? ' · expires ' + expires : ''}</span>
+        <button class="btn btn-sm btn-ghost" id="nag-stop-btn" onclick="stopNagFromForm('${t.id}')">Stop nag</button>
+      </div>`;
+  }
+  const j = nagJerusalemNow();
+  const nextHour = Math.min(23, Math.max(5, j.hh + 1));
+  return `${label}
+    <button class="btn btn-sm btn-ghost" id="nag-open-btn"
+            onclick="document.getElementById('nag-form').style.display='';this.style.display='none'">📣 Nag me</button>
+    <div id="nag-form" style="display:none;border:1px solid var(--border);border-radius:10px;padding:10px;margin-top:6px">
+      <div style="display:flex;gap:8px;margin-bottom:8px">
+        <div style="flex:1">
+          <label style="font-size:10px;color:var(--text3);display:block;margin-bottom:2px">DAY</label>
+          <select id="nag-day" style="width:100%;font-size:12px">
+            <option value="0" selected>Today</option>
+            <option value="1">Tomorrow</option>
+            <option value="2">In 2 days</option>
+          </select>
+        </div>
+        <div style="flex:1">
+          <label style="font-size:10px;color:var(--text3);display:block;margin-bottom:2px">FIRST ALERT</label>
+          <select id="nag-first" style="width:100%;font-size:12px">${nagHourOptions(nextHour)}</select>
+        </div>
+        <div style="flex:1">
+          <label style="font-size:10px;color:var(--text3);display:block;margin-bottom:2px">LAST ALERT</label>
+          <select id="nag-last" style="width:100%;font-size:12px">${nagHourOptions(21)}</select>
+        </div>
+      </div>
+      <div style="margin-bottom:8px">
+        <label style="font-size:10px;color:var(--text3);display:block;margin-bottom:2px">HOW OFTEN</label>
+        <select id="nag-every" style="width:100%;font-size:12px">
+          <option value="60" selected>Every hour</option>
+          <option value="30">Every half hour</option>
+          <option value="120">Every two hours</option>
+        </select>
+      </div>
+      <div style="font-size:10px;color:var(--text3);margin-bottom:8px">Alerts stop by themselves after 48 hours, or when you mark the task done.</div>
+      <button class="btn btn-sm btn-primary" style="width:100%" id="nag-start-btn" onclick="startNagFromForm('${t.id}')">Start nagging</button>
+      <div id="nag-progress" style="font-size:11px;color:var(--text3);margin-top:6px;text-align:center"></div>
+    </div>`;
+}
+
+async function startNagFromForm(taskId) {
+  const t = tasks.find(x => x.id === taskId);
+  if (!t) return;
+  if (!t.title || !t.title.trim()) { showError('The task needs a title before it can nag.'); return; }
+  const dayOffset = Number(document.getElementById('nag-day').value);
+  const firstHour = Number(document.getElementById('nag-first').value);
+  const lastHour  = Number(document.getElementById('nag-last').value);
+  const every     = Number(document.getElementById('nag-every').value);
+  if (lastHour < firstHour) { showError('Last alert must be at or after the first alert.'); return; }
+  const slots = nagBuildSlots(dayOffset, firstHour, lastHour, every);
+  if (!slots.length) {
+    showError('All of those alert times are already in the past — pick a later hour or another day.');
+    return;
+  }
+  const btn = document.getElementById('nag-start-btn');
+  const prog = document.getElementById('nag-progress');
+  btn.disabled = true; btn.textContent = 'Starting…';
+
+  const { nag, failed } = await createNagEvents(t, slots, every,
+    (i, n) => { if (prog) prog.textContent = `Creating alert ${i} of ${n}…`; });
+
+  // Record whatever was created, even on partial failure — never leave
+  // half a nag behind unrecorded.
+  if (nag) {
+    try { await persistTaskNag(t, nag); }
+    catch (e) { showError('Alerts created, but saving them to the task failed: ' + e.message + '. They will still fire; "Stop nag" may need a retry.'); }
+  }
+  if (failed) {
+    showError(`Created ${failed.created} of ${failed.total} alerts, then: ${failed.error.message}. Use "Stop nag" to remove the partial nag, then try again.`);
+  }
+  const sec = document.getElementById('nag-section');
+  if (sec) sec.innerHTML = nagSectionHtml(t);
+  renderTasks(); // refresh the 📣 marker on the card
+}
+
+async function stopNagFromForm(taskId) {
+  const t = tasks.find(x => x.id === taskId);
+  if (!t || !t.nag) return;
+  const btn = document.getElementById('nag-stop-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  await stopNagForTask(t);
+  const sec = document.getElementById('nag-section');
+  if (sec) sec.innerHTML = nagSectionHtml(t);
+  renderTasks();
 }
 
 function editTask(taskId) {
@@ -2494,6 +2873,7 @@ function editTask(taskId) {
         <input type="date" id="edit-task-due" value="${t.due || ''}">
       </div>
       ${reminderPickerHtml('edit-task', t.reminder, t.due)}
+      <div style="margin-bottom:12px" id="nag-section">${nagSectionHtml(t)}</div>
       <div style="margin-bottom:12px">
         <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">PROJECT</label>
         <select id="edit-task-proj">
@@ -2573,6 +2953,7 @@ async function saveTask(taskId) {
   const desc = serializeTaskDesc({
     done: !!(t && t.done),
     category: cat, priority: pri, due, project: proj, notes, reminder,
+    nag: t && t.nag, // editing a task must not drop its nag record
   });
 
   try {
