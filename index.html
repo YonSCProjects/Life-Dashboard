@@ -1768,9 +1768,12 @@ function serializeTaskDesc(t) {
   if (t.due) metaParts.push('due: ' + t.due);
   if (t.project) metaParts.push('project: ' + t.project);
   if (t.reminder) metaParts.push(serializeReminder(t.reminder));
-  // Nag goes last: flat JSON, no pipes/newlines, so it can't confuse the
-  // other meta matchers (parseTask also strips it before matching).
-  if (t.nag && t.nag.ids && t.nag.ids.length) metaParts.push('nag: ' + JSON.stringify(t.nag));
+  // Nag goes last: flat JSON with no pipes/newlines, so it can't confuse the
+  // other meta matchers (parseTask also strips it before matching). Holds
+  // schedule params (times) or, for pre-merge nags awaiting migration, ids.
+  if (t.nag && ((Array.isArray(t.nag.times) && t.nag.times.length) || (Array.isArray(t.nag.ids) && t.nag.ids.length))) {
+    metaParts.push('nag: ' + JSON.stringify(t.nag));
+  }
   return metaParts.join(' | ') + (t.notes ? '\n' + t.notes : '');
 }
 
@@ -1825,13 +1828,24 @@ function reminderToHumanString(rem) {
 // window until the task is done, the user stops it, or it self-expires 48h
 // after its first alert. Delivery is calendar alerts on the primary calendar —
 // the only channel that produces persistent full-screen pages on the phone.
-// The API rejects FREQ=HOURLY, so a nag is one FREQ=DAILY event per time
-// slot, each with its own 48-hour UNTIL. Every event's summary starts with
-// the literal "NAG: " prefix — a shared contract with the external Nag
-// Control artifact and Claude-in-chat, either of which may delete our events
-// (reconcileNags tolerates that). All calendar-facing nag logic lives in this
-// section; the task-sheet UI calls only createNagEvents / stopNagForTask /
-// reconcileNags, so a future "all nags" view can reuse the same functions.
+//
+// MERGED SCHEDULE. All of the app's nags form one shared schedule: when two
+// or more nagging tasks alert at the same minute on the same day, they share
+// ONE calendar event titled "NAG: Task A + Task B", so the phone shows a
+// single alert. A task stores only its nag parameters (day, times, interval);
+// nagRebuild() derives the full set of calendar events from all active nags,
+// diffs it against what's actually on the calendar, and creates/deletes only
+// the difference. The calendar itself is the registry of existing events —
+// each app-made event carries a machine line "nag-key: HH:MM|d1|d2|ids" in
+// its description — so a failed delete is simply retried on the next sync,
+// and a stopped task can never be resurrected by stale local state.
+//
+// The API rejects FREQ=HOURLY, so events are FREQ=DAILY per time slot with an
+// UNTIL; each task's alerts cover its day and the day after (the 48h lifetime).
+// Every summary starts with the literal "NAG: " prefix — the contract with
+// Nag Control and Claude-in-chat. Events without a nag-key line (made by those
+// tools) are never touched. If one of them deletes an app event, every task
+// in that event counts as stopped (nagRebuild detects this).
 const NAG_TZ = 'Asia/Jerusalem';
 const NAG_PREFIX = 'NAG: ';
 const NAG_LIFETIME_MS = 48 * 3600e3;
@@ -1919,54 +1933,186 @@ function nagBuildSlots(dayOffset, firstHour, lastHour, everyMinutes) {
   return slots;
 }
 
-// Create the nag events sequentially (11–14 inserts; sequential avoids
-// rate-limit noise). Returns { nag, failed }: nag holds whatever was created
-// (null if nothing), failed describes a partial failure for the UI. Never
-// silently discards created ids — the caller persists them either way.
-async function createNagEvents(task, slots, everyMinutes, onProgress) {
-  const ids = [];
-  let failed = null;
-  for (let i = 0; i < slots.length; i++) {
-    if (onProgress) onProgress(i + 1, slots.length);
-    const startEpoch = slots[i];
-    const body = {
-      summary: NAG_PREFIX + task.title,
-      start: { dateTime: nagFmtWall(startEpoch), timeZone: NAG_TZ },
-      end:   { dateTime: nagFmtWall(startEpoch + 10 * 60000), timeZone: NAG_TZ },
-      recurrence: ['RRULE:FREQ=DAILY;UNTIL=' + nagFmtUntil(startEpoch + NAG_LIFETIME_MS - 60000)],
-      reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 0 }] },
-      transparency: 'transparent',
-      description: `Nag reminder for task ${task.id}. Stops by itself after 48 hours, or when the task is marked done.`,
-    };
-    try {
-      const ev = await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events`, {
-        method: 'POST', body: JSON.stringify(body),
-      });
-      ids.push(ev.id);
-    } catch (e) {
-      failed = { error: e, created: ids.length, total: slots.length };
-      break;
-    }
-  }
-  const nag = ids.length ? {
-    ids,
-    first: nagWallHHMM(slots[0]),
-    last: nagWallHHMM(slots[ids.length - 1]),
-    every: everyMinutes,
-    until: new Date(slots[0] + NAG_LIFETIME_MS).toISOString(),
-    created: new Date().toISOString(),
-  } : null;
-  return { nag, failed };
+// ── Calendar-day helpers for the schedule (Jerusalem wall-calendar dates) ──
+function nagYmd(y, m, d) {
+  const p = n => String(n).padStart(2, '0');
+  return `${y}-${p(m)}-${p(d)}`;
+}
+function nagAddDays(ymd, n) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const t = new Date(Date.UTC(y, m - 1, d + n));
+  return nagYmd(t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate());
+}
+// Epoch of a Jerusalem wall-clock "YYYY-MM-DD" + "HH:MM".
+function nagInstantEpoch(ymd, hhmm) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const [hh, mm] = hhmm.split(':').map(Number);
+  return nagWallToEpoch(y, m, d, hh, mm);
+}
+// Short stable hash of a sorted task-id set (FNV-1a, base36). Used in each
+// task's compact record of the events it belongs to.
+function nagSetHash(ids) {
+  let h = 0x811c9dc5;
+  const s = ids.slice().sort().join(',');
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(36);
 }
 
-// Delete every stored master id, sendUpdates=none. 404/410 means the event
-// was already stopped elsewhere (Nag Control, Claude) — that's success.
-// Returns ids that still exist after real failures, so a retry finishes the job.
+// Build a task's nag parameters from validated form slots (all on one target
+// day, already past-filtered). Alerts run on that day and the next — each
+// slot fires twice, i.e. the 48-hour lifetime.
+function nagParamsFromSlots(slots, everyMinutes) {
+  const off = nagOffsetFor(new Date(slots[0]));
+  const w = new Date(slots[0] + nagOffsetMinutes(off) * 60000);
+  const day = nagYmd(w.getUTCFullYear(), w.getUTCMonth() + 1, w.getUTCDate());
+  const times = slots.map(nagWallHHMM);
+  const lastInstant = nagInstantEpoch(nagAddDays(day, 1), times[times.length - 1]);
+  return {
+    day, times, every: everyMinutes,
+    first: times[0], last: times[times.length - 1],
+    until: new Date(lastInstant + 10 * 60000).toISOString(),
+    created: new Date().toISOString(),
+    ev: [], // "eventId~key" — events this task is currently part of (set by nagRebuild)
+  };
+}
+
+// A task's nag is "active" if it has schedule params and isn't done.
+function nagIsActive(t) {
+  return !!(t && !t.done && t.nag && Array.isArray(t.nag.times) && t.nag.times.length && t.nag.day);
+}
+
+// Compute the desired event set from every active nag. For each alert time,
+// walk the dates in order and group consecutive dates that share the exact
+// same set of tasks into one DAILY-recurring event. Returns Map key → group.
+function nagDesiredGroups(activeTasks) {
+  const byTime = new Map(); // "HH:MM" → Map(ymd → Set(taskId))
+  for (const t of activeTasks) {
+    for (const time of t.nag.times) {
+      for (const ymd of [t.nag.day, nagAddDays(t.nag.day, 1)]) {
+        if (!byTime.has(time)) byTime.set(time, new Map());
+        const dates = byTime.get(time);
+        if (!dates.has(ymd)) dates.set(ymd, new Set());
+        dates.get(ymd).add(t.id);
+      }
+    }
+  }
+  const groups = new Map();
+  for (const [time, dates] of byTime) {
+    const sorted = [...dates.keys()].sort();
+    let cur = null;
+    for (const ymd of sorted) {
+      const ids = [...dates.get(ymd)].sort();
+      const sig = ids.join(',');
+      const contiguous = cur && nagAddDays(cur.d2, 1) === ymd && cur.sig === sig;
+      if (contiguous) { cur.d2 = ymd; continue; }
+      if (cur) groups.set(nagGroupKey(cur), cur);
+      cur = { time, d1: ymd, d2: ymd, ids, sig };
+    }
+    if (cur) groups.set(nagGroupKey(cur), cur);
+  }
+  for (const g of groups.values()) {
+    g.key = nagGroupKey(g);
+    g.shortKey = `${g.time}/${g.d1}/${g.d2}/${nagSetHash(g.ids)}`; // no pipes: lives in the task meta line
+    g.endEpoch = nagInstantEpoch(g.d2, g.time);
+  }
+  return groups;
+}
+function nagGroupKey(g) { return `${g.time}|${g.d1}|${g.d2}|${g.ids.join(',')}`; }
+
+function nagGroupSummary(g) {
+  const titles = g.ids.map(id => (tasks.find(t => t.id === id) || {}).title || 'Task');
+  return NAG_PREFIX + titles.join(' + ');
+}
+
+function nagGroupBody(g) {
+  const startEpoch = nagInstantEpoch(g.d1, g.time);
+  const titles = g.ids.map(id => (tasks.find(t => t.id === id) || {}).title || 'Task');
+  const body = {
+    summary: nagGroupSummary(g),
+    start: { dateTime: nagFmtWall(startEpoch), timeZone: NAG_TZ },
+    end:   { dateTime: nagFmtWall(startEpoch + 10 * 60000), timeZone: NAG_TZ },
+    reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 0 }] },
+    transparency: 'transparent',
+    description:
+      `Nag reminder for task${g.ids.length > 1 ? 's' : ''} ${g.ids.join(', ')}` +
+      (g.ids.length > 1 ? ` (${titles.join(' + ')})` : '') +
+      `. Stops by itself after 48 hours, or when the task is marked done.\n` +
+      `nag-key: ${g.key}`,
+  };
+  // Hard self-expiry: UNTIL sits one minute after the group's last alert, so
+  // the series can never run past its tasks' 48h window.
+  if (g.d2 !== g.d1) {
+    body.recurrence = ['RRULE:FREQ=DAILY;UNTIL=' + nagFmtUntil(g.endEpoch + 60000)];
+  }
+  return body;
+}
+
+// All app-made nag events currently on the calendar (the registry). Instance
+// ids are collapsed to their series master. Events without a nag-key line
+// were made by Nag Control / Claude and are ignored.
+async function nagListAppEvents() {
+  const timeMin = new Date(Date.now() - 2 * 3600e3).toISOString();
+  const timeMax = new Date(Date.now() + 6 * 86400e3).toISOString();
+  const found = new Map(); // key → {id, summary}
+  let pageToken = '';
+  do {
+    const data = await calFetch(
+      `/calendars/${encodeURIComponent(CALENDAR_ID)}/events?q=NAG&singleEvents=true&maxResults=250` +
+      `&timeMin=${encodeURIComponent(timeMin)}&timeMax=${encodeURIComponent(timeMax)}` +
+      (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '')
+    );
+    for (const ev of (data.items || [])) {
+      if (ev.status === 'cancelled') continue;
+      if (!(ev.summary || '').toUpperCase().startsWith('NAG:')) continue;
+      const m = (ev.description || '').match(/nag-key:\s*(\S+)/);
+      if (!m) continue;
+      const masterId = ev.recurringEventId || String(ev.id).split('_')[0];
+      if (!found.has(m[1])) found.set(m[1], { id: masterId, summary: ev.summary || '' });
+    }
+    pageToken = data.nextPageToken || '';
+  } while (pageToken);
+  return found;
+}
+
+// Old-format nags (v58–v60: one private event series per task, stored as
+// nag.ids) are converted to schedule params, and their old events deleted.
+async function nagMigrateLegacy() {
+  for (const t of tasks) {
+    const n = t.nag;
+    if (!n || Array.isArray(n.times) || !Array.isArray(n.ids) || !n.ids.length) continue;
+    const { remaining } = await deleteNagEvents(n.ids);
+    if (remaining.length) continue; // retry next sync
+    let params = null;
+    if (!t.done && n.until && n.first && n.last && n.every && new Date(n.until).getTime() > Date.now()) {
+      const [fh, fm] = n.first.split(':').map(Number);
+      const [lh, lm] = n.last.split(':').map(Number);
+      const firstEpoch = new Date(n.until).getTime() - NAG_LIFETIME_MS;
+      const off = nagOffsetFor(new Date(firstEpoch));
+      const w = new Date(firstEpoch + nagOffsetMinutes(off) * 60000);
+      const day = nagYmd(w.getUTCFullYear(), w.getUTCMonth() + 1, w.getUTCDate());
+      const times = [];
+      for (let mins = fh * 60 + fm; mins <= lh * 60 + lm; mins += n.every) {
+        times.push(`${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`);
+      }
+      params = { day, times, every: n.every, first: n.first, last: n.last, until: n.until, created: n.created, ev: [] };
+    }
+    try { await persistTaskNag(t, params); } catch {}
+  }
+}
+
+// Write the task's nag field (or clear it with null) back to its calendar event.
+async function persistTaskNag(t, nag) {
+  t.nag = nag || null;
+  await updateEvent(t.id, { description: serializeTaskDesc(t) });
+}
+
+// Delete events by id (series master), sendUpdates=none. 404/410 = already
+// gone, which counts as success. Returns ids that still exist.
 async function deleteNagEvents(ids) {
   const remaining = [];
   let error = null;
   for (const id of ids) {
-    const masterId = String(id).split('_')[0]; // instance id → series master id
+    const masterId = String(id).split('_')[0];
     try {
       await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${encodeURIComponent(masterId)}?sendUpdates=none`, { method: 'DELETE' });
     } catch (e) {
@@ -1978,78 +2124,122 @@ async function deleteNagEvents(ids) {
   return { remaining, error };
 }
 
-// Write the task's nag field (or clear it with null) back to its calendar event.
-async function persistTaskNag(t, nag) {
-  t.nag = (nag && nag.ids && nag.ids.length) ? nag : null;
-  await updateEvent(t.id, { description: serializeTaskDesc(t) });
+// ── The rebuild ──
+// Serialised: overlapping rebuilds (a sync landing mid-"Start nagging") would
+// otherwise both create the same events. Every call queues behind the last.
+let nagRebuildChain = Promise.resolve();
+function nagRebuild(onProgress) {
+  const run = nagRebuildChain.then(() => nagRebuildNow(onProgress));
+  nagRebuildChain = run.catch(() => {});
+  return run;
 }
 
-// Stop a task's nag: delete the events FIRST, then clear task.nag (spec §5
-// order). On partial failure the surviving ids stay on the task so the next
-// attempt deletes just what's left. persist:false skips the description
-// write for a task that's about to be deleted anyway.
-async function stopNagForTask(t, opts) {
-  const persist = !opts || opts.persist !== false;
-  if (!t.nag || !t.nag.ids || !t.nag.ids.length) { t.nag = null; return true; }
-  const { remaining, error } = await deleteNagEvents(t.nag.ids);
-  if (remaining.length) {
-    t.nag = { ...t.nag, ids: remaining };
-    if (persist) { try { await persistTaskNag(t, t.nag); } catch {} }
-    showError(`Couldn't remove ${remaining.length} nag alert${remaining.length > 1 ? 's' : ''} (${(error && error.message) || 'error'}). Try again — it will delete just the rest.`);
-    return false;
+// Returns { created, deleted, failedCreates, failedDeletes, error, stopped }.
+async function nagRebuildNow(onProgress) {
+  await nagMigrateLegacy();
+  const now = Date.now();
+
+  // 1. Expired nags and nags on done tasks: clear their params (persist
+  //    first — clearing before deleting means a failed delete is retried by
+  //    the next rebuild instead of the events being resurrected).
+  for (const t of tasks) {
+    if (!t.nag || !Array.isArray(t.nag.times)) continue;
+    const expired = t.nag.until && new Date(t.nag.until).getTime() < now;
+    if (t.done || expired) { try { await persistTaskNag(t, null); } catch {} }
   }
-  if (persist) {
-    try { await persistTaskNag(t, null); }
-    catch { t.nag = null; } // events are gone; a stale nag field self-heals via reconcile
-  } else {
-    t.nag = null;
+
+  const existing = await nagListAppEvents();
+
+  // 2. External stops. An event this task was part of is gone, its key is
+  //    still one we'd want, and it still had alerts ahead — nobody but
+  //    Nag Control / Claude deletes a still-wanted event, so every task in it
+  //    is stopped. Repeat until stable (stopping one task changes groups).
+  const stopped = [];
+  for (let pass = 0; pass < 5; pass++) {
+    const desired = nagDesiredGroups(tasks.filter(nagIsActive));
+    const desiredShort = new Map([...desired.values()].map(g => [g.shortKey, g]));
+    const existingIds = new Set([...existing.values()].map(e => e.id));
+    const victims = new Set();
+    for (const t of tasks.filter(nagIsActive)) {
+      for (const entry of (t.nag.ev || [])) {
+        const [evId, shortKey] = entry.split('~');
+        const g = desiredShort.get(shortKey);
+        if (g && !existingIds.has(evId) && g.endEpoch > now) g.ids.forEach(id => victims.add(id));
+      }
+    }
+    if (!victims.size) break;
+    for (const id of victims) {
+      const t = tasks.find(x => x.id === id);
+      if (t && t.nag) { stopped.push(t.title); try { await persistTaskNag(t, null); } catch { t.nag = null; } }
+    }
+  }
+
+  // 3. Diff desired vs existing.
+  const desired = nagDesiredGroups(tasks.filter(nagIsActive));
+  const toDelete = [...existing.entries()].filter(([k]) => !desired.has(k)).map(([, e]) => e.id);
+  const toCreate = [...desired.values()].filter(g => !existing.has(g.key) && g.endEpoch > now);
+  const toRetitle = [...desired.values()].filter(g => existing.has(g.key) && existing.get(g.key).summary !== nagGroupSummary(g));
+
+  // 4. Create first, then delete: a change like "A+B" → "A" briefly has both
+  //    events rather than a gap where an alert could be missed.
+  const keyToId = new Map([...existing.entries()].map(([k, e]) => [k, e.id]));
+  let failedCreates = 0, error = null;
+  for (let i = 0; i < toCreate.length; i++) {
+    if (onProgress) onProgress(i + 1, toCreate.length);
+    const g = toCreate[i];
+    try {
+      const ev = await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events`, {
+        method: 'POST', body: JSON.stringify(nagGroupBody(g)),
+      });
+      keyToId.set(g.key, ev.id);
+    } catch (e) { failedCreates++; error = e; }
+  }
+  for (const g of toRetitle) {
+    try { await updateEvent(keyToId.get(g.key), { summary: nagGroupSummary(g) }); } catch {}
+  }
+  const { remaining, error: delErr } = await deleteNagEvents(toDelete);
+  for (const [k, id] of [...keyToId.entries()]) if (toDelete.includes(id) && !remaining.includes(id)) keyToId.delete(k);
+  if (delErr) error = error || delErr;
+
+  // 5. Refresh each task's record of the events it belongs to.
+  for (const t of tasks.filter(nagIsActive)) {
+    const ev = [];
+    for (const g of desired.values()) {
+      if (g.ids.includes(t.id) && keyToId.has(g.key)) ev.push(`${keyToId.get(g.key)}~${g.shortKey}`);
+    }
+    ev.sort();
+    const before = (t.nag.ev || []).slice().sort();
+    if (ev.join() !== before.join()) {
+      try { await persistTaskNag(t, { ...t.nag, ev }); } catch {}
+    }
+  }
+
+  return {
+    created: toCreate.length - failedCreates, deleted: toDelete.length - remaining.length,
+    failedCreates, failedDeletes: remaining.length, error, stopped,
+  };
+}
+
+// Stop one task's nag: clear its params, then rebuild so every event it's in
+// is removed or re-titled for the tasks still sharing it.
+async function stopNagForTask(t) {
+  if (!t.nag) return true;
+  await persistTaskNag(t, null);
+  const r = await nagRebuild();
+  if (r.failedDeletes) {
+    showError(`Nag stopped, but ${r.failedDeletes} calendar alert${r.failedDeletes > 1 ? 's' : ''} couldn't be removed yet (${(r.error && r.error.message) || 'error'}). They'll be retried automatically on the next sync.`);
+    return false;
   }
   return true;
 }
 
-// Does this nag event still exist? cancelled/404/410 = gone. Network errors
-// rethrow — "unknown" must not be treated as "stopped".
-async function nagEventExists(id) {
-  try {
-    const ev = await calFetch(`/calendars/${encodeURIComponent(CALENDAR_ID)}/events/${encodeURIComponent(String(id).split('_')[0])}`);
-    return !!ev && ev.status !== 'cancelled';
-  } catch (e) {
-    if (e.status === 404 || e.status === 410) return false;
-    throw e;
-  }
-}
-
-// Reconcile stored nags with reality after each sync:
-//  - nag expired (48h passed)            → clear the field, nothing to delete
-//  - events gone (stopped from Nag Control or by Claude) → clear the field
-//  - task done but nag events still live (e.g. app was closed mid-stop) → stop
-// Transient errors leave the nag untouched; next sync retries.
+// Called after every sync: migrates old nags, clears expired/done ones,
+// detects external stops, and heals any drift (retries failed creates/deletes).
 async function reconcileNags() {
-  let changed = false;
-  for (const t of tasks) {
-    if (!t.nag || !t.nag.ids || !t.nag.ids.length) continue;
-    try {
-      if (t.done) {
-        if (await stopNagForTask(t)) changed = true;
-        continue;
-      }
-      if (t.nag.until && new Date(t.nag.until).getTime() < Date.now()) {
-        await persistTaskNag(t, null);
-        changed = true;
-        continue;
-      }
-      const checks = await Promise.all(t.nag.ids.map(nagEventExists));
-      const alive = t.nag.ids.filter((_, i) => checks[i]);
-      if (alive.length === 0) {
-        await persistTaskNag(t, null); // stopped elsewhere — fine, not an error
-        changed = true;
-      } else if (alive.length !== t.nag.ids.length) {
-        await persistTaskNag(t, { ...t.nag, ids: alive });
-        changed = true;
-      }
-    } catch { /* transient (offline etc.) — leave as-is, retry next sync */ }
-  }
-  if (changed) renderAll();
+  try {
+    const r = await nagRebuild();
+    if (r.stopped.length || r.created || r.deleted) renderAll();
+  } catch { /* offline etc. — next sync retries */ }
 }
 
 function addMinutesToLocalIso(iso, mins) {
@@ -2476,7 +2666,7 @@ function renderTaskItem(t, i) {
   const remHtml = t.reminder
     ? `<span style="font-size:10px;color:var(--text3)" title="Reminder: ${esc(reminderToHumanString(t.reminder))}">🔔</span>`
     : '';
-  const nagHtml = (t.nag && t.nag.ids && t.nag.ids.length)
+  const nagHtml = nagIsActive(t)
     ? `<span style="font-size:10px" title="Nagging ${t.nag.first}–${t.nag.last}">📣</span>`
     : '';
   return `
@@ -2563,13 +2753,19 @@ async function completeTask(id) {
   const el = document.querySelector(`[data-task="${id}"]`);
   if (el) el.style.opacity = '0.3';
   try {
-    await updateEvent(id, { description: serializeTaskDesc({ ...t, done: true }) });
+    // Done and nag-cleared in one write: a done task never owns a nag, even
+    // for a moment. The rebuild then removes (or re-titles, for merged
+    // alerts) every event it was in; a failed delete retries on next sync.
+    const hadNag = !!t.nag;
+    await updateEvent(id, { description: serializeTaskDesc({ ...t, done: true, nag: null }) });
     t.done = true;
+    t.nag = null;
     renderAll();
-    // A done task must never keep nagging. Runs after the done-flip so the UI
-    // stays snappy; reconcileNags is the safety net if this is interrupted.
-    if (t.nag && t.nag.ids && t.nag.ids.length) {
-      stopNagForTask(t).then(() => renderAll()).catch(() => {});
+    if (hadNag) {
+      nagRebuild().then(r => {
+        if (r.failedDeletes) showError(`Task done, but ${r.failedDeletes} nag alert${r.failedDeletes > 1 ? 's' : ''} couldn't be removed yet — retrying on next sync.`);
+        renderAll();
+      }).catch(() => {});
     }
   } catch (e) {
     showError('Failed to complete: ' + e.message);
@@ -2706,20 +2902,20 @@ async function toggleTopPriority(id) {
 
 async function permanentDeleteTask(id) {
   const t = tasks.find(x => x.id === id);
+  const hadNag = !!(t && t.nag);
   try {
-    // Stop the nag BEFORE deleting the task — otherwise a failed stop would
-    // orphan the nag events with no record of their ids. If some deletes
-    // fail, keep the task (ids stay on it) so pressing Delete again retries.
-    if (t && t.nag && t.nag.ids && t.nag.ids.length) {
-      const ok = await stopNagForTask(t, { persist: false });
-      if (!ok) {
-        try { await persistTaskNag(t, t.nag); } catch {}
-        return; // stopNagForTask already surfaced the error
-      }
-    }
     await deleteEvent(id);
     tasks = tasks.filter(t => t.id !== id);
     renderAll();
+    // Nag events can't be orphaned: every app nag event names its task ids in
+    // its nag-key line, and the rebuild deletes any event whose tasks are no
+    // longer nagging — now, or on the next sync if a delete fails.
+    if (hadNag) {
+      nagRebuild().then(r => {
+        if (r.failedDeletes) showError(`Task deleted, but ${r.failedDeletes} nag alert${r.failedDeletes > 1 ? 's' : ''} couldn't be removed yet — retrying on next sync.`);
+        renderAll();
+      }).catch(() => {});
+    }
   } catch (e) { showError(e.message); }
 }
 
@@ -2784,17 +2980,29 @@ function readNagOptsFromForm(prefix) {
   return { slots, every };
 }
 
+// Other active nags that alert at the same minute on the same day as t —
+// i.e. the tasks t shares merged calendar alerts with.
+function nagSharingPartners(t) {
+  if (!nagIsActive(t)) return [];
+  const mine = new Set();
+  for (const time of t.nag.times) for (const d of [t.nag.day, nagAddDays(t.nag.day, 1)]) mine.add(d + ' ' + time);
+  return tasks.filter(o => o.id !== t.id && nagIsActive(o) && o.nag.times.some(time =>
+    [o.nag.day, nagAddDays(o.nag.day, 1)].some(d => mine.has(d + ' ' + time))));
+}
+
 function nagSectionHtml(t) {
   const label = `<label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">NAG</label>`;
-  if (t.nag && t.nag.ids && t.nag.ids.length) {
+  if (nagIsActive(t)) {
     const untilD = new Date(t.nag.until);
     const expires = isNaN(untilD) ? '' : untilD.toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
     const everyLabel = t.nag.every === 30 ? 'every half hour' : t.nag.every === 120 ? 'every two hours' : 'every hour';
+    const partners = nagSharingPartners(t);
     return `${label}
       <div style="display:flex;align-items:center;gap:8px;font-size:12px">
         <span style="flex:1;min-width:0">📣 Nagging · ${t.nag.first}–${t.nag.last} ${everyLabel}${expires ? ' · expires ' + expires : ''}</span>
         <button class="btn btn-sm btn-ghost" id="nag-stop-btn" onclick="stopNagFromForm('${t.id}')">Stop nag</button>
-      </div>`;
+      </div>
+      ${partners.length ? `<div style="font-size:11px;color:var(--text3);margin-top:4px">Shares alerts with: ${partners.map(o => esc(o.title)).join(', ')} — overlapping times fire as one combined alert.</div>` : ''}`;
   }
   return `${label}
     <button class="btn btn-sm btn-ghost" id="nag-open-btn"
@@ -2804,6 +3012,15 @@ function nagSectionHtml(t) {
       <button class="btn btn-sm btn-primary" style="width:100%" id="nag-start-btn" onclick="startNagFromForm('${t.id}')">Start nagging</button>
       <div id="nag-progress" style="font-size:11px;color:var(--text3);margin-top:6px;text-align:center"></div>
     </div>`;
+}
+
+// Surface the outcome of a rebuild that started or changed a nag.
+function nagReportRebuild(r) {
+  if (r.failedCreates) {
+    showError(`${r.failedCreates} nag alert${r.failedCreates > 1 ? 's' : ''} couldn't be created (${(r.error && r.error.message) || 'error'}). The nag is saved — missing alerts are retried automatically on the next sync.`);
+  } else if (r.failedDeletes) {
+    showError(`${r.failedDeletes} old nag alert${r.failedDeletes > 1 ? 's' : ''} couldn't be removed yet — retrying on the next sync.`);
+  }
 }
 
 async function startNagFromForm(taskId) {
@@ -2816,17 +3033,15 @@ async function startNagFromForm(taskId) {
   const prog = document.getElementById('nag-progress');
   btn.disabled = true; btn.textContent = 'Starting…';
 
-  const { nag, failed } = await createNagEvents(t, opts.slots, opts.every,
-    (i, n) => { if (prog) prog.textContent = `Creating alert ${i} of ${n}…`; });
-
-  // Record whatever was created, even on partial failure — never leave
-  // half a nag behind unrecorded.
-  if (nag) {
-    try { await persistTaskNag(t, nag); }
-    catch (e) { showError('Alerts created, but saving them to the task failed: ' + e.message + '. They will still fire; "Stop nag" may need a retry.'); }
-  }
-  if (failed) {
-    showError(`Created ${failed.created} of ${failed.total} alerts, then: ${failed.error.message}. Use "Stop nag" to remove the partial nag, then try again.`);
+  try {
+    // Save the schedule first, then let the rebuild create/merge the events.
+    // If some inserts fail the params are already saved, so the next sync's
+    // rebuild fills in exactly what's missing.
+    await persistTaskNag(t, nagParamsFromSlots(opts.slots, opts.every));
+    const r = await nagRebuild((i, n) => { if (prog) prog.textContent = `Updating alert ${i} of ${n}…`; });
+    nagReportRebuild(r);
+  } catch (e) {
+    showError('Could not start the nag: ' + e.message);
   }
   const sec = document.getElementById('nag-section');
   if (sec) sec.innerHTML = nagSectionHtml(t);
@@ -2838,7 +3053,8 @@ async function stopNagFromForm(taskId) {
   if (!t || !t.nag) return;
   const btn = document.getElementById('nag-stop-btn');
   if (btn) { btn.disabled = true; btn.textContent = '…'; }
-  await stopNagForTask(t);
+  try { await stopNagForTask(t); }
+  catch (e) { showError('Could not stop the nag: ' + e.message); }
   const sec = document.getElementById('nag-section');
   if (sec) sec.innerHTML = nagSectionHtml(t);
   renderTasks();
@@ -3011,19 +3227,19 @@ async function addTask() {
     const desc = metaParts.join(' | ') + (notes ? '\n' + notes : '');
     const created = await createTaskEvent(title, desc, due, reminder);
 
-    // Task exists — now attach the nag to its real id, with progress on the
-    // Add button. Same partial-failure contract as the edit sheet: whatever
-    // was created is persisted on the task, never dropped.
+    // Task exists — attach the nag to its real id. The rebuild reads the
+    // global task list, so register the new task locally first (the sync
+    // below replaces it with the server copy). Params are saved before any
+    // events exist, so failed inserts are filled in by the next sync.
     if (nagOpts && created && created.id) {
       const newTask = { id: created.id, title, category: cat, priority: pri, due, project: null, notes, reminder, done: false, nag: null };
-      const { nag, failed } = await createNagEvents(newTask, nagOpts.slots, nagOpts.every,
-        (i, n) => { if (addBtn) addBtn.textContent = `Creating alert ${i} of ${n}…`; });
-      if (nag) {
-        try { await persistTaskNag(newTask, nag); }
-        catch (e) { showError('Task added and alerts created, but saving them to the task failed: ' + e.message); }
-      }
-      if (failed) {
-        showError(`Task added, but only ${failed.created} of ${failed.total} nag alerts were created: ${failed.error.message}. Open the task and use "Stop nag", then start it again.`);
+      tasks.push(newTask);
+      try {
+        await persistTaskNag(newTask, nagParamsFromSlots(nagOpts.slots, nagOpts.every));
+        const r = await nagRebuild((i, n) => { if (addBtn) addBtn.textContent = `Updating alert ${i} of ${n}…`; });
+        nagReportRebuild(r);
+      } catch (e) {
+        showError('Task added, but the nag could not be started: ' + e.message);
       }
     }
 
