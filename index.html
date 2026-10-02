@@ -3008,8 +3008,23 @@ async function driveFetch(path, opts = {}) {
   let r = await doFetch();
   if (r.status === 401 && await doRefresh()) r = await doFetch();
   if (!r.ok) {
-    const err = new Error('Drive error: ' + r.status);
+    // Google's error body says WHY (API disabled vs. missing permission) —
+    // surface it instead of a bare status code.
+    const body = await r.json().catch(() => ({}));
+    const ge = body.error || {};
+    const reasons = [
+      ...((ge.errors || []).map(x => x.reason)),
+      ...((ge.details || []).map(x => x.reason)),
+    ].filter(Boolean).join(' ');
+    let msg = 'Drive error ' + r.status + (ge.message ? ': ' + ge.message : '');
+    if (/accessNotConfigured|SERVICE_DISABLED/.test(reasons) || /has not been used|is disabled/i.test(ge.message || '')) {
+      msg = 'The Google Drive API is turned off for this app\'s Google Cloud project. Enable "Google Drive API" in Google Cloud Console → APIs & Services → Library, wait a minute, then try again.';
+    } else if (/insufficientPermissions|ACCESS_TOKEN_SCOPE_INSUFFICIENT/.test(reasons) || /insufficient authentication scopes/i.test(ge.message || '')) {
+      msg = 'The app doesn\'t have Google Drive permission. Sign out, sign back in, and keep the Google Drive box ticked on Google\'s permission screen.';
+    }
+    const err = new Error(msg);
     err.status = r.status;
+    err.reasons = reasons;
     throw err;
   }
   if (r.status === 204) return null;
@@ -6266,7 +6281,7 @@ function closeDetail() {
 function showError(msg) {
   const c = document.getElementById('error-container');
   c.innerHTML = `<div class="error-banner"><span>${esc(msg)}</span><button style="background:none;border:none;color:#b8493c;cursor:pointer;font-size:16px" onclick="this.parentElement.remove()">x</button></div>`;
-  setTimeout(() => c.innerHTML = '', 5000);
+  setTimeout(() => c.innerHTML = '', Math.min(20000, Math.max(5000, msg.length * 70))); // long explanations need reading time
 }
 
 // ── Utilities ──
