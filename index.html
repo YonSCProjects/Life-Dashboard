@@ -2992,6 +2992,13 @@ const INK_START_H = 1400;
 const INK_FOLDER_KEY = 'dash-ink-folder';
 const INK_FOLDER_NAME = 'Life Dashboard handwriting';
 const INK_COLORS = ['#1f2937', '#1d4ed8', '#c0392b'];
+// Pen thickness presets (page units; pressure still varies width around it).
+const INK_SIZES = [{ s: 3, label: 'Thin' }, { s: 6, label: 'Medium' }, { s: 12, label: 'Thick' }];
+const INK_SIZE_KEY = 'dash-ink-size';
+function inkSavedSize() {
+  const v = Number(localStorage.getItem(INK_SIZE_KEY));
+  return INK_SIZES.some(x => x.s === v) ? v : 6;
+}
 const INK_BLANK_GIF = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
 // Drive REST wrapper — mirrors calFetch: offline guard for writes, one
@@ -3143,6 +3150,9 @@ function inkDrawPieces(ctx, stroke, scale, fromPiece, toPiece, finalize) {
     ctx.fill();
     return;
   }
+  // Consecutive pieces of (nearly) the same width share one path: separate
+  // overlapping round-capped pieces leave visible seams at every join.
+  let pathW = null;
   for (let i = Math.max(1, fromPiece); i < Math.min(n, toPiece); i++) {
     const isLast = i === n - 1;
     if (isLast && !finalize) break; // last piece needs the next point (or pen-up)
@@ -3150,12 +3160,17 @@ function inkDrawPieces(ctx, stroke, scale, fromPiece, toPiece, finalize) {
     const sy = i === 1 ? p[1] : (p[(i - 1) * 3 + 1] + p[i * 3 + 1]) / 2;
     const ex = isLast ? p[i * 3] : (p[i * 3] + p[(i + 1) * 3]) / 2;
     const ey = isLast ? p[i * 3 + 1] : (p[i * 3 + 1] + p[(i + 1) * 3 + 1]) / 2;
-    ctx.beginPath();
-    ctx.moveTo(sx * scale, sy * scale);
+    const w = Math.max(0.5, Math.round(inkWidth(stroke, p[i * 3 + 2]) * scale * 2) / 2);
+    if (w !== pathW) {
+      if (pathW !== null) ctx.stroke();
+      ctx.beginPath();
+      ctx.lineWidth = w;
+      ctx.moveTo(sx * scale, sy * scale);
+      pathW = w;
+    }
     ctx.quadraticCurveTo(p[i * 3] * scale, p[i * 3 + 1] * scale, ex * scale, ey * scale);
-    ctx.lineWidth = Math.max(0.5, inkWidth(stroke, p[i * 3 + 2]) * scale);
-    ctx.stroke();
   }
+  if (pathW !== null) ctx.stroke();
 }
 function inkDrawStroke(ctx, stroke, scale) { inkDrawPieces(ctx, stroke, scale, 1, Infinity, true); }
 
@@ -3211,7 +3226,7 @@ function openInkEditor({ doc, saveLabel, onSave }) {
   const ed = inkEd = {
     doc: { v: 1, w: INK_W, h: Math.max(INK_START_H, (doc && doc.h) || INK_START_H),
            strokes: ((doc && doc.strokes) || []).map(s => ({ c: s.c, s: s.s, p: s.p.slice() })) },
-    tool: 'pen', color: INK_COLORS[0], size: 6, fingerDraws: false,
+    tool: 'pen', color: INK_COLORS[0], size: inkSavedSize(), fingerDraws: false,
     undo: [], cur: null, erasing: null, pan: null, penSeen: false, onSave, saving: false,
   };
   const ov = document.createElement('div');
@@ -3223,15 +3238,17 @@ function openInkEditor({ doc, saveLabel, onSave }) {
       <button class="ink-tool active" data-tool="pen" onclick="inkSetTool('pen')" title="Pen">✏️</button>
       <button class="ink-tool" data-tool="eraser" onclick="inkSetTool('eraser')" title="Eraser (or hold the S Pen button)">🧽</button>
       ${INK_COLORS.map((c, i) => `<button class="ink-swatch${i === 0 ? ' active' : ''}" data-color="${c}" style="background:${c}" onclick="inkSetColor('${c}')" title="Ink color"></button>`).join('')}
+      <button class="ink-tool" id="ink-size" onclick="inkCycleSize()"></button>
       <button class="ink-tool" onclick="inkUndo()" title="Undo">↶</button>
-      <button class="ink-tool" onclick="inkClear()" title="Clear page">🗑</button>
       <button class="ink-tool" id="ink-finger" onclick="inkToggleFinger()" title="Let a finger write (off: finger scrolls)">☝️</button>
       <span style="flex:1"></span>
       <button class="btn btn-primary btn-sm" id="ink-save" onclick="inkSave()">${esc(saveLabel || 'Save')}</button>
     </div>
-    <div class="ink-hint" id="ink-hint">S Pen writes · finger scrolls · hold the pen button to erase</div>
+    <div class="ink-hint"><span id="ink-hint">S Pen writes · finger scrolls · hold the pen button to erase</span>
+      <button onclick="inkClear()" style="float:right;background:none;border:none;color:var(--text3);font-size:11px;cursor:pointer;padding:0 0 0 8px;text-decoration:underline">Clear page</button></div>
     <div class="ink-scroll" id="ink-scroll"><div class="ink-scroll-inner"><canvas class="ink-canvas" id="ink-canvas"></canvas></div></div>`;
   document.body.appendChild(ov);
+  inkRenderSizeBtn();
   const canvas = document.getElementById('ink-canvas');
   ed.canvas = canvas; ed.ctx = canvas.getContext('2d');
   ed.scroller = document.getElementById('ink-scroll');
@@ -3338,9 +3355,7 @@ function inkPointerUp(e) {
   const stroke = ed.cur; ed.cur = null;
   ed.doc.strokes.push(stroke);
   ed.undo.push({ t: 'add', stroke });
-  ed.ctx.setTransform(ed.dpr, 0, 0, ed.dpr, 0, 0);
-  const n = stroke.p.length / 3;
-  inkDrawPieces(ed.ctx, stroke, ed.scale, n - 1, n, true); // the final piece (or the dot)
+  inkRedraw(); // clean, seam-free render of the finished stroke
   // Writing near the bottom grows the page.
   let maxY = 0;
   for (let i = 1; i < stroke.p.length; i += 3) maxY = Math.max(maxY, stroke.p[i]);
@@ -3394,6 +3409,25 @@ function inkSetColor(c) {
   inkEd.color = c;
   inkSetTool('pen');
   document.querySelectorAll('#ink-overlay .ink-swatch').forEach(b => b.classList.toggle('active', b.dataset.color === c));
+  inkRenderSizeBtn();
+}
+// One button cycles Thin → Medium → Thick; it shows a dot at the current
+// size and color. Applies to new strokes only; remembered across notes.
+function inkCycleSize() {
+  if (!inkEd) return;
+  const i = INK_SIZES.findIndex(x => x.s === inkEd.size);
+  inkEd.size = INK_SIZES[(i + 1) % INK_SIZES.length].s;
+  try { localStorage.setItem(INK_SIZE_KEY, String(inkEd.size)); } catch {}
+  inkSetTool('pen');
+  inkRenderSizeBtn();
+}
+function inkRenderSizeBtn() {
+  const b = document.getElementById('ink-size');
+  if (!b || !inkEd) return;
+  const preset = INK_SIZES.find(x => x.s === inkEd.size) || INK_SIZES[1];
+  const d = Math.round(3 + preset.s * 1.1); // 6px / 10px / 16px dot
+  b.title = `Pen thickness: ${preset.label} (tap to change)`;
+  b.innerHTML = `<span style="display:block;width:${d}px;height:${d}px;border-radius:50%;background:${inkEd.color}"></span>`;
 }
 function inkToggleFinger() {
   if (!inkEd) return;
