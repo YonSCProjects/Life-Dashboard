@@ -191,6 +191,41 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
   flex-shrink: 0; align-self: flex-start; margin-top: 1px;
 }
 .task-today:hover { opacity: 0.85; transform: scale(1.15); }
+
+/* ── HANDWRITTEN (S Pen) NOTES ── */
+.add-btn-row { display: flex; gap: 8px; margin-bottom: 16px; }
+/* Paper stays light in dark mode, like real paper — ink colors are chosen for it. */
+.ink-thumb {
+  display: block; max-width: 100%; max-height: 90px; margin-top: 6px;
+  border-radius: 8px; border: 1px solid var(--border); background: #fdfdfb;
+  cursor: pointer; min-height: 24px; min-width: 60px;
+}
+.ink-thumb.small { max-height: 40px; margin-top: 4px; }
+.ink-thumb.large { max-height: 180px; }
+.ink-overlay {
+  position: fixed; inset: 0; z-index: 350; background: var(--bg);
+  display: flex; flex-direction: column;
+}
+.ink-toolbar {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  padding: 8px; padding-top: calc(8px + env(safe-area-inset-top, 0px));
+  border-bottom: 1px solid var(--border); background: var(--bg2);
+}
+.ink-tool {
+  min-width: 34px; height: 36px; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--bg); font-size: 16px; cursor: pointer; padding: 0 6px;
+  display: inline-flex; align-items: center; justify-content: center; color: var(--text);
+}
+.ink-tool.active { border-color: var(--text); background: var(--bg3); }
+.ink-swatch { width: 24px; height: 24px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; padding: 0; }
+.ink-swatch.active { border-color: var(--text); box-shadow: 0 0 0 2px var(--bg) inset; }
+.ink-hint { font-size: 11px; color: var(--text3); padding: 4px 12px; }
+.ink-scroll { flex: 1; overflow-y: auto; position: relative; background: var(--bg3); }
+.ink-scroll-inner { padding: 10px; }
+.ink-canvas {
+  display: block; touch-action: none; background-color: #fdfdfb;
+  border-radius: 6px; box-shadow: 0 1px 6px rgba(0,0,0,0.12); cursor: crosshair;
+}
 .task-check {
   width: 24px; height: 24px; border-radius: 7px; border: 2px solid;
   background: transparent; cursor: pointer; flex-shrink: 0; margin-top: 1px;
@@ -594,7 +629,10 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
   <!-- ═══ TASKS VIEW (home) ═══ -->
   <div class="content active" id="tasks-view">
     <div class="pills" id="category-pills"></div>
-    <button class="btn btn-ghost" style="width:100%;margin-bottom:16px;border-style:dashed" onclick="toggleAddForm()" id="add-btn">+ Add Task</button>
+    <div id="add-btn" class="add-btn-row">
+      <button class="btn btn-ghost" style="flex:1;border-style:dashed" onclick="toggleAddForm()">+ Add Task</button>
+      <button class="btn btn-ghost" style="border-style:dashed" onclick="quickHandwrite()" title="Write a task by hand with the S Pen">✍️ Write</button>
+    </div>
     <div id="add-form-container"></div>
     <div class="tasks-split">
       <div class="tasks-split-main">
@@ -1768,6 +1806,7 @@ function serializeTaskDesc(t) {
   if (t.due) metaParts.push('due: ' + t.due);
   if (t.project) metaParts.push('project: ' + t.project);
   if (t.reminder) metaParts.push(serializeReminder(t.reminder));
+  if (t.ink && t.ink.id) metaParts.push(`ink: ${t.ink.id}@${t.ink.v || 1}`);
   // Nag goes last: flat JSON with no pipes/newlines, so it can't confuse the
   // other meta matchers (parseTask also strips it before matching). Holds
   // schedule params (times) or, for pre-merge nags awaiting migration, ids.
@@ -2345,7 +2384,16 @@ function parseTask(event) {
   let nag = null;
   const nagMatch = meta.match(/nag:\s*(\{.*\})/i);
   if (nagMatch) { try { nag = JSON.parse(nagMatch[1]); } catch { nag = null; } }
-  const metaClean = nagMatch ? meta.replace(/\s*\|?\s*nag:\s*\{.*\}/i, '') : meta;
+  let metaClean = nagMatch ? meta.replace(/\s*\|?\s*nag:\s*\{.*\}/i, '') : meta;
+  // Handwritten note: "ink: <driveFileId>@<version>". Stripped like nag —
+  // a random Drive id can contain "low"/"high"/"work" and would otherwise
+  // trip the priority/category substring matchers below.
+  let ink = null;
+  const inkMatch = metaClean.match(/ink:\s*([A-Za-z0-9_-]+)@(\d+)/);
+  if (inkMatch) {
+    ink = { id: inkMatch[1], v: Number(inkMatch[2]) };
+    metaClean = metaClean.replace(/\s*\|?\s*ink:\s*[A-Za-z0-9_-]+@\d+/, '');
+  }
 
   let category = 'Tasks', priority = 'Medium', due = null;
   for (const cat of Object.keys(CATS)) {
@@ -2363,6 +2411,7 @@ function parseTask(event) {
     project: projectMatch ? projectMatch[1].trim() : null,
     reminder: parseReminder(metaClean),
     nag,
+    ink,
     created: event.created,
     order: getEventOrder(event),
   };
@@ -2614,6 +2663,9 @@ function renderPills() {
 function renderTasks() {
   const container = document.getElementById('tasks-list');
   tasks.sort(compareTasks);
+  // Handwriting thumbnails render as placeholders first; fill them once this
+  // synchronous render (main list + Today pane) has finished.
+  setTimeout(hydrateInkThumbs, 0);
   const completed = tasks.filter(t => t.done);
 
   renderTodayPane();
@@ -2674,6 +2726,7 @@ function renderTaskItem(t, i) {
       <button class="task-check" style="border-color:${pri.color}40" onclick="event.stopPropagation();completeTask('${t.id}')" title="Complete"></button>
       <div style="flex:1;min-width:0">
         <div class="task-title">${esc(t.title)}</div>
+        ${t.ink ? inkThumbHtml(t.ink, '', `event.stopPropagation();openInkForTask('${t.id}')`) : ''}
         <div class="task-meta">
           <span class="tag" style="background:${pri.color}15;color:${pri.color}">${t.priority}</span>
           ${t.project ? `<span class="tag" style="background:var(--cyan)15;color:var(--cyan)">🎯 ${esc(t.project)}</span>` : ''}
@@ -2712,7 +2765,7 @@ function renderTodayPane() {
           <button class="today-item-check${t.done ? ' done' : ''}"
                   onclick="${t.done ? `uncompleteTask('${t.id}')` : `completeTask('${t.id}')`}"
                   title="${t.done ? 'Mark not done' : 'Mark done'}">${t.done ? '✓' : ''}</button>
-          <span class="today-item-title" onclick="editTask('${t.id}')">${esc(t.title)}</span>
+          <span class="today-item-title" onclick="editTask('${t.id}')">${esc(t.title)}${t.ink ? inkThumbHtml(t.ink, 'small', `event.stopPropagation();openInkForTask('${t.id}')`) : ''}</span>
           <span class="drag-handle" title="Drag to reorder" onclick="event.stopPropagation()" style="font-size:12px;padding:2px 4px">⠿</span>
           <button class="today-item-remove" onclick="removeFromToday('${t.id}')" title="Remove from Today">×</button>
         </div>`).join('')}
@@ -2907,6 +2960,7 @@ async function permanentDeleteTask(id) {
     await deleteEvent(id);
     tasks = tasks.filter(t => t.id !== id);
     renderAll();
+    if (t && t.ink) inkTrashFile(t.ink.id); // recoverable from Drive trash for 30 days
     // Nag events can't be orphaned: every app nag event names its task ids in
     // its nag-key line, and the rebuild deletes any event whose tasks are no
     // longer nagging — now, or on the next sync if a delete fails.
@@ -2917,6 +2971,522 @@ async function permanentDeleteTask(id) {
       }).catch(() => {});
     }
   } catch (e) { showError(e.message); }
+}
+
+// ══════════════════════════════════════════════════
+// HANDWRITTEN NOTES (S Pen) — storage, rendering, editor
+// ══════════════════════════════════════════════════
+// A task can carry a handwritten note. The strokes live as a small JSON file
+// in the user's Google Drive (the app already holds the drive.file scope, so
+// no new consent; Drive survives clearing site data and syncs across
+// devices). The task meta line references it as "ink: <fileId>@<version>";
+// every save bumps the version, so other devices know their cached copy is
+// stale. Strokes are stored as vectors (not pixels) so a note stays editable:
+// erase single strokes, undo, keep writing.
+//
+// Doc format: { v:1, w:1000, h:<height>, strokes:[{ c:'#hex', s:<size>,
+//   p:[x,y,pressure, x,y,pressure, ...] }] } — x/y in page units (page is
+//   1000 units wide at any screen size), pressure 0–100.
+const INK_W = 1000;
+const INK_START_H = 1400;
+const INK_FOLDER_KEY = 'dash-ink-folder';
+const INK_FOLDER_NAME = 'Life Dashboard handwriting';
+const INK_COLORS = ['#1f2937', '#1d4ed8', '#c0392b'];
+const INK_BLANK_GIF = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+
+// Drive REST wrapper — mirrors calFetch: offline guard for writes, one
+// token refresh on 401, err.status on failures.
+async function driveFetch(path, opts = {}) {
+  const method = (opts.method || 'GET').toUpperCase();
+  if (method !== 'GET' && !navigator.onLine) {
+    throw new Error('Offline — can\'t save the note. Try again when you\'re back online.');
+  }
+  const doFetch = () => fetch('https://www.googleapis.com' + path, {
+    ...opts,
+    headers: { Authorization: 'Bearer ' + accessToken, ...opts.headers },
+  });
+  let r = await doFetch();
+  if (r.status === 401 && await doRefresh()) r = await doFetch();
+  if (!r.ok) {
+    const err = new Error('Drive error: ' + r.status);
+    err.status = r.status;
+    throw err;
+  }
+  if (r.status === 204) return null;
+  return r.json();
+}
+
+// Find or create the app's folder (drive.file only sees app-made files, so
+// this never touches anything else in the user's Drive).
+async function inkFolderId() {
+  const cached = localStorage.getItem(INK_FOLDER_KEY);
+  if (cached) return cached;
+  const q = encodeURIComponent(`name='${INK_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
+  const found = await driveFetch(`/drive/v3/files?q=${q}&fields=files(id)&spaces=drive`);
+  let id = found && found.files && found.files[0] && found.files[0].id;
+  if (!id) {
+    const made = await driveFetch('/drive/v3/files?fields=id', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: INK_FOLDER_NAME, mimeType: 'application/vnd.google-apps.folder' }),
+    });
+    id = made.id;
+  }
+  localStorage.setItem(INK_FOLDER_KEY, id);
+  return id;
+}
+
+function inkMultipart(metadata, doc) {
+  const boundary = 'ink' + Math.random().toString(36).slice(2);
+  const body =
+    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
+    `--${boundary}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(doc)}\r\n--${boundary}--`;
+  return { body, contentType: `multipart/related; boundary=${boundary}` };
+}
+
+async function inkCreateFile(doc) {
+  const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+  const upload = async (folder) => {
+    const { body, contentType } = inkMultipart(
+      { name: `Handwritten note ${stamp}.json`, mimeType: 'application/json', parents: [folder] }, doc);
+    return driveFetch('/upload/drive/v3/files?uploadType=multipart&fields=id', {
+      method: 'POST', headers: { 'Content-Type': contentType }, body,
+    });
+  };
+  try {
+    return (await upload(await inkFolderId())).id;
+  } catch (e) {
+    if (e.status !== 404) throw e;
+    localStorage.removeItem(INK_FOLDER_KEY); // folder was deleted — make a new one
+    return (await upload(await inkFolderId())).id;
+  }
+}
+
+async function inkUpdateFile(fileId, doc) {
+  await driveFetch(`/upload/drive/v3/files/${encodeURIComponent(fileId)}?uploadType=media&fields=id`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(doc),
+  });
+}
+
+// Trash (not hard-delete): recoverable from Drive's trash for 30 days.
+async function inkTrashFile(fileId) {
+  try {
+    await driveFetch(`/drive/v3/files/${encodeURIComponent(fileId)}?fields=id`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trashed: true }),
+    });
+  } catch { /* orphaned file is harmless */ }
+}
+
+// Local cache (same IndexedDB store as the offline snapshot) keyed by
+// "ink:<fileId>@<version>" — notes render instantly and work offline.
+async function inkCacheGet(key) {
+  try {
+    const db = await openOfflineDB();
+    return await new Promise(res => {
+      const r = db.transaction('cache', 'readonly').objectStore('cache').get(key);
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => res(undefined);
+    });
+  } catch { return undefined; }
+}
+async function inkCacheDelete(key) {
+  try {
+    const db = await openOfflineDB();
+    db.transaction('cache', 'readwrite').objectStore('cache').delete(key);
+  } catch {}
+}
+
+const inkDocLoads = new Map(); // "id@v" → in-flight Promise<doc>
+function loadInkDoc(ink) {
+  const key = `${ink.id}@${ink.v}`;
+  if (inkDocLoads.has(key)) return inkDocLoads.get(key);
+  const p = (async () => {
+    const cached = await inkCacheGet('ink:' + key);
+    if (cached && Array.isArray(cached.strokes)) return cached;
+    const doc = await driveFetch(`/drive/v3/files/${encodeURIComponent(ink.id)}?alt=media`);
+    if (!doc || !Array.isArray(doc.strokes)) throw new Error('Handwriting file is unreadable');
+    await offlineCacheSet({ ['ink:' + key]: doc });
+    return doc;
+  })();
+  inkDocLoads.set(key, p);
+  p.catch(() => inkDocLoads.delete(key)); // allow retry after a failure
+  return p;
+}
+
+// ── Rendering ──
+function inkWidth(stroke, pr) { return stroke.s * (0.35 + 0.95 * pr / 100); }
+
+// Draw strokes [from, to) of a stroke's points. Smoothing: quadratic curves
+// through segment midpoints; each piece gets its own width from pressure.
+function inkDrawPieces(ctx, stroke, scale, fromPiece, toPiece, finalize) {
+  const p = stroke.p, n = p.length / 3;
+  ctx.strokeStyle = stroke.c; ctx.fillStyle = stroke.c;
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if (n === 1) {
+    if (!finalize) return;
+    ctx.beginPath();
+    ctx.arc(p[0] * scale, p[1] * scale, Math.max(0.5, inkWidth(stroke, p[2]) * scale / 2), 0, Math.PI * 2);
+    ctx.fill();
+    return;
+  }
+  for (let i = Math.max(1, fromPiece); i < Math.min(n, toPiece); i++) {
+    const isLast = i === n - 1;
+    if (isLast && !finalize) break; // last piece needs the next point (or pen-up)
+    const sx = i === 1 ? p[0] : (p[(i - 1) * 3] + p[i * 3]) / 2;
+    const sy = i === 1 ? p[1] : (p[(i - 1) * 3 + 1] + p[i * 3 + 1]) / 2;
+    const ex = isLast ? p[i * 3] : (p[i * 3] + p[(i + 1) * 3]) / 2;
+    const ey = isLast ? p[i * 3 + 1] : (p[i * 3 + 1] + p[(i + 1) * 3 + 1]) / 2;
+    ctx.beginPath();
+    ctx.moveTo(sx * scale, sy * scale);
+    ctx.quadraticCurveTo(p[i * 3] * scale, p[i * 3 + 1] * scale, ex * scale, ey * scale);
+    ctx.lineWidth = Math.max(0.5, inkWidth(stroke, p[i * 3 + 2]) * scale);
+    ctx.stroke();
+  }
+}
+function inkDrawStroke(ctx, stroke, scale) { inkDrawPieces(ctx, stroke, scale, 1, Infinity, true); }
+
+// Card thumbnail: crop to the writing's bounding box, show the top part.
+const inkThumbs = new Map(); // "id@v" → dataURL
+function inkRenderThumb(doc) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const s of doc.strokes) for (let i = 0; i < s.p.length; i += 3) {
+    minX = Math.min(minX, s.p[i]); maxX = Math.max(maxX, s.p[i]);
+    minY = Math.min(minY, s.p[i + 1]); maxY = Math.max(maxY, s.p[i + 1]);
+  }
+  if (minX === Infinity) { minX = 0; minY = 0; maxX = INK_W; maxY = 200; }
+  const pad = 24;
+  minX = Math.max(0, minX - pad); minY = Math.max(0, minY - pad);
+  maxX = Math.min(INK_W, maxX + pad); maxY = maxY + pad;
+  const cw = Math.max(200, maxX - minX);
+  const ch = Math.min(maxY - minY, cw * 0.6); // tall notes: show the top
+  const outW = 600, scale = outW / cw;
+  const c = document.createElement('canvas');
+  c.width = outW; c.height = Math.max(40, Math.round(ch * scale));
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fdfdfb'; ctx.fillRect(0, 0, c.width, c.height);
+  ctx.translate(-minX * scale, -minY * scale);
+  for (const s of doc.strokes) inkDrawStroke(ctx, s, scale);
+  return c.toDataURL('image/png');
+}
+
+function inkThumbHtml(ink, cls, onclick) {
+  const key = `${ink.id}@${ink.v}`;
+  return `<img class="ink-thumb ${cls || ''}" alt="Handwritten note" data-ink="${key}" src="${inkThumbs.get(key) || INK_BLANK_GIF}"${onclick ? ` onclick="${onclick}"` : ''}>`;
+}
+
+// Fill in any thumbnail <img> rendered before its strokes were loaded.
+function hydrateInkThumbs() {
+  document.querySelectorAll('img.ink-thumb[data-ink]').forEach(img => {
+    const key = img.dataset.ink;
+    if (inkThumbs.has(key)) { if (img.src !== inkThumbs.get(key)) img.src = inkThumbs.get(key); return; }
+    const at = key.lastIndexOf('@');
+    loadInkDoc({ id: key.slice(0, at), v: Number(key.slice(at + 1)) }).then(doc => {
+      if (!inkThumbs.has(key)) inkThumbs.set(key, inkRenderThumb(doc));
+      document.querySelectorAll(`img.ink-thumb[data-ink="${key}"]`).forEach(el => { el.src = inkThumbs.get(key); });
+    }).catch(() => { img.alt = '✍️ (handwriting unavailable)'; });
+  });
+}
+
+// ── Editor ──
+// Pen (and mouse) writes; finger scrolls the page, so a resting palm never
+// draws. Holding the S Pen side button (or the eraser tip on pens that have
+// one) erases. "☝️" lets a finger write when there's no pen.
+let inkEd = null;
+
+function openInkEditor({ doc, saveLabel, onSave }) {
+  const ed = inkEd = {
+    doc: { v: 1, w: INK_W, h: Math.max(INK_START_H, (doc && doc.h) || INK_START_H),
+           strokes: ((doc && doc.strokes) || []).map(s => ({ c: s.c, s: s.s, p: s.p.slice() })) },
+    tool: 'pen', color: INK_COLORS[0], size: 6, fingerDraws: false,
+    undo: [], cur: null, erasing: null, pan: null, penSeen: false, onSave, saving: false,
+  };
+  const ov = document.createElement('div');
+  ov.className = 'ink-overlay';
+  ov.id = 'ink-overlay';
+  ov.innerHTML = `
+    <div class="ink-toolbar">
+      <button class="ink-tool" onclick="inkCancel()" title="Cancel">✕</button>
+      <button class="ink-tool active" data-tool="pen" onclick="inkSetTool('pen')" title="Pen">✏️</button>
+      <button class="ink-tool" data-tool="eraser" onclick="inkSetTool('eraser')" title="Eraser (or hold the S Pen button)">🧽</button>
+      ${INK_COLORS.map((c, i) => `<button class="ink-swatch${i === 0 ? ' active' : ''}" data-color="${c}" style="background:${c}" onclick="inkSetColor('${c}')" title="Ink color"></button>`).join('')}
+      <button class="ink-tool" onclick="inkUndo()" title="Undo">↶</button>
+      <button class="ink-tool" onclick="inkClear()" title="Clear page">🗑</button>
+      <button class="ink-tool" id="ink-finger" onclick="inkToggleFinger()" title="Let a finger write (off: finger scrolls)">☝️</button>
+      <span style="flex:1"></span>
+      <button class="btn btn-primary btn-sm" id="ink-save" onclick="inkSave()">${esc(saveLabel || 'Save')}</button>
+    </div>
+    <div class="ink-hint" id="ink-hint">S Pen writes · finger scrolls · hold the pen button to erase</div>
+    <div class="ink-scroll" id="ink-scroll"><div class="ink-scroll-inner"><canvas class="ink-canvas" id="ink-canvas"></canvas></div></div>`;
+  document.body.appendChild(ov);
+  const canvas = document.getElementById('ink-canvas');
+  ed.canvas = canvas; ed.ctx = canvas.getContext('2d');
+  ed.scroller = document.getElementById('ink-scroll');
+  inkLayout();
+  ed.onResize = () => inkLayout();
+  window.addEventListener('resize', ed.onResize);
+  canvas.addEventListener('pointerdown', inkPointerDown);
+  canvas.addEventListener('pointermove', inkPointerMove);
+  canvas.addEventListener('pointerup', inkPointerUp);
+  canvas.addEventListener('pointercancel', inkPointerUp);
+  canvas.addEventListener('contextmenu', e => e.preventDefault()); // pen button / right-click
+}
+
+function inkLayout() {
+  const ed = inkEd; if (!ed) return;
+  const cssW = Math.max(200, ed.scroller.clientWidth - 20);
+  ed.scale = cssW / INK_W;
+  const cssH = ed.doc.h * ed.scale;
+  const dpr = window.devicePixelRatio || 1;
+  ed.dpr = dpr;
+  ed.canvas.style.width = cssW + 'px';
+  ed.canvas.style.height = cssH + 'px';
+  ed.canvas.width = Math.round(cssW * dpr);
+  ed.canvas.height = Math.round(cssH * dpr);
+  // Ruled lines every 64 page units, scaled with the page.
+  const gap = 64 * ed.scale;
+  ed.canvas.style.backgroundImage = `repeating-linear-gradient(to bottom, transparent 0, transparent ${gap - 1}px, #e3e8ef ${gap - 1}px, #e3e8ef ${gap}px)`;
+  inkRedraw();
+}
+
+function inkRedraw() {
+  const ed = inkEd; if (!ed) return;
+  ed.ctx.setTransform(ed.dpr, 0, 0, ed.dpr, 0, 0);
+  ed.ctx.clearRect(0, 0, ed.canvas.width, ed.canvas.height);
+  for (const s of ed.doc.strokes) inkDrawStroke(ed.ctx, s, ed.scale);
+  if (ed.cur) inkDrawPieces(ed.ctx, ed.cur, ed.scale, 1, Infinity, false);
+}
+
+function inkPoint(e) {
+  const ed = inkEd, r = ed.canvas.getBoundingClientRect();
+  const pr = e.pointerType === 'pen' ? (e.pressure || 0.5) : 0.5;
+  return [Math.round((e.clientX - r.left) / ed.scale), Math.round((e.clientY - r.top) / ed.scale), Math.round(pr * 100)];
+}
+// Pointer Events: barrel button = buttons bit 2; dedicated eraser = bit 32.
+function inkIsEraseEvent(e) {
+  return inkEd.tool === 'eraser' || (e.pointerType === 'pen' && ((e.buttons & 2) || (e.buttons & 32)));
+}
+
+function inkPointerDown(e) {
+  const ed = inkEd; if (!ed || ed.saving) return;
+  if (e.pointerType === 'pen') ed.penSeen = true;
+  const writesWithFinger = ed.fingerDraws && e.pointerType === 'touch';
+  if (e.pointerType === 'touch' && !writesWithFinger) {
+    if (ed.cur || ed.erasing) return; // palm while the pen is down — ignore
+    ed.pan = { id: e.pointerId, y: e.clientY, top: ed.scroller.scrollTop };
+    return;
+  }
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  e.preventDefault();
+  try { ed.canvas.setPointerCapture(e.pointerId); } catch {} // keeps the stroke if the pen slides off the canvas
+  ed.pointerId = e.pointerId;
+  if (inkIsEraseEvent(e)) {
+    ed.erasing = { removed: [] };
+    inkEraseAt(inkPoint(e));
+  } else {
+    ed.cur = { c: ed.color, s: ed.size, p: inkPoint(e) };
+  }
+}
+
+function inkPointerMove(e) {
+  const ed = inkEd; if (!ed) return;
+  if (ed.pan && e.pointerId === ed.pan.id) {
+    ed.scroller.scrollTop = ed.pan.top - (e.clientY - ed.pan.y);
+    return;
+  }
+  if (e.pointerId !== ed.pointerId) return;
+  const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  for (const ev of (events.length ? events : [e])) {
+    const pt = inkPoint(ev);
+    if (ed.erasing) { inkEraseAt(pt); continue; }
+    if (!ed.cur) continue;
+    const p = ed.cur.p, n = p.length / 3;
+    if (Math.abs(p[(n - 1) * 3] - pt[0]) + Math.abs(p[(n - 1) * 3 + 1] - pt[1]) < 1) continue; // dedupe
+    p.push(pt[0], pt[1], pt[2]);
+    const k = p.length / 3 - 1;
+    if (k >= 2) {
+      ed.ctx.setTransform(ed.dpr, 0, 0, ed.dpr, 0, 0);
+      inkDrawPieces(ed.ctx, ed.cur, ed.scale, k - 1, k, false); // the piece that just became drawable
+    }
+  }
+}
+
+function inkPointerUp(e) {
+  const ed = inkEd; if (!ed) return;
+  if (ed.pan && e.pointerId === ed.pan.id) { ed.pan = null; return; }
+  if (e.pointerId !== ed.pointerId) return;
+  ed.pointerId = null;
+  if (ed.erasing) {
+    if (ed.erasing.removed.length) ed.undo.push({ t: 'erase', items: ed.erasing.removed });
+    ed.erasing = null;
+    return;
+  }
+  if (!ed.cur) return;
+  const stroke = ed.cur; ed.cur = null;
+  ed.doc.strokes.push(stroke);
+  ed.undo.push({ t: 'add', stroke });
+  ed.ctx.setTransform(ed.dpr, 0, 0, ed.dpr, 0, 0);
+  const n = stroke.p.length / 3;
+  inkDrawPieces(ed.ctx, stroke, ed.scale, n - 1, n, true); // the final piece (or the dot)
+  // Writing near the bottom grows the page.
+  let maxY = 0;
+  for (let i = 1; i < stroke.p.length; i += 3) maxY = Math.max(maxY, stroke.p[i]);
+  if (maxY > ed.doc.h - 250) { ed.doc.h += 700; inkLayout(); }
+}
+
+// Stroke eraser: removes any stroke passing near the eraser point.
+function inkEraseAt(pt) {
+  const ed = inkEd, r = 14;
+  for (let si = ed.doc.strokes.length - 1; si >= 0; si--) {
+    const s = ed.doc.strokes[si], hitR = r + s.s;
+    for (let i = 0; i < s.p.length; i += 3) {
+      const dx = s.p[i] - pt[0], dy = s.p[i + 1] - pt[1];
+      if (dx * dx + dy * dy <= hitR * hitR) {
+        ed.erasing.removed.push({ stroke: s, index: si });
+        ed.doc.strokes.splice(si, 1);
+        break;
+      }
+    }
+  }
+  if (ed.erasing.removed.length) inkRedraw();
+}
+
+function inkUndo() {
+  const ed = inkEd; if (!ed) return;
+  const a = ed.undo.pop(); if (!a) return;
+  if (a.t === 'add') {
+    const i = ed.doc.strokes.lastIndexOf(a.stroke);
+    if (i >= 0) ed.doc.strokes.splice(i, 1);
+  } else if (a.t === 'erase') {
+    // Re-insert in reverse removal order so original indices line up again.
+    for (let j = a.items.length - 1; j >= 0; j--) ed.doc.strokes.splice(a.items[j].index, 0, a.items[j].stroke);
+  } else if (a.t === 'clear') {
+    ed.doc.strokes = a.strokes;
+  }
+  inkRedraw();
+}
+function inkClear() {
+  const ed = inkEd; if (!ed || !ed.doc.strokes.length) return;
+  ed.undo.push({ t: 'clear', strokes: ed.doc.strokes });
+  ed.doc.strokes = [];
+  inkRedraw();
+}
+function inkSetTool(tool) {
+  if (!inkEd) return;
+  inkEd.tool = tool;
+  document.querySelectorAll('#ink-overlay .ink-tool[data-tool]').forEach(b => b.classList.toggle('active', b.dataset.tool === tool));
+}
+function inkSetColor(c) {
+  if (!inkEd) return;
+  inkEd.color = c;
+  inkSetTool('pen');
+  document.querySelectorAll('#ink-overlay .ink-swatch').forEach(b => b.classList.toggle('active', b.dataset.color === c));
+}
+function inkToggleFinger() {
+  if (!inkEd) return;
+  inkEd.fingerDraws = !inkEd.fingerDraws;
+  document.getElementById('ink-finger').classList.toggle('active', inkEd.fingerDraws);
+  document.getElementById('ink-hint').textContent = inkEd.fingerDraws
+    ? 'Finger writes too · scroll with the edges of the screen'
+    : 'S Pen writes · finger scrolls · hold the pen button to erase';
+}
+
+function inkCloseEditor() {
+  const ed = inkEd; if (!ed) return;
+  window.removeEventListener('resize', ed.onResize);
+  const ov = document.getElementById('ink-overlay');
+  if (ov) ov.remove();
+  inkEd = null;
+}
+function inkCancel() {
+  const ed = inkEd; if (!ed) return;
+  if (ed.undo.length && !confirm('Discard your changes to this note?')) return;
+  inkCloseEditor();
+}
+
+async function inkSave() {
+  const ed = inkEd; if (!ed || ed.saving) return;
+  if (!ed.doc.strokes.length) { showError('The note is empty — write something first, or tap ✕ to cancel.'); return; }
+  // Trim unused page height so the stored doc stays compact.
+  let maxY = 0;
+  for (const s of ed.doc.strokes) for (let i = 1; i < s.p.length; i += 3) maxY = Math.max(maxY, s.p[i]);
+  const doc = { v: 1, w: INK_W, h: Math.max(INK_START_H, Math.ceil((maxY + 300) / 100) * 100), strokes: ed.doc.strokes };
+  const btn = document.getElementById('ink-save');
+  ed.saving = true;
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try {
+    await ed.onSave(doc);
+    inkCloseEditor();
+  } catch (e) {
+    // Keep the editor open so nothing written is lost.
+    showError('Could not save the note: ' + e.message);
+    ed.saving = false; btn.disabled = false; btn.textContent = label;
+  }
+}
+
+// ── Task integration ──
+// Open an existing task's note for editing. Saves overwrite the Drive file,
+// then bump the version in the task's meta so every device re-fetches.
+async function openInkForTask(taskId) {
+  const t = tasks.find(x => x.id === taskId);
+  if (!t || !t.ink) return;
+  let doc;
+  try { doc = await loadInkDoc(t.ink); }
+  catch (e) {
+    showError(e.status === 404 ? 'This note\'s handwriting file is missing from Google Drive (was it deleted?).' : 'Could not load the handwriting: ' + e.message);
+    return;
+  }
+  openInkEditor({
+    doc, saveLabel: 'Save',
+    onSave: async (newDoc) => {
+      const old = { ...t.ink };
+      await inkUpdateFile(old.id, newDoc);
+      const next = { id: old.id, v: (old.v || 1) + 1 };
+      const nextKey = `${next.id}@${next.v}`;
+      await offlineCacheSet({ ['ink:' + nextKey]: newDoc });
+      inkThumbs.set(nextKey, inkRenderThumb(newDoc));
+      t.ink = next;
+      await updateEvent(t.id, { description: serializeTaskDesc(t) });
+      inkCacheDelete(`ink:${old.id}@${old.v}`);
+      inkThumbs.delete(`${old.id}@${old.v}`);
+      renderAll();
+      const sheetThumb = document.getElementById('edit-ink-thumb');
+      if (sheetThumb) sheetThumb.outerHTML = inkThumbHtml(t.ink, 'large', `openInkForTask('${t.id}')`).replace('<img ', '<img id="edit-ink-thumb" ');
+    },
+  });
+}
+
+// Add-form flow: the note is drafted locally and uploaded when the task is added.
+let addInkDraft = null;
+function addFormHandwrite() {
+  openInkEditor({
+    doc: addInkDraft, saveLabel: 'Done',
+    onSave: async (doc) => { addInkDraft = doc; renderAddInkPreview(); },
+  });
+}
+function renderAddInkPreview() {
+  const el = document.getElementById('add-ink-preview');
+  const btn = document.getElementById('add-ink-btn');
+  if (!el) return;
+  if (!addInkDraft) {
+    el.innerHTML = '';
+    if (btn) btn.textContent = '✍️ Write by hand';
+    return;
+  }
+  const url = inkRenderThumb(addInkDraft);
+  el.innerHTML = `
+    <img class="ink-thumb" src="${url}" alt="Handwritten note" onclick="addFormHandwrite()">
+    <div style="display:flex;gap:6px;margin-top:6px">
+      <button class="btn btn-sm btn-ghost" onclick="addFormHandwrite()">✏️ Edit</button>
+      <button class="btn btn-sm btn-ghost" onclick="addInkDraft=null;renderAddInkPreview()">Remove</button>
+    </div>`;
+  if (btn) btn.textContent = '✍️ Handwritten note attached';
+  const title = document.getElementById('add-title');
+  if (title) title.placeholder = 'Title (optional for a handwritten note)';
+}
+// "✍️ Write" shortcut: open the add form and go straight to the pen.
+function quickHandwrite() {
+  if (!showAddFormVisible) toggleAddForm();
+  addFormHandwrite();
 }
 
 // ── Nag UI (thin layer over the nag service) ──
@@ -3077,8 +3647,14 @@ function editTask(taskId) {
     <div class="detail-body">
       <div style="margin-bottom:12px">
         <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">TITLE</label>
-        <input id="edit-task-title" value="${esc(t.title)}">
+        <input id="edit-task-title" value="${esc(t.title)}"${t.ink ? ' placeholder="Optional for a handwritten note"' : ''}>
       </div>
+      ${t.ink ? `
+      <div style="margin-bottom:12px">
+        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">HANDWRITING</label>
+        ${inkThumbHtml(t.ink, 'large', `openInkForTask('${t.id}')`).replace('<img ', '<img id="edit-ink-thumb" ')}
+        <button class="btn btn-sm btn-ghost" style="margin-top:6px" onclick="openInkForTask('${t.id}')">✍️ Edit handwriting</button>
+      </div>` : ''}
       <div style="margin-bottom:12px">
         <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">PRIORITY</label>
         <select id="edit-task-pri">${Object.keys(PRIS).map(p => `<option value="${p}" ${t.priority === p ? 'selected' : ''}>${p}</option>`).join('')}</select>
@@ -3100,7 +3676,7 @@ function editTask(taskId) {
         <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">NOTES</label>
         <textarea id="edit-task-notes" style="min-height:120px">${esc(t.notes || '')}</textarea>
       </div>
-      <div style="margin-bottom:12px">
+      ${t.ink ? '' : `<div style="margin-bottom:12px">
         <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">MOVE TO ANOTHER LIST</label>
         <div style="display:flex;gap:8px">
           <select id="edit-task-move-dest" style="flex:1">
@@ -3112,7 +3688,7 @@ function editTask(taskId) {
           <button class="btn btn-sm btn-ghost" onclick="moveTaskFromForm('${taskId}')">Move</button>
         </div>
         <div style="font-size:10px;color:var(--text3);margin-top:4px">Title and notes carry over. Priority, due date, project and reminder do not.</div>
-      </div>
+      </div>`}
       <button class="btn btn-danger" style="width:100%" onclick="permanentDeleteTask('${taskId}');closeDetail()">Delete Task</button>
     </div>
   `);
@@ -3148,7 +3724,9 @@ async function moveTaskTo(taskId, dest) {
 }
 
 async function saveTask(taskId) {
-  const title = document.getElementById('edit-task-title').value.trim();
+  const existing = tasks.find(x => x.id === taskId);
+  let title = document.getElementById('edit-task-title').value.trim();
+  if (!title && existing && existing.ink) title = 'Handwritten note';
   const pri = document.getElementById('edit-task-pri').value;
   const due = document.getElementById('edit-task-due').value;
   const proj = document.getElementById('edit-task-proj').value;
@@ -3171,6 +3749,7 @@ async function saveTask(taskId) {
     category: (t && t.category) || 'Tasks',
     priority: pri, due, project: proj, notes, reminder,
     nag: t && t.nag, // editing a task must not drop its nag record
+    ink: t && t.ink, // …or its handwriting
   });
 
   try {
@@ -3194,13 +3773,15 @@ function toggleAddNag(btn) {
 }
 
 async function addTask() {
-  const title = document.getElementById('add-title').value.trim();
+  let title = document.getElementById('add-title').value.trim();
   const cat = 'Tasks'; // category UI removed — every new task gets the neutral default
   const pri = document.getElementById('add-pri').value;
   const due = document.getElementById('add-due')?.value || '';
   const notes = document.getElementById('add-notes')?.value.trim() || '';
   const reminder = readReminderFromForm('add');
-  if (!title) return;
+  const inkDoc = addInkDraft;
+  if (!title && !inkDoc) return;
+  if (!title) title = 'Handwritten note'; // handwriting is the content; title is optional
 
   if (reminder && reminder.kind === 'preset' && !due) {
     showError('Set a due date before using a "before-the-day" reminder, or pick Custom time.');
@@ -3220,19 +3801,29 @@ async function addTask() {
   const addBtn = document.querySelector('#add-form-container .btn-primary');
   if (addBtn) { addBtn.textContent = 'Adding...'; addBtn.disabled = true; }
 
+  let ink = null, created = null;
   try {
+    // Handwriting goes to Drive first so the task can reference its file id.
+    if (inkDoc) {
+      if (addBtn) addBtn.textContent = 'Saving handwriting…';
+      ink = { id: await inkCreateFile(inkDoc), v: 1 };
+      await offlineCacheSet({ [`ink:${ink.id}@1`]: inkDoc });
+      inkThumbs.set(`${ink.id}@1`, inkRenderThumb(inkDoc));
+      if (addBtn) addBtn.textContent = 'Adding...';
+    }
     const metaParts = [cat, pri + ' priority'];
     if (due) metaParts.push('due: ' + due);
     if (reminder) metaParts.push(serializeReminder(reminder));
+    if (ink) metaParts.push(`ink: ${ink.id}@1`);
     const desc = metaParts.join(' | ') + (notes ? '\n' + notes : '');
-    const created = await createTaskEvent(title, desc, due, reminder);
+    created = await createTaskEvent(title, desc, due, reminder);
 
     // Task exists — attach the nag to its real id. The rebuild reads the
     // global task list, so register the new task locally first (the sync
     // below replaces it with the server copy). Params are saved before any
     // events exist, so failed inserts are filled in by the next sync.
     if (nagOpts && created && created.id) {
-      const newTask = { id: created.id, title, category: cat, priority: pri, due, project: null, notes, reminder, done: false, nag: null };
+      const newTask = { id: created.id, title, category: cat, priority: pri, due, project: null, notes, reminder, done: false, nag: null, ink };
       tasks.push(newTask);
       try {
         await persistTaskNag(newTask, nagParamsFromSlots(nagOpts.slots, nagOpts.every));
@@ -3246,6 +3837,8 @@ async function addTask() {
     toggleAddForm();
     await syncAll();
   } catch (e) {
+    // Task never got created → don't leave its handwriting orphaned in Drive.
+    if (ink && !created) inkTrashFile(ink.id);
     showError('Failed to add: ' + e.message);
     if (addBtn) { addBtn.textContent = 'Add Task'; addBtn.disabled = false; }
   }
@@ -3260,6 +3853,10 @@ function toggleAddForm() {
     container.innerHTML = `
       <div class="add-form">
         <input id="add-title" placeholder="What needs to be done?" style="margin-bottom:10px" onkeydown="if(event.key==='Enter')addTask()">
+        <div style="margin-bottom:10px">
+          <button class="btn btn-sm btn-ghost" id="add-ink-btn" onclick="addFormHandwrite()">✍️ Write by hand</button>
+          <div id="add-ink-preview"></div>
+        </div>
         <div class="row">
           <select id="add-pri" style="flex:1">${Object.keys(PRIS).map(p => `<option value="${p}"${p === 'Medium' ? ' selected' : ''}>${p}</option>`).join('')}</select>
         </div>
@@ -3281,10 +3878,13 @@ function toggleAddForm() {
           <button class="btn btn-ghost" onclick="toggleAddForm()">Cancel</button>
         </div>
       </div>`;
-    setTimeout(() => document.getElementById('add-title')?.focus(), 50);
+    addInkDraft = null;
+    // Don't pop the keyboard behind the pen editor (the ✍️ Write shortcut).
+    setTimeout(() => { if (!inkEd) document.getElementById('add-title')?.focus(); }, 50);
   } else {
     btn.style.display = '';
     container.innerHTML = '';
+    addInkDraft = null;
   }
 }
 
@@ -5655,6 +6255,7 @@ function updateDate() {
 function showDetail(html) {
   const container = document.getElementById('detail-container');
   container.innerHTML = `<div class="detail-view">${html}</div>`;
+  setTimeout(hydrateInkThumbs, 0); // handwriting thumbnails inside the sheet
 }
 
 function closeDetail() {
