@@ -169,20 +169,6 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
   display: flex; align-items: flex-start; gap: 12px; padding: 14px 0;
   border-bottom: 1px solid var(--bg3); transition: opacity 0.3s, background 0.2s; cursor: pointer;
 }
-.task-item.urgent {
-  background: rgba(207,81,71,0.07);
-  box-shadow: inset 4px 0 0 #cf5147;
-  border-radius: 0 8px 8px 0;
-  padding-left: 12px; padding-right: 8px;
-}
-.task-pin {
-  background: none; border: none; cursor: pointer;
-  font-size: 17px; padding: 4px 6px; line-height: 1;
-  color: var(--text3); transition: color 0.2s, transform 0.15s;
-  flex-shrink: 0; align-self: flex-start; margin-top: 1px;
-}
-.task-pin:hover { transform: scale(1.15); }
-.task-pin.active { color: #cf5147; }
 .task-today {
   background: none; border: none; cursor: pointer;
   font-size: 16px; padding: 4px 6px; line-height: 1;
@@ -605,7 +591,7 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
         <p class="date" id="date-display"></p>
       </div>
       <div style="display:flex;gap:6px;align-items:center">
-        <button class="btn btn-ghost btn-sm" onclick="openReminderSettings()" id="reminder-btn" title="Urgent task reminders">🔔</button>
+        <button class="btn btn-ghost btn-sm" onclick="openReminderSettings()" id="reminder-btn" title="Overdue task reminders">🔔</button>
         <button class="btn btn-ghost btn-sm" onclick="toggleTheme()" id="theme-toggle-btn" title="Switch color scheme">🌙</button>
         <button class="btn btn-ghost btn-sm" onclick="toggleSearch()" id="search-toggle-btn">Search</button>
         <button class="btn btn-ghost btn-sm" onclick="syncAll()" id="sync-btn">Sync</button>
@@ -1816,25 +1802,20 @@ function serializeTaskDesc(t) {
   return metaParts.join(' | ') + (t.notes ? '\n' + t.notes : '');
 }
 
-// Done last; Urgent always at top; then High → Medium → Low; within a
-// priority tier, earlier due first, due-set before due-unset, manual
-// drag order as final tie-breaker.
+// Done last; otherwise the user's own drag order decides — no automatic
+// priority sorting, so a task can be dragged anywhere. Tasks that have never
+// been placed by a drag fall in after placed ones, earliest due date first.
 function compareTasks(a, b) {
   if (a.done !== b.done) return a.done ? 1 : -1;
   if (!a.done && !b.done) {
-    const aTop = a.priority === 'Urgent', bTop = b.priority === 'Urgent';
-    if (aTop !== bTop) return aTop ? -1 : 1;
-    const pa = PRIS[a.priority]?.order ?? 2;
-    const pb = PRIS[b.priority]?.order ?? 2;
-    if (pa !== pb) return pa - pb;
+    const ao = a.order ?? Infinity, bo = b.order ?? Infinity;
+    if (ao !== bo) return ao - bo;
     if (a.due && b.due) {
       const da = new Date(a.due).getTime(), db = new Date(b.due).getTime();
       if (da !== db) return da - db;
     } else if (!!a.due !== !!b.due) {
       return a.due ? -1 : 1;
     }
-    const ao = a.order ?? Infinity, bo = b.order ?? Infinity;
-    if (ao !== bo) return ao - bo;
   }
   return 0;
 }
@@ -2307,8 +2288,9 @@ function taskEventBody(title, desc, due, reminder) {
   return body;
 }
 
-async function createTaskEvent(title, desc, due, reminder) {
+async function createTaskEvent(title, desc, due, reminder, order) {
   const body = taskEventBody(title, desc, due, reminder);
+  if (Number.isFinite(order)) body.extendedProperties = { private: { order: String(order) } };
   if (!body.start) {
     const d = new Date().toISOString().split('T')[0];
     body.start = { date: d }; body.end = { date: d };
@@ -2712,8 +2694,6 @@ function renderTasks() {
 }
 
 function renderTaskItem(t, i) {
-  const pri = PRIS[t.priority] || PRIS.Medium;
-  const isUrgent = t.priority === 'Urgent';
   const dueHtml = t.due ? `<span class="task-due ${getDueClass(t.due)}">${formatDue(t.due)}</span>` : '';
   const remHtml = t.reminder
     ? `<span style="font-size:10px;color:var(--text3)" title="Reminder: ${esc(reminderToHumanString(t.reminder))}">🔔</span>`
@@ -2722,13 +2702,12 @@ function renderTaskItem(t, i) {
     ? `<span style="font-size:10px" title="Nagging ${t.nag.first}–${t.nag.last}">📣</span>`
     : '';
   return `
-    <div class="task-item fade-up${isUrgent ? ' urgent' : ''}" data-task="${t.id}" data-drag-id="${t.id}" style="animation-delay:${i * 0.03}s" onclick="editTask('${t.id}')">
-      <button class="task-check" style="border-color:${pri.color}40" onclick="event.stopPropagation();completeTask('${t.id}')" title="Complete"></button>
+    <div class="task-item fade-up" data-task="${t.id}" data-drag-id="${t.id}" style="animation-delay:${i * 0.03}s" onclick="editTask('${t.id}')">
+      <button class="task-check" style="border-color:var(--text3)" onclick="event.stopPropagation();completeTask('${t.id}')" title="Complete"></button>
       <div style="flex:1;min-width:0">
         <div class="task-title">${esc(t.title)}</div>
         ${t.ink ? inkThumbHtml(t.ink, '', `event.stopPropagation();openInkForTask('${t.id}')`) : ''}
         <div class="task-meta">
-          <span class="tag" style="background:${pri.color}15;color:${pri.color}">${t.priority}</span>
           ${t.project ? `<span class="tag" style="background:var(--cyan)15;color:var(--cyan)">🎯 ${esc(t.project)}</span>` : ''}
           ${dueHtml}
           ${remHtml}
@@ -2737,7 +2716,6 @@ function renderTaskItem(t, i) {
         ${t.notes ? `<div class="task-notes">${esc(t.notes)}</div>` : ''}
       </div>
       <button class="task-today" onclick="event.stopPropagation();addToToday('${t.id}')" title="Move to Today">☀</button>
-      <button class="task-pin${isUrgent ? ' active' : ''}" onclick="event.stopPropagation();toggleTopPriority('${t.id}')" title="${isUrgent ? 'Unpin from top' : 'Mark as highest priority'}">${isUrgent ? '★' : '☆'}</button>
       ${DRAG_HANDLE_HTML}
     </div>`;
 }
@@ -2940,17 +2918,6 @@ async function deleteCategory(name) {
     rebuildCats();
     renderCatsManagerList();
   }
-}
-
-async function toggleTopPriority(id) {
-  const t = tasks.find(x => x.id === id);
-  if (!t || t.done) return;
-  const next = { ...t, priority: t.priority === 'Urgent' ? 'Medium' : 'Urgent' };
-  try {
-    await updateEvent(id, { description: serializeTaskDesc(next) });
-    t.priority = next.priority;
-    renderAll();
-  } catch (e) { showError('Failed to update priority: ' + e.message); }
 }
 
 async function permanentDeleteTask(id) {
@@ -3705,10 +3672,6 @@ function editTask(taskId) {
         <button class="btn btn-sm btn-ghost" style="margin-top:6px" onclick="openInkForTask('${t.id}')">✍️ Edit handwriting</button>
       </div>` : ''}
       <div style="margin-bottom:12px">
-        <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">PRIORITY</label>
-        <select id="edit-task-pri">${Object.keys(PRIS).map(p => `<option value="${p}" ${t.priority === p ? 'selected' : ''}>${p}</option>`).join('')}</select>
-      </div>
-      <div style="margin-bottom:12px">
         <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">DUE DATE</label>
         <input type="date" id="edit-task-due" value="${t.due || ''}">
       </div>
@@ -3736,7 +3699,7 @@ function editTask(taskId) {
           </select>
           <button class="btn btn-sm btn-ghost" onclick="moveTaskFromForm('${taskId}')">Move</button>
         </div>
-        <div style="font-size:10px;color:var(--text3);margin-top:4px">Title and notes carry over. Priority, due date, project and reminder do not.</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:4px">Title and notes carry over. Due date, project and reminder do not.</div>
       </div>`}
       <button class="btn btn-danger" style="width:100%" onclick="permanentDeleteTask('${taskId}');closeDetail()">Delete Task</button>
     </div>
@@ -3776,7 +3739,8 @@ async function saveTask(taskId) {
   const existing = tasks.find(x => x.id === taskId);
   let title = document.getElementById('edit-task-title').value.trim();
   if (!title && existing && existing.ink) title = 'Handwritten note';
-  const pri = document.getElementById('edit-task-pri').value;
+  // Priority UI is gone; the stored value is written back untouched.
+  const pri = (existing && existing.priority) || 'Medium';
   const due = document.getElementById('edit-task-due').value;
   const proj = document.getElementById('edit-task-proj').value;
   const notes = document.getElementById('edit-task-notes').value.trim();
@@ -3824,7 +3788,7 @@ function toggleAddNag(btn) {
 async function addTask() {
   let title = document.getElementById('add-title').value.trim();
   const cat = 'Tasks'; // category UI removed — every new task gets the neutral default
-  const pri = document.getElementById('add-pri').value;
+  const pri = 'Medium'; // priority UI removed — neutral stored default
   const due = document.getElementById('add-due')?.value || '';
   const notes = document.getElementById('add-notes')?.value.trim() || '';
   const reminder = readReminderFromForm('add');
@@ -3865,7 +3829,10 @@ async function addTask() {
     if (reminder) metaParts.push(serializeReminder(reminder));
     if (ink) metaParts.push(`ink: ${ink.id}@1`);
     const desc = metaParts.join(' | ') + (notes ? '\n' + notes : '');
-    created = await createTaskEvent(title, desc, due, reminder);
+    // Top of the list: one above the current highest manually-ordered task.
+    const orders = tasks.filter(x => !x.done && Number.isFinite(x.order)).map(x => x.order);
+    const topOrder = (orders.length ? Math.min(...orders) : 0) - 1;
+    created = await createTaskEvent(title, desc, due, reminder, topOrder);
 
     // Task exists — attach the nag to its real id. The rebuild reads the
     // global task list, so register the new task locally first (the sync
@@ -3905,9 +3872,6 @@ function toggleAddForm() {
         <div style="margin-bottom:10px">
           <button class="btn btn-sm btn-ghost" id="add-ink-btn" onclick="addFormHandwrite()">✍️ Write by hand</button>
           <div id="add-ink-preview"></div>
-        </div>
-        <div class="row">
-          <select id="add-pri" style="flex:1">${Object.keys(PRIS).map(p => `<option value="${p}"${p === 'Medium' ? ' selected' : ''}>${p}</option>`).join('')}</select>
         </div>
         <div style="margin-bottom:10px">
           <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">DUE DATE</label>
@@ -6362,7 +6326,7 @@ function buildSystemPrompt() {
   const dueToday = activeTasks.filter(t => t.due && getDueClass(t.due) === 'today');
 
   const taskList = activeTasks.map(t => {
-    let s = `- ${t.title} [${t.category}, ${t.priority}]`;
+    let s = `- ${t.title}`;
     if (t.due) s += ` due: ${formatDue(t.due)}`;
     if (t.reminder) s += ` 🔔 ${reminderToHumanString(t.reminder)}`;
     if (t.project) s += ` (project: ${t.project})`;
@@ -7317,9 +7281,11 @@ function getNotifTimes() {
 }
 function setNotifTimes(times) { localStorage.setItem(NOTIF_TIMES_KEY, JSON.stringify(times)); }
 
-// What counts as "urgent" for a reminder: Urgent-priority OR overdue, still open.
+// What a reminder alerts about: open tasks past their due date. (Priority is
+// no longer user-visible, so a hidden old "Urgent" flag must not trigger
+// alerts the user can't see the reason for or switch off.)
 function getUrgentTaskList() {
-  return tasks.filter(t => !t.done && (t.priority === 'Urgent' || (t.due && getDueClass(t.due) === 'overdue')));
+  return tasks.filter(t => !t.done && t.due && getDueClass(t.due) === 'overdue');
 }
 
 // ── IndexedDB state, shared with the service worker so background reminders
@@ -7427,7 +7393,7 @@ function fireUrgentReminder() {
   const titles = urgent.slice(0, 4).map(t => '• ' + t.title);
   const extra = urgent.length > 4 ? `\n…and ${urgent.length - 4} more` : '';
   showReminderNotification(
-    `🚨 ${urgent.length} urgent task${urgent.length > 1 ? 's' : ''} need attention`,
+    `🚨 ${urgent.length} overdue task${urgent.length > 1 ? 's' : ''} need attention`,
     titles.join('\n') + extra,
     true
   );
@@ -7492,7 +7458,7 @@ async function enableReminders() {
   await saveNotifState();
   await registerPeriodicReminders();
   startReminderScheduler();
-  showReminderNotification('✅ Urgent reminders on', `You'll be alerted at ${getNotifTimes().join(', ')} whenever urgent tasks are open.`, false);
+  showReminderNotification('✅ Overdue reminders on', `You'll be alerted at ${getNotifTimes().join(', ')} whenever tasks are overdue.`, false);
   return true;
 }
 
@@ -7667,11 +7633,11 @@ function openReminderSettings() {
   showDetail(`
     <div class="detail-header">
       <button class="detail-back" onclick="closeDetail()">&larr;</button>
-      <span class="detail-title">🔔 Urgent Reminders</span>
+      <span class="detail-title">🔔 Overdue Reminders</span>
     </div>
     <div class="detail-body">
       <p style="font-size:13px;color:var(--text2);line-height:1.6;margin-bottom:20px">
-        Get an attention-grabbing alert — sound, vibration and a banner that stays on screen — whenever you still have <b>urgent or overdue</b> tasks open. It checks at your chosen times each day and stays quiet when nothing's urgent.
+        Get an attention-grabbing alert — sound, vibration and a banner that stays on screen — whenever you still have <b>overdue</b> tasks open. It checks at your chosen times each day and stays quiet when nothing is overdue.
       </p>
       <div class="ai-settings-row" style="justify-content:space-between;margin-bottom:16px">
         <span style="font-size:14px;font-weight:600">Reminders ${enabled ? 'on' : 'off'}</span>
@@ -7730,14 +7696,14 @@ function fireTestReminder() {
     const titles = urgent.slice(0, 4).map(t => '• ' + t.title);
     const extra = urgent.length > 4 ? `\n…and ${urgent.length - 4} more` : '';
     showReminderNotification(
-      `🚨 Test — ${urgent.length} urgent task${urgent.length > 1 ? 's' : ''}`,
+      `🚨 Test — ${urgent.length} overdue task${urgent.length > 1 ? 's' : ''}`,
       titles.join('\n') + extra,
       true,
       'reminder-test',
     );
     playAlarmChime();
   } else {
-    showReminderNotification('🔔 Test alert', "Reminders are working. You have no urgent tasks right now — nice!", true, 'reminder-test');
+    showReminderNotification('🔔 Test alert', "Reminders are working. Nothing is overdue right now — nice!", true, 'reminder-test');
     playAlarmChime();
   }
 }

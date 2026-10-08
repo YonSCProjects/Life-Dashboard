@@ -1,4 +1,4 @@
-const CACHE_NAME = 'life-dash-v64';
+const CACHE_NAME = 'life-dash-v65';
 const ASSETS = [
   '/Life-Dashboard/',
   '/Life-Dashboard/index.html',
@@ -64,7 +64,7 @@ self.addEventListener('message', e => {
 // Server push (Web Push from the Cloudflare Worker) — fires even when the app
 // is fully closed. Payload is { title, body }.
 self.addEventListener('push', e => {
-  let data = { title: '🚨 Urgent tasks need attention', body: 'You have urgent tasks open.' };
+  let data = { title: '🚨 Overdue tasks need attention', body: 'You have overdue tasks open.' };
   try { if (e.data) data = e.data.json(); } catch {}
   e.waitUntil(self.registration.showNotification(data.title, {
     body: data.body,
@@ -154,7 +154,7 @@ async function runUrgentReminderCheck() {
   const titles = cfg.tasks.slice(0, 4).map(t => '• ' + t.title);
   const extra = cfg.tasks.length > 4 ? `\n…and ${cfg.tasks.length - 4} more` : '';
   await self.registration.showNotification(
-    `🚨 ${cfg.tasks.length} urgent task${cfg.tasks.length > 1 ? 's' : ''} need attention`,
+    `🚨 ${cfg.tasks.length} overdue task${cfg.tasks.length > 1 ? 's' : ''} need attention`,
     {
       body: titles.join('\n') + extra,
       tag: 'urgent-tasks',

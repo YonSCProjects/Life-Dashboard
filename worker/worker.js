@@ -475,7 +475,7 @@ async function runScheduled(env) {
     }
     const parts2 = [];
     if (orders.length) parts2.push(`${orders.length} package${orders.length > 1 ? 's' : ''} waiting`);
-    if (tasks.length)  parts2.push(`${tasks.length} urgent task${tasks.length > 1 ? 's' : ''}`);
+    if (tasks.length)  parts2.push(`${tasks.length} overdue task${tasks.length > 1 ? 's' : ''}`);
     const titlePrefix = orders.length ? '📦' : '🚨';
     let res;
     try {
