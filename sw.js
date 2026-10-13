@@ -1,4 +1,6 @@
-const CACHE_NAME = 'life-dash-v66';
+const SHARE_CACHE = 'life-dash-share';
+const SHARED_IMAGE_URL = '/Life-Dashboard/__shared-image';
+const CACHE_NAME = 'life-dash-v67';
 const ASSETS = [
   '/Life-Dashboard/',
   '/Life-Dashboard/index.html',
@@ -15,7 +17,9 @@ self.addEventListener('install', e => {
 self.addEventListener('activate', e => {
   e.waitUntil(
     caches.keys().then(keys =>
-      Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
+      // The share cache holds a photo shared into the app until the page reads
+      // it — never wipe it just because the app version changed.
+      Promise.all(keys.filter(k => k !== CACHE_NAME && k !== SHARE_CACHE).map(k => caches.delete(k)))
     )
   );
   self.clients.claim();
@@ -24,6 +28,24 @@ self.addEventListener('activate', e => {
 // Fetch — network-first for API calls, cache-first for assets
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
+
+  // Android share sheet → "Share to Dashboard": the OS POSTs the shared photo
+  // here. GitHub Pages can't take a POST, so the worker answers it: stash the
+  // image for the page, then send the user into the app to process it.
+  if (e.request.method === 'POST' && url.pathname.endsWith('/share-target')) {
+    e.respondWith((async () => {
+      try {
+        const form = await e.request.formData();
+        const file = form.getAll('image').find(f => f && f.size) || null;
+        if (file) {
+          const cache = await caches.open(SHARE_CACHE);
+          await cache.put(SHARED_IMAGE_URL, new Response(file, { headers: { 'Content-Type': file.type || 'image/jpeg' } }));
+        }
+      } catch {}
+      return Response.redirect('/Life-Dashboard/?shared=1', 303);
+    })());
+    return;
+  }
 
   // Always go to network for Google API calls
   if (url.hostname.includes('googleapis.com') || url.hostname.includes('accounts.google.com')) {

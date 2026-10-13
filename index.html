@@ -191,6 +191,14 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 .school-badge.now { background: var(--green); color: #fff; }
 .school-badge.done { background: var(--bg3); color: var(--text2); }
 .school-badge.todo { background: #f3d9a4; color: #6b4e12; }
+.school-badge.changed { background: #dbe7fb; color: #1d4ed8; }
+.school-badge.cancelled { background: var(--bg3); color: var(--red); }
+.school-lesson.cancelled { opacity: 0.6; cursor: default; }
+.school-lesson.cancelled .school-group bdi { text-decoration: line-through; }
+.daily-row { display: flex; gap: 8px; align-items: flex-start; padding: 7px 0; font-size: 13px; border-bottom: 1px solid var(--border); cursor: pointer; }
+.daily-row input { margin-top: 2px; width: auto; }
+.daily-why { font-size: 11px; color: var(--text3); }
+.daily-warn { font-size: 12px; background: #fdf3dc; color: #6b4e12; border-radius: 8px; padding: 7px 10px; margin-bottom: 8px; }
 .log-entry { padding: 8px 0; border-bottom: 1px solid var(--border); }
 .log-date { font-size: 11px; color: var(--text3); font-weight: 600; }
 .log-text { font-size: 13px; white-space: pre-wrap; margin-top: 3px; }
@@ -1202,6 +1210,7 @@ function showApp() {
       if (hadCache) renderAll();
       syncAll(); // refresh from network in the background
     });
+    checkSharedImage(); // a schedule photo shared in from WhatsApp / the gallery
   }
 }
 
@@ -3559,13 +3568,17 @@ function quickHandwrite() {
 // "ink: <driveFileId>@<v>" (S Pen note), "---", then the note text.
 const LESSON_PREFIX = '🤖 ';
 
-function localYmd(d) {
-  const p = n => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+// The school runs on Israel time and the daily photo is read in Israel time,
+// so lesson dates, times and weekdays are always computed in Asia/Jerusalem —
+// never the device's zone (a phone set to another zone would otherwise see
+// every lesson as "moved").
+function schoolYmd(d) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: NAG_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
 }
 function hhmm(iso) {
-  return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+  return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: NAG_TZ });
 }
+function ymdWeekday(ymd) { return new Date(ymd + 'T12:00:00Z').getUTCDay(); } // 0 = Sunday
 function ymdLabel(ymd) {
   const [y, m, d] = ymd.split('-').map(Number);
   return new Date(y, m - 1, d).toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' });
@@ -3592,7 +3605,7 @@ function parseLessonLog(event) {
 // This week's lessons (today through +8 days), one entry per occurrence.
 async function loadLessons() {
   try {
-    const from = new Date(); from.setHours(0, 0, 0, 0);
+    const from = new Date(nagInstantEpoch(schoolYmd(new Date()), '00:00'));
     const to = new Date(from.getTime() + 9 * 86400000);
     const data = await calFetch(
       `/calendars/${encodeURIComponent(CALENDAR_ID)}/events?singleEvents=true&orderBy=startTime&maxResults=250` +
@@ -3600,7 +3613,8 @@ async function loadLessons() {
     );
     lessons = (data.items || [])
       .filter(e => e.status !== 'cancelled' && (e.summary || '').startsWith(LESSON_PREFIX) && e.start && e.start.dateTime)
-      .map(e => ({ id: e.id, group: e.summary.slice(LESSON_PREFIX.length).trim(), start: e.start.dateTime, end: e.end.dateTime }))
+      .map(e => ({ id: e.id, group: e.summary.slice(LESSON_PREFIX.length).trim(), start: e.start.dateTime, end: e.end.dateTime,
+                    changed: /daily-update:/.test(e.description || '') }))
       .sort((a, b) => a.start.localeCompare(b.start));
   } catch { /* offline — keep the cached week */ }
 }
@@ -3608,8 +3622,8 @@ async function loadLessons() {
 // The day the strip shows: today if it has lessons, otherwise the next day
 // that does (so the evening before / the weekend shows what's coming).
 function schoolStripDay() {
-  const today = localYmd(new Date());
-  const days = [...new Set(lessons.map(l => localYmd(new Date(l.start))))].sort();
+  const today = schoolYmd(new Date());
+  const days = [...new Set(lessons.map(l => schoolYmd(new Date(l.start))))].sort();
   if (days.includes(today)) return today;
   return days.find(d => d > today) || null;
 }
@@ -3624,17 +3638,30 @@ function renderSchoolStrip() {
   const day = schoolStripDay();
   if (!day) { el.innerHTML = ''; return; }
   const now = Date.now();
-  const today = localYmd(new Date());
-  const items = lessons.filter(l => localYmd(new Date(l.start)) === day);
-  const title = day === today ? 'Today at school' : `${new Date(items[0].start).toLocaleDateString([], { weekday: 'long' })} at school`;
+  const today = schoolYmd(new Date());
+  const items = [
+    ...lessons.filter(l => schoolYmd(new Date(l.start)) === day),
+    ...schoolCancelledFor(day).map(c => ({ ...c, cancelled: true })),
+  ].sort((a, b) => a.start.localeCompare(b.start));
+  const title = day === today ? 'Today at school' : `${new Date(day + 'T12:00:00Z').toLocaleDateString([], { weekday: 'long', timeZone: 'UTC' })} at school`;
+  const cancelledRow = l => `
+          <div class="school-lesson cancelled">
+            <div class="school-time">${hhmm(l.start)}</div>
+            <div style="flex:1;min-width:0"><div class="school-group"><bdi>${esc(l.group)}</bdi> <span class="school-badge cancelled">cancelled today</span></div></div>
+          </div>`;
   el.innerHTML = `
     <div class="school-strip">
-      <div class="school-strip-title">🤖 ${esc(title)}</div>
+      <div class="school-strip-title" style="display:flex;align-items:center">
+        <span style="flex:1">🤖 ${esc(title)}</span>
+        <button class="btn btn-sm btn-ghost" style="padding:3px 8px" onclick="pickDailyUpdatePhoto()" title="Update from the daily schedule photo">📷 Update</button>
+      </div>
       ${items.map(l => {
+        if (l.cancelled) return cancelledRow(l);
         const s = new Date(l.start).getTime(), e = new Date(l.end).getTime();
         const loggedToday = lessonLogs.some(x => x.group === l.group && x.date === day);
         const prev = lastLogFor(l.group, day);
         let badge = '';
+        const changedBadge = l.changed ? ' <span class="school-badge changed">changed today</span>' : '';
         if (day === today && now >= s && now < e) badge = '<span class="school-badge now">now</span>';
         else if (loggedToday) badge = '<span class="school-badge done">✓ logged</span>';
         else if (day === today && now >= e) badge = '<span class="school-badge todo">📝 log it</span>';
@@ -3644,7 +3671,7 @@ function renderSchoolStrip() {
           <div class="school-lesson${past ? ' past' : ''}" onclick="openGroupSheet(${JSON.stringify(l.group).replace(/"/g, '&quot;')}, '${day}')">
             <div class="school-time">${hhmm(l.start)}</div>
             <div style="flex:1;min-width:0">
-              <div class="school-group"><bdi>${esc(l.group)}</bdi> ${badge}</div>
+              <div class="school-group"><bdi>${esc(l.group)}</bdi> ${badge}${changedBadge}</div>
               ${lastTxt ? `<div class="school-last">Last (${esc(ymdLabel(prev.date))}): <bdi>${esc(lastTxt.slice(0, 90))}</bdi></div>`
                         : `<div class="school-last">No log yet</div>`}
             </div>
@@ -3660,7 +3687,7 @@ let groupSheetGroup = null;
 function openGroupSheet(group, ymd) {
   groupSheetGroup = group;
   groupInkDraft = null;
-  const logDate = ymd || localYmd(new Date());
+  const logDate = ymd || schoolYmd(new Date());
   const upcoming = lessons.filter(l => l.group === group && new Date(l.end).getTime() > Date.now()).slice(0, 3);
   const history = lessonLogs.filter(l => l.group === group);
   const gq = JSON.stringify(group).replace(/"/g, '&quot;');
@@ -3671,7 +3698,7 @@ function openGroupSheet(group, ymd) {
       <span></span>
     </div>
     <div class="detail-body">
-      ${upcoming.length ? `<div style="font-size:12px;color:var(--text3);margin-bottom:12px">Next: ${upcoming.map(l => esc(new Date(l.start).toLocaleDateString([], { weekday: 'short' }) + ' ' + hhmm(l.start))).join(' · ')}</div>` : ''}
+      ${upcoming.length ? `<div style="font-size:12px;color:var(--text3);margin-bottom:12px">Next: ${upcoming.map(l => esc(new Date(l.start).toLocaleDateString([], { weekday: 'short', timeZone: NAG_TZ }) + ' ' + hhmm(l.start))).join(' · ')}</div>` : ''}
       <div style="margin-bottom:16px">
         <label style="font-size:11px;color:var(--text3);margin-bottom:4px;display:block">LOG FOR ${esc(ymdLabel(logDate).toUpperCase())}</label>
         <textarea id="log-text" dir="auto" rows="3" placeholder="What did we do? Where did we stop? What's next / what to bring?"></textarea>
@@ -3773,6 +3800,302 @@ async function openLogInk(id) {
       },
     });
   } catch (e) { showError('Could not load the handwriting: ' + e.message); }
+}
+
+// ── Daily schedule update (photo → Claude → confirm → today's calendar) ──
+// Each morning the school posts that day's real timetable (staff absences,
+// swaps). The user shares the photo into the app (Android share sheet → the
+// service worker stashes it → ?shared=1) or picks it with 📷. Claude reads
+// only the robotics cells; the app diffs them against the planned "🤖" lessons
+// for that day and, after the user confirms, changes ONLY that day's calendar
+// occurrences — the weekly series stay untouched.
+const SHARE_CACHE_NAME = 'life-dash-share';
+const SHARED_IMAGE_PATH = '/Life-Dashboard/__shared-image';
+const HEB_WEEKDAY = ['א', 'ב', 'ג', 'ד', 'ה', 'ו', 'ש']; // Sun..Sat
+let dailyUpd = null; // { imageUrl, found, error, dayOffset, plan }
+
+// Called once the app is showing: pick up a photo shared into the app.
+async function checkSharedImage() {
+  if (!/[?&]shared=1/.test(location.search)) return;
+  history.replaceState({}, '', location.pathname); // don't re-trigger on reload
+  try {
+    const cache = await caches.open(SHARE_CACHE_NAME);
+    const res = await cache.match(SHARED_IMAGE_PATH);
+    if (!res) return;
+    const blob = await res.blob();
+    await cache.delete(SHARED_IMAGE_PATH);
+    switchTab && switchTab('tasks', document.querySelector('[data-tab="tasks"]'));
+    openDailyUpdate(blob);
+  } catch (e) { showError('Could not open the shared photo: ' + e.message); }
+}
+
+function pickDailyUpdatePhoto() {
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = 'image/*';
+  input.onchange = () => { if (input.files && input.files[0]) openDailyUpdate(input.files[0]); };
+  input.click();
+}
+
+// Downscale before upload: phone photos are several MB; ~1600px on the long
+// edge is what Claude reads at anyway.
+async function dailyImageToBase64(blob) {
+  const bmp = await createImageBitmap(blob);
+  const scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+  c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+  const dataUrl = c.toDataURL('image/jpeg', 0.85);
+  return dataUrl.slice(dataUrl.indexOf(',') + 1);
+}
+
+const DAILY_READ_TOOL = {
+  name: 'report_robotics_lessons',
+  description: 'Report every robotics lesson found on the photographed daily timetable.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      weekday_letter: { type: 'string', description: 'Hebrew weekday letter of the day block shown (א–ו), or "" if not visible.' },
+      lessons: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            group: { type: 'string', description: 'Group name — one of the known groups when it clearly matches, otherwise the class code from the column header (e.g. "ח\'2").' },
+            start: { type: 'string', description: 'Start time HH:MM from the time column of the cell\'s period block.' },
+            end: { type: 'string', description: 'End time HH:MM.' },
+            cell_text: { type: 'string', description: 'The cell text as written.' },
+            confident: { type: 'boolean', description: 'false if the cell, its column or its time is hard to read.' },
+          },
+          required: ['group', 'start', 'end', 'cell_text', 'confident'],
+        },
+      },
+      notes: { type: 'string', description: 'Anything the user should double-check (blurry areas, ambiguous columns). Empty if none.' },
+    },
+    required: ['weekday_letter', 'lessons', 'notes'],
+  },
+};
+
+async function dailyReadPhoto(base64) {
+  const worker = getWorkerUrl();
+  if (!worker) throw new Error('Connect your AI Worker first (open ✨ Claude).');
+  const groups = [...new Set([...lessons.map(l => l.group), ...lessonLogs.map(l => l.group)])];
+  const system =
+`You read a photo of an Israeli school's DAILY timetable (Hebrew, right-to-left; often photographed off a screen at an angle).
+Layout: a header row of class columns — each header starts with a class code (ז', ח'1, ח'2, ט', י', יא', יב') followed by teacher names; a time column "שעה" with period ranges (e.g. 10:20-11:05); each period block spans several sub-rows (the homeroom "מחנכת/מחנכים" row, then subject rows). Side columns outside the class grid may hold extra activities.
+Find EVERY cell that is a robotics lesson: "רובוטיקה", or the robotics competition teams (FLL = junior-high team, "רובוטיקה חטיבה צעירה"; FTC = senior-high league team, "חטיבה בוגרת").
+For each: the group, and the start/end of the period block it sits in (use the time column; periods are 45 min, the last one 13:20-14:00). If a side-column activity spans several periods, report its full span.
+The teacher's known group names (use these exact strings when a cell clearly corresponds): ${JSON.stringify(groups)}.
+Report only what is on the photo — do not add the regular plan. Call the tool exactly once.`;
+  const res = await fetch(worker, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: getChatModel(), max_tokens: 1500, system,
+      tools: [DAILY_READ_TOOL], tool_choice: { type: 'tool', name: DAILY_READ_TOOL.name },
+      messages: [{ role: 'user', content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64 } },
+        { type: 'text', text: 'Which robotics lessons are on this daily timetable?' },
+      ] }],
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error((data.error && (data.error.message || data.error)) || ('Claude error ' + res.status));
+  const use = (data.content || []).find(b => b.type === 'tool_use');
+  if (!use) throw new Error('Claude did not return the lessons.');
+  const out = use.input || {};
+  out.lessons = (out.lessons || []).filter(l => /^\d{1,2}:\d{2}$/.test(l.start || '') && /^\d{1,2}:\d{2}$/.test(l.end || ''))
+    .map(l => ({ ...l, start: l.start.padStart(5, '0'), end: l.end.padStart(5, '0'), group: (l.group || '').trim() }));
+  return out;
+}
+
+function dailyTargetYmd(offset) {
+  const t = nagTargetDay(offset); // Israel calendar day, DST-safe
+  return nagYmd(t.y, t.m, t.d);
+}
+
+// Diff the photo against the plan for one day.
+//   unchanged: same group, same start
+//   moved:     same group, different start (paired in time order)
+//   added:     on the photo, not planned            → checked by default
+//   removed:   planned, not on the photo            → UNchecked by default:
+//              a missed cell on a blurry photo is the likeliest reading
+//              error, and silently cancelling a real lesson is worse than a
+//              stray alert.
+function dailyDiff(found, ymd) {
+  const planned = lessons.filter(l => schoolYmd(new Date(l.start)) === ymd)
+    .map(l => ({ ...l, hm: hhmm(l.start), hmEnd: hhmm(l.end) }));
+  const photo = found.map(f => ({ ...f }));
+  const unchanged = [], moved = [], added = [], removed = [];
+  const usedP = new Set(), usedF = new Set();
+  photo.forEach((f, fi) => {
+    const pi = planned.findIndex((p, i) => !usedP.has(i) && p.group === f.group && p.hm === f.start);
+    if (pi >= 0) { usedP.add(pi); usedF.add(fi); unchanged.push({ plan: planned[pi], found: f }); }
+  });
+  photo.forEach((f, fi) => {
+    if (usedF.has(fi)) return;
+    const pi = planned.findIndex((p, i) => !usedP.has(i) && p.group === f.group);
+    if (pi >= 0) { usedP.add(pi); usedF.add(fi); moved.push({ plan: planned[pi], found: f, apply: true }); }
+  });
+  photo.forEach((f, fi) => { if (!usedF.has(fi)) added.push({ found: f, apply: true }); });
+  planned.forEach((p, i) => { if (!usedP.has(i)) removed.push({ plan: p, apply: false }); });
+  return { ymd, unchanged, moved, added, removed };
+}
+
+async function openDailyUpdate(blob) {
+  dailyUpd = { imageUrl: URL.createObjectURL(blob), found: null, error: null, dayOffset: 0, plan: null };
+  renderDailyUpdate();
+  try {
+    const b64 = await dailyImageToBase64(blob);
+    const [found] = await Promise.all([dailyReadPhoto(b64), loadLessons()]);
+    dailyUpd.found = found;
+    // Evening shares are usually tomorrow's schedule: default to the day the
+    // photo says, when it's today or tomorrow.
+    if (found.weekday_letter && found.weekday_letter === HEB_WEEKDAY[ymdWeekday(dailyTargetYmd(1))]
+        && found.weekday_letter !== HEB_WEEKDAY[ymdWeekday(dailyTargetYmd(0))]) dailyUpd.dayOffset = 1;
+  } catch (e) {
+    dailyUpd.error = e.message;
+  }
+  dailyUpd.plan = dailyUpd.found ? dailyDiff(dailyUpd.found.lessons, dailyTargetYmd(dailyUpd.dayOffset)) : null;
+  renderDailyUpdate();
+}
+
+function dailySetDay(offset) {
+  if (!dailyUpd || !dailyUpd.found) return;
+  dailyUpd.dayOffset = offset;
+  dailyUpd.plan = dailyDiff(dailyUpd.found.lessons, dailyTargetYmd(offset));
+  renderDailyUpdate();
+}
+function dailyToggle(kind, i, on) {
+  if (dailyUpd && dailyUpd.plan && dailyUpd.plan[kind][i]) dailyUpd.plan[kind][i].apply = on;
+  const btn = document.getElementById('daily-apply-btn');
+  if (btn) btn.disabled = !dailyHasSelection();
+}
+function dailyHasSelection() {
+  const p = dailyUpd && dailyUpd.plan;
+  return !!p && [...p.moved, ...p.added, ...p.removed].some(x => x.apply);
+}
+
+function renderDailyUpdate() {
+  const u = dailyUpd; if (!u) return;
+  const g = s => `<bdi>${esc(s)}</bdi>`;
+  let body;
+  if (!u.found && !u.error) {
+    body = `<div style="text-align:center;padding:24px 0;color:var(--text3)">Reading the schedule with Claude…<br><span style="font-size:11px">this takes about 10–20 seconds</span></div>`;
+  } else if (u.error) {
+    body = `<div class="error-banner" style="position:static"><span>${esc(u.error)}</span></div>`;
+  } else {
+    const p = u.plan;
+    const dayName = new Date(p.ymd + 'T12:00:00Z').toLocaleDateString([], { weekday: 'long', timeZone: 'UTC' });
+    const photoDay = u.found.weekday_letter;
+    const targetLetter = HEB_WEEKDAY[ymdWeekday(p.ymd)];
+    const warn = [];
+    if (photoDay && photoDay !== targetLetter) warn.push(`The photo looks like day ${esc(photoDay)}'s schedule, but you're updating ${esc(dayName)} (${targetLetter}). Pick the right day above, or check the photo.`);
+    const unsure = u.found.lessons.filter(l => !l.confident);
+    if (unsure.length) warn.push(`Hard to read: ${unsure.map(l => g(l.group) + ' ' + esc(l.start)).join(', ')} — double-check before applying.`);
+    if (u.found.notes) warn.push(esc(u.found.notes));
+    const row = (kind, i, item, label) => `
+      <label class="daily-row"><input type="checkbox" ${item.apply ? 'checked' : ''} onchange="dailyToggle('${kind}', ${i}, this.checked)"> <span>${label}</span></label>`;
+    const changes =
+      p.added.map((a, i) => row('added', i, a, `➕ ${g(a.found.group)} · ${a.found.start}–${a.found.end} <span class="daily-why">extra lesson</span>`)).join('') +
+      p.moved.map((m, i) => row('moved', i, m, `🔀 ${g(m.found.group)} · ${m.plan.hm} → ${m.found.start}–${m.found.end} <span class="daily-why">moved</span>`)).join('') +
+      p.removed.map((r, i) => row('removed', i, r, `❌ ${g(r.plan.group)} · ${r.plan.hm}–${r.plan.hmEnd} <span class="daily-why">not on the photo — tick only if it's really cancelled</span>`)).join('');
+    body = `
+      <div style="display:flex;gap:6px;margin-bottom:10px">
+        <button class="btn btn-sm ${u.dayOffset === 0 ? 'btn-primary' : 'btn-ghost'}" onclick="dailySetDay(0)">Today</button>
+        <button class="btn btn-sm ${u.dayOffset === 1 ? 'btn-primary' : 'btn-ghost'}" onclick="dailySetDay(1)">Tomorrow</button>
+        <span style="align-self:center;font-size:12px;color:var(--text3)">${esc(dayName)}</span>
+      </div>
+      ${warn.map(w => `<div class="daily-warn">⚠️ ${w}</div>`).join('')}
+      ${changes ? `<div style="font-weight:600;font-size:13px;margin:8px 0 4px">Changes</div>${changes}`
+                : `<div style="padding:10px 0;font-size:13px">✅ No changes — your robotics lessons match the plan.</div>`}
+      ${p.unchanged.length ? `<div style="font-size:12px;color:var(--text3);margin-top:8px">Unchanged: ${p.unchanged.map(x => g(x.plan.group) + ' ' + x.plan.hm).join(' · ')}</div>` : ''}
+      ${changes ? `<button class="btn btn-primary" style="width:100%;margin-top:14px" id="daily-apply-btn" onclick="applyDailyUpdate()" ${dailyHasSelection() ? '' : 'disabled'}>Apply to ${esc(dayName)}'s calendar</button>
+      <div style="font-size:11px;color:var(--text3);margin-top:6px">Only ${esc(dayName)} changes — your weekly lessons stay as planned.</div>` : ''}
+      <details style="margin-top:14px"><summary style="font-size:12px;color:var(--text3);cursor:pointer">What Claude read on the photo</summary>
+        <div style="font-size:12px;margin-top:6px">${u.found.lessons.length ? u.found.lessons.map(l => `${g(l.group)} · ${l.start}–${l.end} — <bdi>${esc(l.cell_text || '')}</bdi>${l.confident ? '' : ' (unsure)'}`).join('<br>') : 'No robotics cells found.'}</div>
+      </details>`;
+  }
+  showDetail(`
+    <div class="detail-header">
+      <button class="detail-back" onclick="closeDetail();dailyUpd=null">&larr;</button>
+      <span class="detail-title">📷 Schedule update</span>
+      <span></span>
+    </div>
+    <div class="detail-body">
+      <img src="${u.imageUrl}" alt="Shared schedule" style="width:100%;max-height:160px;object-fit:cover;object-position:top;border-radius:8px;border:1px solid var(--border);margin-bottom:12px">
+      ${body}
+    </div>`);
+}
+
+function dailyEventTimes(ymd, start, end) {
+  return {
+    start: { dateTime: nagFmtWall(nagInstantEpoch(ymd, start)), timeZone: NAG_TZ },
+    end:   { dateTime: nagFmtWall(nagInstantEpoch(ymd, end)), timeZone: NAG_TZ },
+  };
+}
+
+// Calendar changes for the chosen day only: added → one-off "🤖" event;
+// moved → that occurrence rescheduled; cancelled → that occurrence deleted.
+async function applyDailyUpdate() {
+  const u = dailyUpd; if (!u || !u.plan) return;
+  const p = u.plan, ymd = p.ymd;
+  const btn = document.getElementById('daily-apply-btn');
+  btn.disabled = true; btn.textContent = 'Applying…';
+  const marker = `\ndaily-update: ${ymd}`;
+  const base = `/calendars/${encodeURIComponent(CALENDAR_ID)}/events`;
+  const failed = [];
+  const cancelled = [];
+  for (const a of p.added.filter(x => x.apply)) {
+    try {
+      await calFetch(base, { method: 'POST', body: JSON.stringify({
+        summary: LESSON_PREFIX + a.found.group,
+        description: `Robotics — extra lesson from the daily schedule.${marker}`,
+        ...dailyEventTimes(ymd, a.found.start, a.found.end),
+        reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 5 }] },
+        colorId: '9',
+      }) });
+    } catch (e) { failed.push(`➕ ${a.found.group}: ${e.message}`); }
+  }
+  for (const m of p.moved.filter(x => x.apply)) {
+    try {
+      const ev = await calFetch(`${base}/${encodeURIComponent(m.plan.id)}`);
+      await updateEvent(m.plan.id, {
+        ...dailyEventTimes(ymd, m.found.start, m.found.end),
+        description: (ev.description || '').replace(/\ndaily-update: \S+/g, '') + marker,
+      });
+    } catch (e) { failed.push(`🔀 ${m.plan.group}: ${e.message}`); }
+  }
+  for (const r of p.removed.filter(x => x.apply)) {
+    try {
+      await calFetch(`${base}/${encodeURIComponent(r.plan.id)}`, { method: 'DELETE' });
+      cancelled.push({ group: r.plan.group, start: r.plan.start, end: r.plan.end });
+    } catch (e) { failed.push(`❌ ${r.plan.group}: ${e.message}`); }
+  }
+  if (cancelled.length) schoolSaveCancelled(ymd, cancelled);
+  await loadLessons();
+  saveCacheSnapshot();
+  renderSchoolStrip();
+  if (failed.length) {
+    showError('Some changes failed: ' + failed.join('; '));
+    btn.disabled = false; btn.textContent = 'Retry';
+    return;
+  }
+  closeDetail();
+  dailyUpd = null;
+}
+
+// Cancelled occurrences vanish from the calendar; remember them per day
+// (this device) so the strip can still say "cancelled" instead of going quiet.
+function schoolCancelledFor(ymd) {
+  try { return JSON.parse(localStorage.getItem('dash-school-cancel:' + ymd) || '[]'); } catch { return []; }
+}
+function schoolSaveCancelled(ymd, items) {
+  try {
+    const merged = [...schoolCancelledFor(ymd), ...items];
+    localStorage.setItem('dash-school-cancel:' + ymd, JSON.stringify(merged));
+    const cutoff = dailyTargetYmd(-14);
+    Object.keys(localStorage).filter(k => k.startsWith('dash-school-cancel:') && k.slice(19) < cutoff)
+      .forEach(k => localStorage.removeItem(k));
+  } catch {}
 }
 
 // ── Nag UI (thin layer over the nag service) ──
