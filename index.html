@@ -194,6 +194,8 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 .school-badge.changed { background: #dbe7fb; color: #1d4ed8; }
 .school-badge.cancelled { background: var(--bg3); color: var(--red); }
 .school-lesson.cancelled { opacity: 0.6; cursor: default; }
+.school-lesson.duty { cursor: default; }
+.school-lesson.duty .school-group { color: #a16207; }
 .school-lesson.cancelled .school-group bdi { text-decoration: line-through; }
 .daily-row { display: flex; gap: 8px; align-items: flex-start; padding: 7px 0; font-size: 13px; border-bottom: 1px solid var(--border); cursor: pointer; }
 .daily-row input { margin-top: 2px; width: auto; }
@@ -851,7 +853,8 @@ let learningNotes = [];           // [{id, title, type, body, date, created}] �
 let memory = '';                  // Claude's curated memory document (markdown text)
 let memoryEventId = null;         // calendar event id of the memory doc (null if not yet created)
 let lessons = [];                 // robotics lessons in the next ~8 days: [{id, group, start, end}] (from "🤖 <group>" events)
-let lessonLogs = [];              // [{id, date:'YYYY-MM-DD', group, text, ink}]
+let lessonLogs = [];
+let schoolDuties = [];            // recess duties etc. this week: [{id, title, location, start, end}] (from "🚸 …" events)              // [{id, date:'YYYY-MM-DD', group, text, ink}]
 let orders = [];                  // [{id, merchant, product, trackingNumber, status, orderedAt, expectedAt, statusHistory, notes, sourceMessages, lastUpdated}]
 let orderParseDraft = null;       // {originalText, parsed:{...}, matchedOrderId|null, confidence} while reviewing a paste
 let caregiverConfig = null;       // single config object (rates) or null if not set
@@ -1317,7 +1320,7 @@ const IDB_VERSION = 1;
 const CACHE_KEYS = [
   'tasks','shopItems','ideas','projects','customLists',
   'caregiverConfig','caregiverMonths','caregiverVacation','caregiverHoliday','caregiverSick','caregiverPrepays',
-  'reflections','learningNotes','memory','memoryEventId','orders','customCats','customCatsEventId','lessons','lessonLogs','lastSyncAt',
+  'reflections','learningNotes','memory','memoryEventId','orders','customCats','customCatsEventId','lessons','lessonLogs','schoolDuties','lastSyncAt',
 ];
 
 let isOffline = !navigator.onLine;
@@ -1385,7 +1388,7 @@ async function saveCacheSnapshot() {
     caregiverConfig, caregiverMonths, caregiverVacation, caregiverHoliday, caregiverSick, caregiverPrepays,
     reflections, learningNotes, memory, memoryEventId, orders,
     customCats, customCatsEventId,
-    lessons, lessonLogs,
+    lessons, lessonLogs, schoolDuties,
     lastSyncAt: Date.now(),
   });
 }
@@ -1412,6 +1415,7 @@ async function loadCacheSnapshot() {
   if (c.customCatsEventId !== undefined) customCatsEventId = c.customCatsEventId;
   if (c.lessons !== undefined)          lessons = c.lessons;
   if (c.lessonLogs !== undefined)       lessonLogs = c.lessonLogs;
+  if (c.schoolDuties !== undefined)     schoolDuties = c.schoolDuties;
   if (c.lastSyncAt !== undefined)       lastSyncAt = c.lastSyncAt;
   return c.lastSyncAt !== undefined;
 }
@@ -3572,6 +3576,9 @@ function quickHandwrite() {
 // "🤖L <group> · <snippet>"; description: "group: X", optional
 // "ink: <driveFileId>@<v>" (S Pen note), "---", then the note text.
 const LESSON_PREFIX = '🤖 ';
+// School duties that aren't lessons (recess duty and the like): "🚸 <what>",
+// place in the event's location. Shown in the strip, no lesson log.
+const DUTY_PREFIX = '🚸 ';
 
 // The school runs on Israel time and the daily photo is read in Israel time,
 // so lesson dates, times and weekdays are always computed in Asia/Jerusalem —
@@ -3612,10 +3619,15 @@ async function loadLessons() {
   try {
     const from = new Date(nagInstantEpoch(schoolYmd(new Date()), '00:00'));
     const to = new Date(from.getTime() + 9 * 86400000);
-    const data = await calFetch(
+    const week = q => calFetch(
       `/calendars/${encodeURIComponent(CALENDAR_ID)}/events?singleEvents=true&orderBy=startTime&maxResults=250` +
-      `&timeMin=${encodeURIComponent(from.toISOString())}&timeMax=${encodeURIComponent(to.toISOString())}&q=${encodeURIComponent('🤖')}`
+      `&timeMin=${encodeURIComponent(from.toISOString())}&timeMax=${encodeURIComponent(to.toISOString())}&q=${encodeURIComponent(q)}`
     );
+    const [data, dutyData] = await Promise.all([week('🤖'), week('🚸')]);
+    schoolDuties = (dutyData.items || [])
+      .filter(e => e.status !== 'cancelled' && (e.summary || '').startsWith(DUTY_PREFIX) && e.start && e.start.dateTime)
+      .map(e => ({ id: e.id, title: e.summary.slice(DUTY_PREFIX.length).trim(), location: e.location || '', start: e.start.dateTime, end: e.end.dateTime }))
+      .sort((a, b) => a.start.localeCompare(b.start));
     lessons = (data.items || [])
       .filter(e => e.status !== 'cancelled' && (e.summary || '').startsWith(LESSON_PREFIX) && e.start && e.start.dateTime)
       .map(e => ({ id: e.id, group: e.summary.slice(LESSON_PREFIX.length).trim(), start: e.start.dateTime, end: e.end.dateTime,
@@ -3628,7 +3640,7 @@ async function loadLessons() {
 // that does (so the evening before / the weekend shows what's coming).
 function schoolStripDay() {
   const today = schoolYmd(new Date());
-  const days = [...new Set(lessons.map(l => schoolYmd(new Date(l.start))))].sort();
+  const days = [...new Set([...lessons, ...schoolDuties].map(l => schoolYmd(new Date(l.start))))].sort();
   if (days.includes(today)) return today;
   return days.find(d => d > today) || null;
 }
@@ -3647,6 +3659,7 @@ function renderSchoolStrip() {
   const items = [
     ...lessons.filter(l => schoolYmd(new Date(l.start)) === day),
     ...schoolCancelledFor(day).map(c => ({ ...c, cancelled: true })),
+    ...schoolDuties.filter(d => schoolYmd(new Date(d.start)) === day).map(d => ({ ...d, duty: true })),
   ].sort((a, b) => a.start.localeCompare(b.start));
   const title = day === today ? 'Today at school' : `${new Date(day + 'T12:00:00Z').toLocaleDateString([], { weekday: 'long', timeZone: 'UTC' })} at school`;
   const cancelledRow = l => `
@@ -3654,6 +3667,19 @@ function renderSchoolStrip() {
             <div class="school-time">${hhmm(l.start)}</div>
             <div style="flex:1;min-width:0"><div class="school-group"><bdi>${esc(l.group)}</bdi> <span class="school-badge cancelled">cancelled today</span></div></div>
           </div>`;
+  const dutyRow = d => {
+    const s = new Date(d.start).getTime(), e = new Date(d.end).getTime();
+    const nowBadge = day === today && now >= s && now < e ? ' <span class="school-badge now">now</span>' : '';
+    const past = day === today && now >= e;
+    return `
+          <div class="school-lesson duty${past ? ' past' : ''}">
+            <div class="school-time">${hhmm(d.start)}</div>
+            <div style="flex:1;min-width:0">
+              <div class="school-group">🚸 <bdi>${esc(d.title)}</bdi>${nowBadge}</div>
+              <div class="school-last">${hhmm(d.start)}–${hhmm(d.end)}${d.location ? ` · 📍 <bdi>${esc(d.location)}</bdi>` : ''}</div>
+            </div>
+          </div>`;
+  };
   el.innerHTML = `
     <div class="school-strip">
       <div class="school-strip-title" style="display:flex;align-items:center">
@@ -3662,6 +3688,7 @@ function renderSchoolStrip() {
       </div>
       ${items.map(l => {
         if (l.cancelled) return cancelledRow(l);
+        if (l.duty) return dutyRow(l);
         const s = new Date(l.start).getTime(), e = new Date(l.end).getTime();
         const loggedToday = lessonLogs.some(x => x.group === l.group && x.date === day);
         const prev = lastLogFor(l.group, day);
