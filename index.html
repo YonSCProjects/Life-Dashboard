@@ -564,6 +564,11 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
   animation: micPulse 1.2s ease-out infinite;
 }
 .ai-mic-btn.speaking { background: var(--purple); color: #fff; border-color: var(--purple); }
+.ai-lang-btn {
+  min-width: 40px; height: 40px; border-radius: 10px; cursor: pointer; padding: 0 6px;
+  border: 1px solid var(--border); background: var(--bg3); color: var(--text2);
+  font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center;
+}
 .ai-mic-btn:disabled { opacity: 0.4; cursor: default; }
 @keyframes micPulse {
   0% { box-shadow: 0 0 0 0 rgba(239,68,68,0.55); }
@@ -6903,6 +6908,15 @@ let aiRecognition = null;
 let aiListening = false;
 let aiSpeaking = false;
 let aiLastInputWasVoice = false;
+// Language the mic listens in. Default follows the phone; the EN/עב button switches it.
+const AI_VOICE_LANG_KEY = 'dash-ai-voice-lang';
+const AI_VOICE_LANGS = { en: 'en-US', he: 'he-IL' };
+let aiVoiceLang = (() => {
+  let saved = null;
+  try { saved = localStorage.getItem(AI_VOICE_LANG_KEY); } catch {}
+  if (saved && AI_VOICE_LANGS[saved]) return saved;
+  return /^(he|iw)\b/i.test(navigator.language || '') ? 'he' : 'en';
+})();
 
 function getWorkerUrl() { return localStorage.getItem(AI_WORKER_KEY) || ''; }
 function setWorkerUrl(url) { localStorage.setItem(AI_WORKER_KEY, url); updateFabVisibility(); }
@@ -7344,11 +7358,11 @@ function aiExtractText(content) {
 
 function aiRenderMessage(m) {
   if (typeof m.content === 'string') {
-    return `<div class="ai-msg ${m.role}">${esc(m.content)}</div>`;
+    return `<div class="ai-msg ${m.role}" dir="auto">${esc(m.content)}</div>`;
   }
   if (!Array.isArray(m.content)) return '';
   return m.content.map(b => {
-    if (b.type === 'text') return `<div class="ai-msg ${m.role}">${esc(b.text)}</div>`;
+    if (b.type === 'text') return `<div class="ai-msg ${m.role}" dir="auto">${esc(b.text)}</div>`;
     if (b.type === 'tool_use') {
       const args = Object.entries(b.input || {}).map(([k, v]) => `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`).join(', ');
       return `<div class="ai-tool-call">🔧 ${esc(b.name)}(${esc(args)})</div>`;
@@ -7570,8 +7584,9 @@ function openAI() {
           </div>
         ` : ''}
         <div class="ai-input-row">
-          <input class="ai-input" id="ai-input" placeholder="Ask Claude..."
+          <input class="ai-input" id="ai-input" dir="auto" placeholder="Ask Claude..."
                  onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();aiSend()}">
+          ${aiSupportsSpeech() ? `<button class="ai-lang-btn" id="ai-lang-btn" onclick="aiToggleVoiceLang()" title="Language the microphone listens in (tap to switch)">${aiVoiceLang === 'he' ? 'עב' : 'EN'}</button>` : ''}
           ${aiSupportsSpeech() ? `<button class="ai-mic-btn ${aiListening ? 'listening' : ''}" id="ai-mic-btn" onclick="aiToggleMic()" title="Tap to speak">🎤</button>` : ''}
           <button class="ai-send-btn" id="ai-send-btn" onclick="aiSend()">→</button>
         </div>
@@ -7696,7 +7711,7 @@ function aiStartListening() {
 function aiStartRecognitionSession(v) {
   const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
   const rec = new Rec();
-  rec.lang = navigator.language || 'en-US';
+  rec.lang = AI_VOICE_LANGS[aiVoiceLang];
   rec.interimResults = true;
   rec.continuous = true;
   rec.maxAlternatives = 1;
@@ -7774,6 +7789,19 @@ function aiStopListening() {
   aiFinishListening(false);
 }
 
+function aiToggleVoiceLang() {
+  aiVoiceLang = aiVoiceLang === 'he' ? 'en' : 'he';
+  try { localStorage.setItem(AI_VOICE_LANG_KEY, aiVoiceLang); } catch {}
+  const b = document.getElementById('ai-lang-btn');
+  if (b) b.textContent = aiVoiceLang === 'he' ? 'עב' : 'EN';
+  // Mid-turn switch: end the current session — its words are banked and the
+  // automatic restart picks up the new language.
+  if (aiVoice && aiVoice.rec) {
+    aiVoice.quickEnds = 0;
+    try { aiVoice.rec.abort(); } catch {}
+  }
+}
+
 function aiStripMarkdown(text) {
   return text
     .replace(/```[\s\S]*?```/g, ' ')
@@ -7789,8 +7817,16 @@ function aiStripMarkdown(text) {
 function aiSpeak(text, onDone) {
   if (!('speechSynthesis' in window)) { onDone?.(); return; }
   aiStopSpeaking();
-  const utter = new SpeechSynthesisUtterance(aiStripMarkdown(text));
-  utter.lang = navigator.language || 'en-US';
+  const spoken = aiStripMarkdown(text);
+  const utter = new SpeechSynthesisUtterance(spoken);
+  // Read Hebrew replies with a Hebrew voice and English ones with an English
+  // voice, whatever the mic is set to (Android may list Hebrew as "iw").
+  const lang = aiDetectLang(spoken);
+  utter.lang = AI_VOICE_LANGS[lang];
+  const prefixes = lang === 'he' ? ['he', 'iw'] : ['en'];
+  const voice = (window.speechSynthesis.getVoices() || [])
+    .find(v => prefixes.some(p => (v.lang || '').toLowerCase().replace('_', '-').startsWith(p)));
+  if (voice) utter.voice = voice;
   utter.rate = 1.0;
   utter.pitch = 1.0;
   utter.onstart = () => {
@@ -7805,6 +7841,12 @@ function aiSpeak(text, onDone) {
     onDone?.();
   };
   window.speechSynthesis.speak(utter);
+}
+
+function aiDetectLang(text) {
+  const he = (text.match(/[\u0590-\u05FF]/g) || []).length;
+  const en = (text.match(/[A-Za-z]/g) || []).length;
+  return he > en ? 'he' : 'en';
 }
 
 function aiStopSpeaking() {
