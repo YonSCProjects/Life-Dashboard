@@ -7647,74 +7647,131 @@ function aiToggleVoiceMode() {
   openAI();
 }
 
+// ── Voice input ──
+// Keeps listening across pauses until the user is done. The Web Speech API
+// ends a recognition session at the first pause, and Android Chrome ends even
+// "continuous" sessions after a few seconds — so whenever a session ends on
+// its own, its words are banked and a new session starts. The turn ends when
+// the user taps 🎤 again (send now) or stays quiet for AI_VOICE_SILENCE_MS.
+const AI_VOICE_SILENCE_MS = 3500; // quiet this long after speaking → send
+const AI_VOICE_IDLE_MS = 12000;   // nothing said at all for this long → give up
+let aiVoice = null; // active turn: { rec, committed, session, interim, silenceTimer, idleTimer, quickEnds }
+
 function aiToggleMic() {
-  if (aiListening) aiStopListening();
+  if (aiVoice) aiFinishListening(true);
   else aiStartListening();
 }
 
+// Android Chrome sometimes re-sends earlier words inside later results (each
+// one cumulative). Join so a phrase that already contains the text so far
+// replaces it instead of doubling it.
+function aiMergeTranscripts(parts) {
+  let out = '';
+  for (const raw of parts) {
+    const t = (raw || '').trim();
+    if (!t) continue;
+    if (!out) { out = t; continue; }
+    const lo = out.toLowerCase(), lt = t.toLowerCase();
+    if (lt.startsWith(lo)) out = t;
+    else if (!lo.endsWith(lt)) out += ' ' + t;
+  }
+  return out;
+}
+
+function aiVoiceText(v) { return aiMergeTranscripts([v.committed, v.session, v.interim]); }
+
 function aiStartListening() {
-  if (!aiSupportsSpeech() || aiStreaming) return;
+  if (!aiSupportsSpeech() || aiStreaming || aiVoice) return;
   aiStopSpeaking();
+  aiVoice = { rec: null, committed: '', session: '', interim: '', silenceTimer: null, idleTimer: null, quickEnds: 0 };
+  aiVoice.idleTimer = setTimeout(() => aiFinishListening(true), AI_VOICE_IDLE_MS);
+  aiListening = true;
+  const btn = document.getElementById('ai-mic-btn');
+  if (btn) btn.classList.add('listening');
+  const input = document.getElementById('ai-input');
+  if (input) { input.value = ''; input.placeholder = 'Listening… pause or tap 🎤 to send'; }
+  aiStartRecognitionSession(aiVoice);
+}
+
+function aiStartRecognitionSession(v) {
   const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
   const rec = new Rec();
   rec.lang = navigator.language || 'en-US';
   rec.interimResults = true;
-  rec.continuous = false;
+  rec.continuous = true;
   rec.maxAlternatives = 1;
+  const startedAt = Date.now();
 
-  let finalText = '';
   rec.onresult = (e) => {
+    if (aiVoice !== v) return;
+    const finals = [];
     let interim = '';
-    for (let i = e.resultIndex; i < e.results.length; i++) {
+    for (let i = 0; i < e.results.length; i++) {
       const r = e.results[i];
-      if (r.isFinal) finalText += r[0].transcript;
+      if (r.isFinal) finals.push(r[0].transcript);
       else interim += r[0].transcript;
     }
+    v.session = aiMergeTranscripts(finals);
+    v.interim = interim.trim();
     const input = document.getElementById('ai-input');
-    if (input) input.value = (finalText + interim).trim();
+    if (input) input.value = aiVoiceText(v);
+    // Still talking: push back the end of the turn.
+    clearTimeout(v.idleTimer); v.idleTimer = null;
+    clearTimeout(v.silenceTimer);
+    v.silenceTimer = setTimeout(() => aiFinishListening(true), AI_VOICE_SILENCE_MS);
   };
   rec.onerror = (e) => {
-    aiListening = false;
-    aiRecognition = null;
-    const btn = document.getElementById('ai-mic-btn');
-    if (btn) btn.classList.remove('listening');
+    if (aiVoice !== v) return;
     if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
       showError('Microphone access denied. Enable it in your browser settings.');
+      aiFinishListening(false);
+    } else if (e.error === 'audio-capture') {
+      showError('No microphone available.');
+      aiFinishListening(false);
     }
+    // no-speech / network / aborted: onend decides whether to carry on.
   };
   rec.onend = () => {
-    aiListening = false;
-    aiRecognition = null;
-    const btn = document.getElementById('ai-mic-btn');
-    if (btn) btn.classList.remove('listening');
-    const input = document.getElementById('ai-input');
-    const text = (input?.value || '').trim();
-    if (text) {
-      aiLastInputWasVoice = true;
-      aiSend();
-    }
+    if (aiVoice !== v) return; // the turn already finished or was cancelled
+    // The session ended by itself (a pause, or Android's time limit):
+    // bank its words and keep listening with a fresh session.
+    v.committed = aiMergeTranscripts([v.committed, v.session, v.interim]);
+    v.session = ''; v.interim = '';
+    v.quickEnds = Date.now() - startedAt < 500 ? v.quickEnds + 1 : 0;
+    if (v.quickEnds >= 5) { aiFinishListening(true); return; } // engine keeps refusing — don't spin
+    try { aiStartRecognitionSession(v); } catch { aiFinishListening(true); }
   };
 
-  try {
-    rec.start();
-    aiRecognition = rec;
-    aiListening = true;
-    const btn = document.getElementById('ai-mic-btn');
-    if (btn) btn.classList.add('listening');
-    const input = document.getElementById('ai-input');
-    if (input) { input.value = ''; input.placeholder = 'Listening…'; }
-  } catch (e) {
-    aiListening = false;
-    aiRecognition = null;
+  v.rec = rec;
+  aiRecognition = rec;
+  rec.start();
+}
+
+// End the turn. send=true sends what was heard (tap 🎤, or the pause timer);
+// send=false cancels (panel closed / cleared).
+function aiFinishListening(send) {
+  const v = aiVoice;
+  if (!v) return;
+  aiVoice = null; // from here on, late events from the recognizer are ignored
+  clearTimeout(v.silenceTimer);
+  clearTimeout(v.idleTimer);
+  try { v.rec && v.rec.abort(); } catch {}
+  aiListening = false;
+  aiRecognition = null;
+  const btn = document.getElementById('ai-mic-btn');
+  if (btn) btn.classList.remove('listening');
+  const input = document.getElementById('ai-input');
+  if (input) input.placeholder = 'Ask Claude...';
+  const text = aiVoiceText(v) || (input?.value || '').trim();
+  if (send && text) {
+    if (input) input.value = text;
+    aiLastInputWasVoice = true;
+    aiSend();
   }
 }
 
 function aiStopListening() {
-  if (aiRecognition) {
-    try { aiRecognition.stop(); } catch {}
-  }
-  aiListening = false;
-  aiRecognition = null;
+  aiFinishListening(false);
 }
 
 function aiStripMarkdown(text) {

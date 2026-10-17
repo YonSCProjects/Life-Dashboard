@@ -1,6 +1,6 @@
 const SHARE_CACHE = 'life-dash-share';
 const SHARED_IMAGE_URL = '/Life-Dashboard/__shared-image';
-const CACHE_NAME = 'life-dash-v68';
+const CACHE_NAME = 'life-dash-v69';
 const ASSETS = [
   '/Life-Dashboard/',
   '/Life-Dashboard/index.html',
