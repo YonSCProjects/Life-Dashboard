@@ -8459,6 +8459,42 @@ if ('serviceWorker' in navigator) {
     .catch(() => {});
 }
 
+// ── Coming back to the app ──
+// Android keeps the installed app alive in the background, so the page can be
+// hours old when the user returns. On return: redraw the time-driven views at
+// once (the school strip's 16:00 look-ahead, its "now" badges), re-sync if the
+// data is stale, and — if a new version was installed meanwhile — reload into
+// it, but never while something is open that a reload would throw away.
+const RESUME_SYNC_AFTER_MS = 10 * 60 * 1000;
+let appUpdateWaiting = false;
+if ('serviceWorker' in navigator) {
+  const hadController = !!navigator.serviceWorker.controller; // first install also fires controllerchange
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController) appUpdateWaiting = true; });
+}
+function appReload() { location.reload(); }
+function appIsBusy() {
+  return !!(document.getElementById('detail-container')?.innerHTML.trim()
+    || (typeof inkEd !== 'undefined' && inkEd)
+    || document.getElementById('ai-panel')?.style.display !== 'none'
+    || document.getElementById('add-form-container')?.innerHTML.trim());
+}
+function onAppResume() {
+  if (document.getElementById('app')?.style.display !== 'block') return;
+  if (appUpdateWaiting && !appIsBusy()) { appReload(); return; }
+  renderSchoolStrip();
+  const syncing = document.getElementById('sync-btn')?.disabled;
+  if (accessToken && navigator.onLine && !syncing && Date.now() - lastSyncAt > RESUME_SYNC_AFTER_MS) {
+    syncAll().catch(() => {});
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') onAppResume();
+});
+// While the app is on screen, keep the strip's clock-driven parts current.
+setInterval(() => {
+  if (document.visibilityState === 'visible' && document.getElementById('app')?.style.display === 'block') renderSchoolStrip();
+}, 60000);
+
 // ── Bootstrap ──
 applyTheme(localStorage.getItem('dash-theme') || 'mist');
 initReminders();
