@@ -195,6 +195,8 @@ textarea { resize: vertical; min-height: 60px; line-height: 1.5; }
 .school-badge.cancelled { background: var(--bg3); color: var(--red); }
 .school-lesson.cancelled { opacity: 0.6; cursor: default; }
 .school-lesson.duty { cursor: default; }
+.school-pending { font-size: 12px; color: #6b4e12; background: #fdf3dc; border-radius: 8px; padding: 6px 10px; margin-top: 8px; }
+.school-pending a { color: inherit; font-weight: 700; text-decoration: underline; cursor: pointer; }
 .school-lesson.duty .school-group { color: #a16207; }
 .school-lesson.cancelled .school-group bdi { text-decoration: line-through; }
 .daily-row { display: flex; gap: 8px; align-items: flex-start; padding: 7px 0; font-size: 13px; border-bottom: 1px solid var(--border); cursor: pointer; }
@@ -3636,13 +3638,16 @@ async function loadLessons() {
   } catch { /* offline — keep the cached week */ }
 }
 
-// The day the strip shows: today if it has lessons, otherwise the next day
-// that does (so the evening before / the weekend shows what's coming).
+// The day the strip shows: today while today's school day is on; from
+// SCHOOL_EVENING_HOUR (Israel time) it looks ahead to the next school day, so
+// the evening before shows tomorrow. Weekends show the coming school day.
+const SCHOOL_EVENING_HOUR = 16;
 function schoolStripDay() {
   const today = schoolYmd(new Date());
   const days = [...new Set([...lessons, ...schoolDuties].map(l => schoolYmd(new Date(l.start))))].sort();
-  if (days.includes(today)) return today;
-  return days.find(d => d > today) || null;
+  const evening = nagJerusalemNow().hh >= SCHOOL_EVENING_HOUR;
+  if (!evening && days.includes(today)) return today;
+  return days.find(d => d > today) || (days.includes(today) ? today : null);
 }
 
 function lastLogFor(group, beforeYmd) {
@@ -3661,7 +3666,15 @@ function renderSchoolStrip() {
     ...schoolCancelledFor(day).map(c => ({ ...c, cancelled: true })),
     ...schoolDuties.filter(d => schoolYmd(new Date(d.start)) === day).map(d => ({ ...d, duty: true })),
   ].sort((a, b) => a.start.localeCompare(b.start));
-  const title = day === today ? 'Today at school' : `${new Date(day + 'T12:00:00Z').toLocaleDateString([], { weekday: 'long', timeZone: 'UTC' })} at school`;
+  const title = day === today ? 'Today at school'
+    : day === dailyTargetYmd(1) ? 'Tomorrow at school'
+    : `${new Date(day + 'T12:00:00Z').toLocaleDateString([], { weekday: 'long', timeZone: 'UTC' })} at school`;
+  // Looking ahead in the evening hides today's "log it" prompts — so list
+  // today's finished lessons that still have no log entry, one tap to log.
+  const pendingToday = day === today ? [] : [...new Set(lessons
+    .filter(l => schoolYmd(new Date(l.start)) === today && new Date(l.end).getTime() <= now
+              && !lessonLogs.some(x => x.group === l.group && x.date === today))
+    .map(l => l.group))];
   const cancelledRow = l => `
           <div class="school-lesson cancelled">
             <div class="school-time">${hhmm(l.start)}</div>
@@ -3709,6 +3722,8 @@ function renderSchoolStrip() {
             </div>
           </div>`;
       }).join('')}
+      ${pendingToday.length ? `<div class="school-pending">📝 Not logged today: ${pendingToday.map(g =>
+        `<a onclick="openGroupSheet(${JSON.stringify(g).replace(/"/g, '&quot;')}, '${today}')"><bdi>${esc(g)}</bdi></a>`).join(', ')}</div>` : ''}
     </div>`;
 }
 
